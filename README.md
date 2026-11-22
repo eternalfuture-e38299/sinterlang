@@ -1,6 +1,8 @@
 # Sinter
 
-<img src="assets/icon.svg" width="88" align="right" alt="Sinter">
+<p align="right">
+  <img src="assets/icon.svg" alt="Sinter" width="88">
+</p>
 
 ## 中文
 
