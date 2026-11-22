@@ -1,6 +1,6 @@
 # Sinter
 
-<p align="right">
+<p align="left">
   <img src="assets/icon.svg" alt="Sinter" width="88">
 </p>
 
