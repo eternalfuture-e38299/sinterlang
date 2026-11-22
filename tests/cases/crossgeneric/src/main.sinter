@@ -1,0 +1,21 @@
+module crossgeneric
+import std
+import std.memory
+import lib
+
+class Point(val x: i64, val y: i64) { }
+
+fun main(): void {
+    var x: i64 = 5
+    println(readAt<i64>(&x))
+    writeAt<i64>(&x, 9)
+    println(x)
+
+    val p = alloc(16)
+    store<i64>(p as *i64, 42)
+    println(load<i64>(p as *i64))
+    dealloc(p)
+
+    var pt: Point = Point(3, 4)
+    println(readAt<Point>(&pt).x)
+}

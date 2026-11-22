@@ -1,0 +1,26 @@
+module algotest
+import std
+import std.arrays
+import std.algo
+
+fun main(): void {
+    val xs: Array<i64> = intArrayOf(1, 1, 2, 3, 3, 3)
+    val u = List<i64>()
+    uniqueInt(xs, u)
+    var i: i64 = 0
+    while i < u.size() {
+        println(u.get(i))
+        i = i + 1
+    }
+    rotateInt(xs, 2)
+    println(xs.joinToString(","))
+    println(partitionInt(xs, 3))
+    println(nthSmallestInt(xs, 2))
+    println(levenshtein("kitten", "sitting"))
+    println(levenshtein("same", "same"))
+    println(isPalindrome("racecar"))
+    println(isPalindrome("sinter"))
+    println(longestCommonPrefix(arrayOf("inter", "internet", "internal")))
+    println(countOccurrences("abababa", "aba"))
+    println(countOccurrences("abc", ""))
+}

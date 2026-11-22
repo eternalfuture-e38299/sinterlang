@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Thin socket bridge used by the self-hosted sinterd.  POSIX builds use a real
+// Unix socket; Windows builds use a loopback TCP port derived from the path so
+// the daemon can be cross-compiled with Zig.
+module csupport
+
+import std
+
+bind C fun snt_unix_listen(path: cstr): i64
+bind C fun snt_unix_accept(server: i64): i64
+bind C fun snt_read_line_fd(fd: i64): str
+bind C fun snt_write_fd(fd: i64, text: str): i64
+bind C fun snt_close_fd(fd: i64): void
+
+embed C {
+#include <errno.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+#define SNT_BAD ((int64_t)-1)
+
+static int snt_wsa(void) {
+    static int ready = 0;
+    WSADATA data;
+    if (ready) return 0;
+    if (WSAStartup(MAKEWORD(2, 2), &data) != 0) return -1;
+    ready = 1;
+    return 0;
+}
+
+static unsigned short snt_port(const char* path) {
+    uint32_t h = 2166136261u;
+    while (*path) {
+        h ^= (unsigned char)*path++;
+        h *= 16777619u;
+    }
+    return (unsigned short)(25000u + (h % 20000u));
+}
+
+int64_t snt_unix_listen(const char* path) {
+    if (snt_wsa() != 0) return SNT_BAD;
+    SOCKET fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == INVALID_SOCKET) return SNT_BAD;
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(snt_port(path));
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { closesocket(fd); return SNT_BAD; }
+    if (listen(fd, 16) != 0) { closesocket(fd); return SNT_BAD; }
+    return (int64_t)fd;
+}
+
+int64_t snt_unix_accept(int64_t server) {
+    SOCKET client = accept((SOCKET)server, 0, 0);
+    if (client == INVALID_SOCKET) return SNT_BAD;
+    return (int64_t)client;
+}
+
+static int64_t snt_recv(int64_t fd, void* buf, size_t len) {
+    return (int64_t)recv((SOCKET)fd, (char*)buf, (int)len, 0);
+}
+
+static int64_t snt_send(int64_t fd, const void* buf, size_t len) {
+    return (int64_t)send((SOCKET)fd, (const char*)buf, (int)len, 0);
+}
+
+static void snt_close_socket(int64_t fd) {
+    if (fd != SNT_BAD) closesocket((SOCKET)fd);
+}
+#else
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#define SNT_BAD ((int64_t)-1)
+
+int64_t snt_unix_listen(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return SNT_BAD;
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    unlink(path);
+    if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { close(fd); return SNT_BAD; }
+    if (listen(fd, 16) < 0) { close(fd); return SNT_BAD; }
+    return (int64_t)fd;
+}
+
+int64_t snt_unix_accept(int64_t server) {
+    return (int64_t)accept((int)server, 0, 0);
+}
+
+static int64_t snt_recv(int64_t fd, void* buf, size_t len) {
+    return (int64_t)read((int)fd, buf, len);
+}
+
+static int64_t snt_send(int64_t fd, const void* buf, size_t len) {
+    return (int64_t)write((int)fd, buf, len);
+}
+
+static void snt_close_socket(int64_t fd) {
+    if (fd >= 0) close((int)fd);
+}
+#endif
+
+sinter_string snt_read_line_fd(int64_t fd) {
+    char* buf = 0;
+    size_t cap = 0;
+    size_t len = 0;
+    char c;
+    while (snt_recv(fd, &c, 1) == 1) {
+        if (c == '\n') break;
+        if (len + 1 >= cap) {
+            size_t next = cap == 0 ? 256 : cap * 2;
+            char* nb = (char*)realloc(buf, next);
+            if (!nb) { free(buf); return sinter_string_from_literal("", 0); }
+            buf = nb;
+            cap = next;
+        }
+        buf[len++] = c;
+    }
+    if (len == 0) { free(buf); return sinter_string_from_literal("", 0); }
+    sinter_string out = sinter_string_from_buf(buf, (int64_t)len);
+    free(buf);
+    return out;
+}
+
+int64_t snt_write_fd(int64_t fd, sinter_string s) {
+    const char* p = s.data;
+    int64_t left = s.len;
+    while (left > 0) {
+        int64_t n = snt_send(fd, p, (size_t)left);
+        if (n <= 0) return -1;
+        p += n;
+        left -= n;
+    }
+    char nl = '\n';
+    if (snt_send(fd, &nl, 1) != 1) return -1;
+    return 0;
+}
+
+void snt_close_fd(int64_t fd) {
+    snt_close_socket(fd);
+}
+}
+
+pub fun unixListen(path: str): i64 => snt_unix_listen(toCStr(path))
+pub fun unixAccept(server: i64): i64 => snt_unix_accept(server)
+pub fun readLineFd(fd: i64): str => snt_read_line_fd(fd)
+pub fun writeFd(fd: i64, text: str): i64 => snt_write_fd(fd, text) as i64
+pub fun closeFd(fd: i64): void => snt_close_fd(fd)

@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: filesystem (compatibility layer)
+//
+// This module used to hold everything: "paths + files + directories". It is now split by responsibility into three:
+//
+//     std.path   pure string path math (no disk access)
+//     std.file  File class + file / directory operations
+//     std.stream  streams (InputStream / OutputStream / LineReader)
+//
+// So existing code (`import std.filesystem` then `readText(path)`) keeps working,
+// `std.file` and `std.path` are re-exported here. New code should import those two directly:
+// `std.path` doesn't compile `open` / `stat` / `dirent` into the output, and `std.file`'s `File`
+// class is nicer than a pile of free functions.
+//
+//     import std.filesystem   // old style: readText / writeText / listDir …
+//     import std.file         // new style: File("/tmp/a.txt").readText()
+//     import std.path         // lightweight: join / extension / normalize …
+module std.filesystem
+
+import std.core
+import std.string
+import std.arrays
+import std.path
+import std.file

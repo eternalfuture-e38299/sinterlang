@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Request handlers for the self-hosted sinterd protocol.
+module ops
+
+import std
+import std.string
+import std.list
+import std.text
+import std.file
+import json
+import syntax
+import lexer
+import parser
+import cfront
+import cparse
+import cformat
+import sfmt
+import sver
+
+pub fun version(): str => sver.text()
+
+fun esc(s: str): str {
+    var out = ""
+    var i: i64 = 0
+    while i < s.length() {
+        val c = s.at(i)
+        if c == 92 { out = out + "\\\\" }
+        else if c == 34 { out = out + "\\\"" }
+        else if c == 10 { out = out + "\\n" }
+        else if c == 13 { out = out + "\\r" }
+        else if c == 9 { out = out + "\\t" }
+        else { out = out + s.substring(i, i + 1) }
+        i = i + 1
+    }
+    ret out
+}
+
+fun idField(doc: Json, root: i64): str {
+    val n = doc.get(root, "id")
+    if n < 0 { ret "null" }
+    if doc.isString(n) { ret "\"" + esc(doc.asString(n)) + "\"" }
+    if doc.isInt(n) { ret fromInt(doc.asInt(n)) }
+    if doc.isBool(n) { ret doc.asBool(n) ? "true" : "false" }
+    ret "null"
+}
+
+fun ok(id: str, body: str): str {
+    if body.length() == 0 { ret "{\"id\":" + id + ",\"ok\":true}" }
+    ret "{\"id\":" + id + ",\"ok\":true," + body + "}"
+}
+
+fun fail(id: str, msg: str): str => "{\"id\":" + id + ",\"ok\":false,\"error\":\"" + esc(msg) + "\"}"
+
+fun kindName(k: i64): str {
+    if k == 0 { ret "eof" }
+    if k == 1 { ret "ident" }
+    if k == 2 { ret "integer" }
+    if k == 3 { ret "float" }
+    if k == 4 { ret "string" }
+    if k == 5 { ret "char" }
+    if k == 6 { ret "punct" }
+    if k == 7 { ret "newline" }
+    if k == 8 { ret "embed" }
+    ret "unknown"
+}
+
+fun tokensJson(text: str): str {
+    val toks = Tokens()
+    val diags = Diagnostics()
+    Lexer(text).tokenize(toks, diags)
+    var out = "{\"tokens\":["
+    var i: i64 = 0
+    var first = true
+    while i < toks.size() {
+        if !first { out = out + "," }
+        first = false
+        val tx = toks.text(i)
+        out = out + "{\"kind\":\"" + kindName(toks.kind(i) as i64) + "\",\"type\":\"" + kindName(toks.kind(i) as i64) + "\",\"text\":\"" + esc(tx) + "\",\"offset\":0,\"length\":" + fromInt(tx.length()) + ",\"line\":" + fromInt(toks.line(i)) + ",\"column\":" + fromInt(toks.col(i)) + "}"
+        i = i + 1
+    }
+    out = out + "],\"errors\":["
+    i = 0
+    first = true
+    while i < diags.size() {
+        if !first { out = out + "," }
+        first = false
+        out = out + "{\"line\":" + fromInt(diags.line(i)) + ",\"column\":" + fromInt(diags.col(i)) + ",\"message\":\"" + esc(diags.message(i)) + "\"}"
+        i = i + 1
+    }
+    ret out + "]}"
+}
+
+fun diagnoseJson(text: str): str {
+    val toks = Tokens()
+    val diags = Diagnostics()
+    Lexer(text).tokenize(toks, diags)
+    val ast = Ast()
+    Parser(toks, ast, diags).parseProgram()
+    var out = "{\"diagnostics\":["
+    var i: i64 = 0
+    var first = true
+    while i < diags.size() {
+        if !first { out = out + "," }
+        first = false
+        out = out + "{\"line\":" + fromInt(diags.line(i)) + ",\"column\":" + fromInt(diags.col(i)) + ",\"message\":\"" + esc(diags.message(i)) + "\"}"
+        i = i + 1
+    }
+    ret out + "]}"
+}
+
+fun cstringsJson(xs: List<str>): str {
+    var out = "["
+    var i: i64 = 0
+    while i < xs.size() {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + esc(xs.get(i)) + "\""
+        i = i + 1
+    }
+    ret out + "]"
+}
+
+fun cdiagsJson(u: CUnit): str {
+    var out = "["
+    var i: i64 = 0
+    while i < u.diagCount() {
+        if i > 0 { out = out + "," }
+        out = out + "{\"line\":" + fromInt(u.diag_lines.get(i)) + ",\"column\":" + fromInt(u.diag_cols.get(i)) + ",\"message\":\"" + esc(u.diag_msgs.get(i)) + "\"}"
+        i = i + 1
+    }
+    ret out + "]"
+}
+
+/// cfront-compatible `cparse` / `symbols` shape.
+fun cparseJson(text: str): str {
+    val u = parseC(text)
+    var fns = "["
+    var i: i64 = 0
+    while i < u.funcCount() {
+        if i > 0 { fns = fns + "," }
+        fns = fns + "\"" + esc(u.func_names.get(i)) + "\""
+        i = i + 1
+    }
+    fns = fns + "]"
+
+    var syms = "["
+    var first = true
+    i = 0
+    while i < u.funcCount() {
+        if u.func_defs.get(i) != 0 {
+            if !first { syms = syms + "," }
+            first = false
+            syms = syms + "{\"kind\":\"function\",\"name\":\"" + esc(u.func_names.get(i)) + "\",\"type\":\"" + esc(u.func_rets.get(i)) + "\",\"line\":" + fromInt(u.func_lines.get(i)) + "}"
+        }
+        i = i + 1
+    }
+    syms = syms + "]"
+
+    var out = "\"functions\":" + fns
+    out = out + ",\"tags\":" + cstringsJson(u.rec_names)
+    out = out + ",\"typedefs\":" + cstringsJson(u.td_names)
+    out = out + ",\"includes\":" + cstringsJson(u.includes)
+    out = out + ",\"items\":" + fromInt(u.funcCount() + u.recordCount() + u.typedefCount())
+    out = out + ",\"symbols\":" + syms
+    out = out + ",\"diagnostics\":" + cdiagsJson(u)
+    ret out
+}
+
+/// cfront2-compatible `cparse2` / `symbols2` shape.
+fun cparse2Json(text: str): str {
+    val u = parseC(text)
+    var fns = "["
+    var i: i64 = 0
+    while i < u.funcCount() {
+        if i > 0 { fns = fns + "," }
+        fns = fns + "{\"name\":\"" + esc(u.func_names.get(i)) + "\",\"return\":\"" + esc(u.func_rets.get(i)) + "\",\"params\":" + fromInt(u.func_params.get(i)) + ",\"variadic\":" + (u.func_variadic.get(i) != 0 ? "true" : "false") + ",\"definition\":" + (u.func_defs.get(i) != 0 ? "true" : "false") + ",\"line\":" + fromInt(u.func_lines.get(i)) + "}"
+        i = i + 1
+    }
+    fns = fns + "]"
+
+    var recs = "["
+    i = 0
+    while i < u.recordCount() {
+        if i > 0 { recs = recs + "," }
+        recs = recs + "{\"kind\":\"" + esc(u.rec_kinds.get(i)) + "\",\"name\":\"" + esc(u.rec_names.get(i)) + "\",\"fields\":" + fromInt(u.rec_fields.get(i)) + ",\"variants\":" + fromInt(u.rec_variants.get(i)) + "}"
+        i = i + 1
+    }
+    recs = recs + "]"
+
+    var tds = "["
+    i = 0
+    while i < u.typedefCount() {
+        if i > 0 { tds = tds + "," }
+        tds = tds + "{\"name\":\"" + esc(u.td_names.get(i)) + "\",\"type\":\"" + esc(u.td_types.get(i)) + "\"}"
+        i = i + 1
+    }
+    tds = tds + "]"
+
+    var out = "\"frontend\":\"cfront2\""
+    out = out + ",\"functions\":" + fns
+    out = out + ",\"records\":" + recs
+    out = out + ",\"typedefs\":" + tds
+    out = out + ",\"includes\":" + cstringsJson(u.includes)
+    out = out + ",\"diagnostics\":" + cdiagsJson(u)
+    ret out
+}
+
+fun cdiagnoseJson(text: str): str {
+    val u = parseC(text)
+    ret "{\"diagnostics\":" + cdiagsJson(u) + "}"
+}
+
+pub fun handleRaw(text: str): str {
+    if text.length() == 0 { ret fail("null", "empty request") }
+    val doc = Json()
+    if !doc.parse(text) { ret fail("null", "invalid json") }
+    val root = doc.root()
+    val id = idField(doc, root)
+    val op = doc.getString(root, "op", "")
+    if op.length() == 0 { ret fail(id, "missing op") }
+    if op == "ping" { ret ok(id, "\"pong\":true,\"version\":\"" + version() + "\"") }
+    if op == "shutdown" { ret ok(id, "\"bye\":true") }
+    val src = doc.getString(root, "text", doc.getString(root, "source", ""))
+    if op == "format" {
+        var width = doc.getInt(root, "indent", 4)
+        if width < 1 { width = 4 }
+        ret ok(id, "\"text\":\"" + esc(formatSinterWith(src, width)) + "\"")
+    }
+    if op == "reindent" {
+        var indent = doc.getInt(root, "indent", 4)
+        if indent < 1 { indent = 4 }
+        val base = doc.getInt(root, "base_indent", 0)
+        val useTabs = doc.getBool(root, "use_tabs", false)
+        ret ok(id, "\"text\":\"" + esc(reindentC(src, base, indent, useTabs)) + "\"")
+    }
+    if op == "tokens" { ret ok(id, tokensJson(src).substring(1, tokensJson(src).length() - 1)) }
+    if op == "diagnose" { ret ok(id, cdiagnoseJson(src).substring(1, cdiagnoseJson(src).length() - 1)) }
+    if op == "cparse" || op == "symbols" { ret ok(id, cparseJson(src)) }
+    if op == "cparse2" || op == "symbols2" { ret ok(id, cparse2Json(src)) }
+    if op == "cheader" {
+        val path = doc.getString(root, "path", "")
+        if path.length() == 0 { ret fail(id, "missing 'path'") }
+        ret ok(id, cparseJson(readText(path)))
+    }
+    ret fail(id, "unknown op: " + op)
+}

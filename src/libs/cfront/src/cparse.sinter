@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted C99 recursive-descent parser (cfront2 parity).
+// Preprocessing is upstream: `#include` lines are recorded, other `#` lines
+// are skipped.  The parser is deliberately permissive so generated C and
+// real headers can be inspected without a full preprocessor.
+module cparse
+
+import std
+import std.list
+import std.string
+import cfront
+
+class C2Specs {
+    var text: str
+    var is_typedef: bool
+    var has_type: bool
+
+    C2Specs() {
+        self.text = ""
+        self.is_typedef = false
+        self.has_type = false
+    }
+}
+
+class C2Decl {
+    var name: str
+    var type: str
+    var return_type: str
+    var params: i64
+    var variadic: bool
+    var is_func: bool
+    var definition: bool
+
+    C2Decl() {
+        self.name = ""
+        self.type = ""
+        self.return_type = ""
+        self.params = 0
+        self.variadic = false
+        self.is_func = false
+        self.definition = false
+    }
+}
+
+fun typeStartWord(w: str): bool {
+    if w == "void" || w == "char" || w == "short" || w == "int" || w == "long" { ret true }
+    if w == "float" || w == "double" || w == "signed" || w == "unsigned" || w == "_Bool" { ret true }
+    if w == "_Complex" || w == "struct" || w == "union" || w == "enum" || w == "const" { ret true }
+    if w == "volatile" || w == "restrict" || w == "typedef" || w == "extern" || w == "static" { ret true }
+    if w == "auto" || w == "register" || w == "inline" { ret true }
+    ret false
+}
+
+class C2Parser {
+    var toks: CTokens
+    var pos: i64
+    var unit: CUnit
+    var typedefs: List<str>
+    var diag_seen: bool
+
+    C2Parser(tokens: CTokens) {
+        self.toks = tokens
+        self.pos = 0
+        self.unit = CUnit()
+        self.typedefs = List<str>()
+        self.diag_seen = false
+        self.typedefs.add("int8_t")
+        self.typedefs.add("int16_t")
+        self.typedefs.add("int32_t")
+        self.typedefs.add("int64_t")
+        self.typedefs.add("uint8_t")
+        self.typedefs.add("uint16_t")
+        self.typedefs.add("uint32_t")
+        self.typedefs.add("uint64_t")
+        self.typedefs.add("size_t")
+        self.typedefs.add("ssize_t")
+        self.typedefs.add("ptrdiff_t")
+        self.typedefs.add("intptr_t")
+        self.typedefs.add("uintptr_t")
+        self.typedefs.add("mode_t")
+        self.typedefs.add("pid_t")
+        self.typedefs.add("uid_t")
+        self.typedefs.add("gid_t")
+        self.typedefs.add("off_t")
+        self.typedefs.add("dev_t")
+        self.typedefs.add("ino_t")
+        self.typedefs.add("nlink_t")
+        self.typedefs.add("time_t")
+        self.typedefs.add("clock_t")
+        self.typedefs.add("socklen_t")
+        self.typedefs.add("sinter_string")
+        self.typedefs.add("sinter_vfn")
+        self.typedefs.add("std_size_t")
+        self.typedefs.add("std_ssize_t")
+        self.typedefs.add("FILE")
+        self.typedefs.add("va_list")
+        self.typedefs.add("bool")
+    }
+
+    fun size(): i64 => self.toks.size()
+
+    fun idx(k: i64): i64 {
+        var i = self.pos + k
+        if i >= self.toks.size() { i = self.toks.size() - 1 }
+        if i < 0 { i = 0 }
+        ret i
+    }
+
+    fun kindAt(k: i64): CTokKind => self.toks.kind(self.idx(k))
+    fun textAt(k: i64): str => self.toks.text(self.idx(k))
+    fun lineAt(k: i64): i64 => self.toks.line(self.idx(k))
+    fun colAt(k: i64): i64 => self.toks.col(self.idx(k))
+
+    fun at(w: str): bool => self.textAt(0) == w
+    fun atEof(): bool => self.kindAt(0) == CTokKind.Eof
+
+    fun advance(): void {
+        if !self.atEof() { self.pos = self.pos + 1 }
+    }
+
+    fun accept(w: str): bool {
+        if self.at(w) { self.advance(); ret true }
+        ret false
+    }
+
+    fun error(msg: str): void {
+        if self.diag_seen { ret }
+        self.diag_seen = true
+        self.unit.error(self.lineAt(0), self.colAt(0), msg)
+    }
+
+    fun expect(w: str): bool {
+        if self.accept(w) { ret true }
+        self.error("expected '" + w + "', found '" + self.textAt(0) + "'")
+        if !self.atEof() { self.advance() }
+        ret false
+    }
+
+    fun isTypeStartTok(k: i64): bool {
+        if self.kindAt(k) == CTokKind.Keyword && typeStartWord(self.textAt(k)) { ret true }
+        ret false
+    }
+
+    fun isTypeStartHere(): bool {
+        if self.isTypeStartTok(0) { ret true }
+        if self.kindAt(0) == CTokKind.Ident && self.typedefs.indexOf(self.textAt(0)) >= 0 { ret true }
+        ret false
+    }
+
+    fun recordPreproc(line: str): void {
+        val inc = line.indexOf("#include")
+        if inc < 0 { ret }
+        var i = inc + 8
+        while i < line.length() && (line.at(i) == 32 || line.at(i) == 9) { i = i + 1 }
+        if i >= line.length() { ret }
+        val open = line.at(i)
+        if open == 34 || open == 60 {
+            val close = open == 34 ? 34 : 62
+            var j = i + 1
+            while j < line.length() && line.at(j) != close { j = j + 1 }
+            if j < line.length() { self.unit.addInclude(line.substring(i + 1, j)) }
+        }
+    }
+
+    fun skipAttribute(): void {
+        if !self.at("__attribute__") && !self.at("__attribute") { ret }
+        self.advance()
+        if !self.accept("(") { ret }
+        var depth: i64 = 1
+        while depth > 0 && !self.atEof() {
+            if self.at("(") { depth = depth + 1 }
+            else if self.at(")") { depth = depth - 1 }
+            self.advance()
+        }
+    }
+
+    fun parse(): CUnit {
+        while !self.atEof() {
+            if self.kindAt(0) == CTokKind.Preproc {
+                self.recordPreproc(self.textAt(0))
+                self.advance()
+                continue
+            }
+            if self.kindAt(0) == CTokKind.Comment {
+                self.advance()
+                continue
+            }
+            if self.accept(";") { continue }
+            self.parseExternal()
+        }
+        ret self.unit
+    }
+
+    fun parseExternal(): void {
+        val specs = C2Specs()
+        if !self.parseSpecs(specs) {
+            if self.kindAt(0) == CTokKind.Ident {
+                specs.text = self.textAt(0) + ""
+                specs.has_type = true
+                self.advance()
+            } else {
+                self.error("expected a declaration")
+                if !self.atEof() { self.advance() }
+                ret
+            }
+        }
+        if self.accept(";") { ret }
+
+        val first = self.parseDeclarator(specs)
+        if first.is_func && self.at("{") {
+            first.definition = true
+            self.addDeclarator(specs, first)
+            self.parseCompound()
+            ret
+        }
+        self.addDeclarator(specs, first)
+        self.parseInitializerOpt()
+        while self.accept(",") {
+            val d = self.parseDeclarator(specs)
+            self.addDeclarator(specs, d)
+            self.parseInitializerOpt()
+        }
+        self.expect(";")
+    }
+
+    fun parseSpecs(specs: C2Specs): bool {
+        var any = false
+        while !self.atEof() {
+            val t = self.textAt(0)
+            if t == "__extension__" { self.advance(); continue }
+            if t == "__attribute__" || t == "__attribute" { self.skipAttribute(); continue }
+            if t == "typedef" {
+                specs.is_typedef = true
+                any = true
+                self.advance()
+                continue
+            }
+            if t == "struct" || t == "union" {
+                val kind = t + ""
+                self.advance()
+                while self.at("__attribute__") || self.at("__attribute") { self.skipAttribute() }
+                var name = ""
+                if self.kindAt(0) == CTokKind.Ident {
+                    name = self.textAt(0) + ""
+                    self.advance()
+                }
+                while self.at("__attribute__") || self.at("__attribute") { self.skipAttribute() }
+                if self.at("{") { self.parseRecordBody(kind, name) }
+                if specs.text.length() > 0 { specs.text = specs.text + " " }
+                specs.text = specs.text + kind
+                if name.length() > 0 { specs.text = specs.text + " " + name }
+                specs.has_type = true
+                any = true
+                continue
+            }
+            if t == "enum" {
+                val eline = self.lineAt(0)
+                self.advance()
+                while self.at("__attribute__") || self.at("__attribute") { self.skipAttribute() }
+                var name = ""
+                if self.kindAt(0) == CTokKind.Ident {
+                    name = self.textAt(0) + ""
+                    self.advance()
+                }
+                while self.at("__attribute__") || self.at("__attribute") { self.skipAttribute() }
+                var variants: i64 = 0
+                if self.at("{") {
+                    self.advance()
+                    while !self.at("}") && !self.atEof() {
+                        if self.kindAt(0) != CTokKind.Ident {
+                            self.error("expected enum constant")
+                            if !self.atEof() { self.advance() }
+                            continue
+                        }
+                        variants = variants + 1
+                        self.advance()
+                        if self.accept("=") { self.parseConditional() }
+                        if !self.accept(",") { break }
+                    }
+                    self.expect("}")
+                }
+                if name.length() > 0 { self.unit.addRecord("enum", name, 0, variants, eline) }
+                if specs.text.length() > 0 { specs.text = specs.text + " " }
+                specs.text = specs.text + "enum"
+                if name.length() > 0 { specs.text = specs.text + " " + name }
+                specs.has_type = true
+                any = true
+                continue
+            }
+            if self.isTypeStartTok(0) || (self.kindAt(0) == CTokKind.Ident && self.typedefs.indexOf(t) >= 0) {
+                if specs.text.length() > 0 { specs.text = specs.text + " " }
+                specs.text = specs.text + t
+                specs.has_type = true
+                any = true
+                self.advance()
+                continue
+            }
+            if self.kindAt(0) == CTokKind.Ident {
+                val nextIdent = self.kindAt(1) == CTokKind.Ident
+                val ptrDecl = self.textAt(1) == "*" && self.kindAt(2) == CTokKind.Ident
+                if nextIdent || ptrDecl {
+                    if specs.text.length() > 0 { specs.text = specs.text + " " }
+                    specs.text = specs.text + t
+                    specs.has_type = true
+                    any = true
+                    self.advance()
+                    continue
+                }
+            }
+            break
+        }
+        ret any
+    }
+
+    fun parseRecordBody(kind: str, name: str): void {
+        val rline = self.lineAt(0)
+        self.expect("{")
+        var fields: i64 = 0
+        while !self.at("}") && !self.atEof() {
+            if self.accept(";") { continue }
+            if self.kindAt(0) == CTokKind.Preproc { self.advance(); continue }
+            if self.kindAt(0) == CTokKind.Comment { self.advance(); continue }
+            val fspec = C2Specs()
+            if !self.parseSpecs(fspec) {
+                self.error("expected a struct member")
+                if !self.atEof() { self.advance() }
+                continue
+            }
+            if self.accept(";") { continue }
+            var more = true
+            while more {
+                val before = self.pos
+                var fname = ""
+                var text = ""
+                var depth: i64 = 0
+                while !self.atEof() {
+                    val tx = self.textAt(0)
+                    if depth == 0 && (tx == "," || tx == ";" || tx == ":") { break }
+                    if tx == "(" || tx == "[" { depth = depth + 1 }
+                    else if tx == ")" || tx == "]" { depth = depth - 1 }
+                    if fname.length() == 0 && self.kindAt(0) == CTokKind.Ident { fname = tx }
+                    if text.length() > 0 && self.kindAt(0) != CTokKind.Punct { text = text + " " }
+                    text = text + tx
+                    self.advance()
+                }
+                if fname.length() == 0 && self.pos == before {
+                    self.error("expected a member declarator")
+                    more = false
+                    break
+                }
+                if self.accept(":") { self.parseConditional() }
+                fields = fields + 1
+                more = self.accept(",")
+            }
+            self.expect(";")
+        }
+        self.expect("}")
+        if name.length() > 0 { self.unit.addRecord(kind, name, fields, 0, rline) }
+    }
+
+    fun parseDeclarator(specs: C2Specs): C2Decl {
+        val d = C2Decl()
+        var text = ""
+        var name = ""
+        var depth: i64 = 0
+        while !self.atEof() {
+            val tx = self.textAt(0)
+            if tx == "__extension__" { self.advance(); continue }
+            if tx == "__attribute__" || tx == "__attribute" { self.skipAttribute(); continue }
+            if depth == 0 && (tx == "," || tx == ";" || tx == "=" || tx == "{") { break }
+            if tx == "(" || tx == "[" { depth = depth + 1 }
+            else if tx == ")" || tx == "]" { depth = depth - 1 }
+            if name.length() == 0 && self.kindAt(0) == CTokKind.Ident { name = tx }
+            if text.length() > 0 && self.kindAt(0) != CTokKind.Punct { text = text + " " }
+            text = text + tx
+            self.advance()
+        }
+        d.name = name.substring(0, name.length())
+        d.type = specs.text
+        if text.length() > 0 { d.type = d.type + " " + text }
+
+        val needle = name + "("
+        var compact = ""
+        var ci: i64 = 0
+        while ci < text.length() {
+            val c = text.at(ci)
+            if c != 32 && c != 9 { compact = compact + text.substring(ci, ci + 1) }
+            ci = ci + 1
+        }
+        if name.length() > 0 && compact.indexOf(needle) >= 0 {
+            val open = compact.indexOf(needle) + name.length()
+            val close = compact.lastIndexOf(")")
+            d.is_func = true
+            d.return_type = specs.text
+            if open < close {
+                val inside = compact.substring(open + 1, close)
+                if inside.length() > 0 && inside != "void" {
+                    if inside.indexOf("...") >= 0 { d.variadic = true }
+                    var start: i64 = 0
+                    var pd: i64 = 0
+                    var i: i64 = 0
+                    while i <= inside.length() {
+                        if i == inside.length() || (inside.at(i) == 44 && pd == 0) {
+                            val part = inside.substring(start, i)
+                            if part.length() > 0 && part != "..." { d.params = d.params + 1 }
+                            start = i + 1
+                        } else if inside.at(i) == 40 || inside.at(i) == 91 {
+                            pd = pd + 1
+                        } else if inside.at(i) == 41 || inside.at(i) == 93 {
+                            pd = pd - 1
+                        }
+                        i = i + 1
+                    }
+                }
+            }
+        }
+        ret d
+    }
+
+    fun addDeclarator(specs: C2Specs, d: C2Decl): void {
+        if d.name.length() == 0 { ret }
+        if specs.is_typedef {
+            self.typedefs.add(d.name)
+            self.unit.addTypedef(d.name, d.type)
+            ret
+        }
+        if d.is_func {
+            val rt = (d.return_type.length() > 0 ? d.return_type + "" : specs.text + "")
+            self.unit.addFunc(d.name, rt, d.params, d.variadic, d.definition, self.lineAt(0))
+        }
+    }
+
+    fun parseCompound(): void {
+        self.expect("{")
+        while !self.at("}") && !self.atEof() {
+            if self.kindAt(0) == CTokKind.Preproc { self.advance(); continue }
+            if self.kindAt(0) == CTokKind.Comment { self.advance(); continue }
+            self.parseStatement()
+        }
+        self.expect("}")
+    }
+
+    fun parseStatement(): void {
+        if self.isTypeStartHere() {
+            val s = C2Specs()
+            if self.parseSpecs(s) {
+                if !self.accept(";") {
+                    var more = true
+                    while more {
+                        val d = self.parseDeclarator(s)
+                        self.addDeclarator(s, d)
+                        self.parseInitializerOpt()
+                        more = self.accept(",")
+                    }
+                    self.expect(";")
+                }
+                ret
+            }
+        }
+        if self.at("{") { self.parseCompound(); ret }
+        if self.accept(";") { ret }
+        if self.accept("if") {
+            self.expect("(")
+            self.parseExpression()
+            self.expect(")")
+            self.parseStatement()
+            if self.accept("else") { self.parseStatement() }
+            ret
+        }
+        if self.accept("switch") {
+            self.expect("(")
+            self.parseExpression()
+            self.expect(")")
+            self.parseStatement()
+            ret
+        }
+        if self.accept("while") {
+            self.expect("(")
+            self.parseExpression()
+            self.expect(")")
+            self.parseStatement()
+            ret
+        }
+        if self.accept("do") {
+            self.parseStatement()
+            self.expect("while")
+            self.expect("(")
+            self.parseExpression()
+            self.expect(")")
+            self.expect(";")
+            ret
+        }
+        if self.accept("for") {
+            self.expect("(")
+            if self.isTypeStartHere() {
+                val s = C2Specs()
+                self.parseSpecs(s)
+                if !self.accept(";") {
+                    self.parseDeclarator(s)
+                    self.parseInitializerOpt()
+                    while self.accept(",") {
+                        self.parseDeclarator(s)
+                        self.parseInitializerOpt()
+                    }
+                    self.expect(";")
+                }
+            } else if !self.accept(";") {
+                self.parseExpression()
+                self.expect(";")
+            }
+            if !self.at(";") { self.parseExpression() }
+            self.expect(";")
+            if !self.at(")") { self.parseExpression() }
+            self.expect(")")
+            self.parseStatement()
+            ret
+        }
+        if self.accept("return") {
+            if !self.at(";") { self.parseExpression() }
+            self.expect(";")
+            ret
+        }
+        if self.accept("break") || self.accept("continue") {
+            self.expect(";")
+            ret
+        }
+        if self.accept("goto") {
+            if !self.atEof() { self.advance() }
+            self.expect(";")
+            ret
+        }
+        if self.accept("case") {
+            self.parseConditional()
+            self.expect(":")
+            self.parseStatement()
+            ret
+        }
+        if self.accept("default") {
+            self.expect(":")
+            self.parseStatement()
+            ret
+        }
+        if self.kindAt(0) == CTokKind.Ident && self.textAt(1) == ":" {
+            self.advance()
+            self.advance()
+            self.parseStatement()
+            ret
+        }
+        self.parseExpression()
+        self.expect(";")
+    }
+
+    fun parseInitializerOpt(): void {
+        if !self.accept("=") { ret }
+        self.parseInitializer()
+    }
+
+    fun parseInitializer(): void {
+        if self.accept("{") {
+            while !self.at("}") && !self.atEof() {
+                if self.accept(".") {
+                    if !self.atEof() { self.advance() }
+                    if self.accept("=") { self.parseInitializer() }
+                } else if self.accept("[") {
+                    self.parseConditional()
+                    self.expect("]")
+                    if self.accept("=") { self.parseInitializer() }
+                } else {
+                    self.parseInitializer()
+                }
+                if !self.accept(",") { break }
+            }
+            self.expect("}")
+            ret
+        }
+        self.parseAssignment()
+    }
+
+    fun parseExpression(): void {
+        self.parseAssignment()
+        while self.accept(",") { self.parseAssignment() }
+    }
+
+    fun isAssignOp(w: str): bool {
+        if w == "=" || w == "+=" || w == "-=" || w == "*=" || w == "/=" || w == "%=" { ret true }
+        if w == "<<=" || w == ">>=" || w == "&=" || w == "^=" || w == "|=" { ret true }
+        ret false
+    }
+
+    fun parseAssignment(): void {
+        self.parseConditional()
+        if self.isAssignOp(self.textAt(0)) {
+            self.advance()
+            self.parseAssignment()
+        }
+    }
+
+    fun parseConditional(): void {
+        self.parseBinary(0)
+        if self.accept("?") {
+            self.parseExpression()
+            self.expect(":")
+            self.parseConditional()
+        }
+    }
+
+    fun precedence(w: str): i64 {
+        if w == "||" { ret 1 }
+        if w == "&&" { ret 2 }
+        if w == "|" { ret 3 }
+        if w == "^" { ret 4 }
+        if w == "&" { ret 5 }
+        if w == "==" || w == "!=" { ret 6 }
+        if w == "<" || w == ">" || w == "<=" || w == ">=" { ret 7 }
+        if w == "<<" || w == ">>" { ret 8 }
+        if w == "+" || w == "-" { ret 9 }
+        if w == "*" || w == "/" || w == "%" { ret 10 }
+        ret -1
+    }
+
+    fun parseBinary(minPrec: i64): void {
+        self.parseUnary()
+        while true {
+            val prec = self.precedence(self.textAt(0))
+            if prec < minPrec { break }
+            self.advance()
+            self.parseBinary(prec + 1)
+        }
+    }
+
+    fun parseUnary(): void {
+        val w = self.textAt(0)
+        if w == "++" || w == "--" || w == "&" || w == "*" || w == "+" || w == "-" || w == "~" || w == "!" {
+            self.advance()
+            self.parseUnary()
+            ret
+        }
+        if self.accept("sizeof") {
+            if self.accept("(") {
+                if self.isTypeStartHere() {
+                    self.parseTypeName()
+                    self.expect(")")
+                } else {
+                    self.parseExpression()
+                    self.expect(")")
+                }
+            } else {
+                self.parseUnary()
+            }
+            ret
+        }
+        if self.at("(") {
+            val save = self.pos
+            self.advance()
+            if self.isTypeStartHere() {
+                self.parseTypeName()
+                if self.accept(")") {
+                    if self.at("{") { self.parseInitializer() }
+                    else { self.parseUnary() }
+                    ret
+                }
+            }
+            self.pos = save
+        }
+        self.parsePostfix()
+    }
+
+    fun parsePostfix(): void {
+        self.parsePrimary()
+        while true {
+            if self.accept("[") {
+                self.parseExpression()
+                self.expect("]")
+            } else if self.accept("(") {
+                if !self.at(")") {
+                    var more = true
+                    while more {
+                        self.parseAssignment()
+                        more = self.accept(",")
+                    }
+                }
+                self.expect(")")
+            } else if self.accept(".") || self.accept("->") {
+                if !self.atEof() { self.advance() }
+            } else if self.accept("++") || self.accept("--") {
+            } else {
+                break
+            }
+        }
+    }
+
+    fun parsePrimary(): void {
+        val k = self.kindAt(0)
+        if k == CTokKind.IntLit || k == CTokKind.FloatLit || k == CTokKind.StringLit || k == CTokKind.CharLit || k == CTokKind.Ident {
+            self.advance()
+            ret
+        }
+        if self.accept("(") {
+            self.parseExpression()
+            self.expect(")")
+            ret
+        }
+        self.error("expected expression, found '" + self.textAt(0) + "'")
+        if !self.atEof() { self.advance() }
+    }
+
+    fun parseTypeName(): void {
+        val s = C2Specs()
+        if !self.parseSpecs(s) {
+            self.error("expected a type name")
+            ret
+        }
+        var depth: i64 = 0
+        while !self.atEof() {
+            val w = self.textAt(0)
+            if depth == 0 && (w == ")" || w == "," || w == ";" || w == "{") { break }
+            if w == "(" || w == "[" { depth = depth + 1 }
+            else if w == ")" || w == "]" { depth = depth - 1 }
+            self.advance()
+        }
+    }
+}
+
+pub fun parseC(src: str): CUnit {
+    val toks = lexC(src)
+    ret C2Parser(toks).parse()
+}

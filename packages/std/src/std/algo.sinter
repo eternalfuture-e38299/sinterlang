@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// Sinter standard library: small, dependency-free algorithms.
+// These operate on Array<i64> / Array<str> and use only std containers.
+module std.algo
+
+import std
+import std.arrays
+import std.list
+import std.string
+
+/// Append `xs` with adjacent duplicates removed to `out` (input sorted).
+/// Out-parameter form avoids returning a cleanup-managed local container.
+pub fun uniqueInt(xs: Array<i64>, out: List<i64>): void {
+    var i: i64 = 0
+    while i < xs.size {
+        if i == 0 || xs.get(i) != xs.get(i - 1) { out.add(xs.get(i)) }
+        i = i + 1
+    }
+}
+
+/// In-place rotation by `k` positions (positive rotates left).
+pub fun rotateInt(xs: Array<i64>, k: i64): void {
+    val n = xs.size
+    if n <= 1 { ret }
+    var shift = k % n
+    if shift < 0 { shift = shift + n }
+    if shift == 0 { ret }
+    // left rotation: reverse [0,shift), [shift,n), then the whole array
+    var i: i64 = 0
+    var j: i64 = shift - 1
+    while i < j {
+        val t = xs.get(i); xs.set(i, xs.get(j)); xs.set(j, t)
+        i = i + 1; j = j - 1
+    }
+    i = shift; j = n - 1
+    while i < j {
+        val t = xs.get(i); xs.set(i, xs.get(j)); xs.set(j, t)
+        i = i + 1; j = j - 1
+    }
+    i = 0; j = n - 1
+    while i < j {
+        val t = xs.get(i); xs.set(i, xs.get(j)); xs.set(j, t)
+        i = i + 1; j = j - 1
+    }
+}
+
+/// Partition around `pivot`; returns the first index of the right partition.
+pub fun partitionInt(xs: Array<i64>, pivot: i64): i64 {
+    var left: i64 = 0
+    var i: i64 = 0
+    while i < xs.size {
+        if xs.get(i) < pivot {
+            val t = xs.get(i); xs.set(i, xs.get(left)); xs.set(left, t)
+            left = left + 1
+        }
+        i = i + 1
+    }
+    ret left
+}
+
+/// k-th smallest element (0-based). Makes a sorted copy; does not mutate input.
+pub fun nthSmallestInt(xs: Array<i64>, k: i64): i64 {
+    if k < 0 || k >= xs.size { ret 0 }
+    val copy = xs.copyOf()
+    copy.sort()
+    ret copy.get(k)
+}
+
+/// Levenshtein edit distance.
+pub fun levenshtein(a: str, b: str): i64 {
+    val n = b.length()
+    val row: Array<i64> = intArray(n + 1, 0)
+    var j: i64 = 0
+    while j <= n { row.set(j, j); j = j + 1 }
+
+    var i: i64 = 1
+    while i <= a.length() {
+        var prev = row.get(0)
+        row.set(0, i)
+        j = 1
+        while j <= n {
+            val old = row.get(j)
+            var cost: i64 = 1
+            if a.at(i - 1) == b.at(j - 1) { cost = 0 }
+            var best = row.get(j) + 1
+            if row.get(j - 1) + 1 < best { best = row.get(j - 1) + 1 }
+            if prev + cost < best { best = prev + cost }
+            row.set(j, best)
+            prev = old
+            j = j + 1
+        }
+        i = i + 1
+    }
+    ret row.get(n)
+}
+
+pub fun isPalindrome(s: str): bool {
+    var i: i64 = 0
+    var j: i64 = s.length() - 1
+    while i < j {
+        if s.at(i) != s.at(j) { ret false }
+        i = i + 1
+        j = j - 1
+    }
+    ret true
+}
+
+/// Longest common prefix of all strings; "" for an empty array.
+pub fun longestCommonPrefix(xs: Array<str>): str {
+    if xs.size == 0 { ret "" }
+    var end = xs.get(0).length()
+    var i: i64 = 1
+    while i < xs.size {
+        val s = xs.get(i)
+        var j: i64 = 0
+        while j < end && j < s.length() && xs.get(0).at(j) == s.at(j) { j = j + 1 }
+        end = j
+        if end == 0 { ret "" }
+        i = i + 1
+    }
+    ret xs.get(0).substring(0, end)
+}
+
+/// Count non-overlapping occurrences of `needle`.
+pub fun countOccurrences(text: str, needle: str): i64 {
+    if needle.length() == 0 { ret 0 }
+    var count: i64 = 0
+    var at = text.indexOf(needle)
+    while at >= 0 {
+        count = count + 1
+        at = text.indexOfFrom(needle, at + needle.length())
+    }
+    ret count
+}

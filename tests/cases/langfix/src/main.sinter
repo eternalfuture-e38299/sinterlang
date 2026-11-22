@@ -1,0 +1,26 @@
+// tests/cases/langfix —— 1.0 前修掉的三个「用户看到的是 gcc 报错」的问题
+//
+//   L1  `fun f(): void => expr` 不再生成 `void __ret = expr;`
+//       （C 里没有 void 变量；`return expr;` 在 ISO C 里也不允许）
+//   L2  泛型函数的模板原型不再漏进头文件（`(T a, T b)` 是未单态化的类型）
+//       `fun add<T,>` 的尾随逗号是同一条路径上的历史症状。
+//   L3  字符串字面量的长度按**解码后**的字节数算：
+//       `"a\"b"` 是 3 个字节（a " b），不是 4 个源码字符。
+module langfix
+import std
+import std.string
+
+fun dump(x: i64): void => println(x)
+
+fun add<T,>(a: T, b: T): T => a + b
+
+fun main(): void {
+    dump(7)
+    println(add(3, 4))
+    // 含转义的字面量：内容 3 字节
+    println("a\"b")
+    println("a\"b".length())
+    // 反斜杠自己也是 1 字节，内容 10 字节
+    println("back\\slash")
+    println("back\\slash".length())
+}

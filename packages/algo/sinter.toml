@@ -1,0 +1,13 @@
+[package]
+name = "algo"
+version = "1.0.0"
+entry = "src/algo/aes.sinter"
+description = "Independent Sinter algorithm library: AES block/CBC/CTR (self-contained, no external crypto dependency)"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "algo_lib"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../std" }

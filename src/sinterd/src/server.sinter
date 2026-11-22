@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Unix-socket line protocol loop for the self-hosted sinterd.
+module server
+
+import std
+import std.io
+import csupport
+import ops
+
+pub class Server {
+    var socket_path: str
+    var verbose: bool
+    var running: bool
+
+    Server(path: str, talk: bool) {
+        self.socket_path = path
+        self.verbose = talk
+        self.running = true
+    }
+
+    pub fun run(): i64 {
+        val server = unixListen(self.socket_path)
+        if server < 0 {
+            writeErrLine("sinterd: cannot listen on " + self.socket_path)
+            ret 1
+        }
+        writeErrLine("sinterd " + ops.version() + " listening on " + self.socket_path)
+        while self.running {
+            val client = unixAccept(server)
+            if client < 0 { break }
+            var open = true
+            while open && self.running {
+                val line = readLineFd(client)
+                if line.length() == 0 { break }
+                if self.verbose { writeErrLine("<- " + line) }
+                val reply = ops.handleRaw(line)
+                if self.verbose { writeErrLine("-> " + reply) }
+                if writeFd(client, reply) != 0 { open = false }
+                if reply.contains("\"bye\":true") { self.running = false }
+            }
+            closeFd(client)
+        }
+        closeFd(server)
+        ret 0
+    }
+}

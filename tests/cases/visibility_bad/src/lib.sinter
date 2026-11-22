@@ -1,0 +1,6 @@
+module lib
+import std
+
+pub class Greeter() {
+    fun secret(): str => "s"
+}

@@ -1,0 +1,19 @@
+// tests/cases/cstd —— [build] cstd 的回归
+//
+// 验证两件事：
+//   1. sinter.toml 里的 cstd 真的传到了 CMake（assert_gen.txt 断言 CMakeLists 内容）；
+//   2. 在严格 C17 下程序照样编得过、跑得对（expect.txt 断言输出）。
+// 代码本身刻意用上字符串拼接与 for 循环，保证生成的不是空翻译单元。
+module cstd
+import std
+
+fun cat2(a: str, b: str): str { return a + b }
+
+fun main(): void {
+    var total = 0
+    for (i in 0..3) {
+        total = total + i
+    }
+    println("cstd=" + cat2("1", "7"))
+    println(total)
+}

@@ -1,0 +1,40 @@
+# file header
+title = "Sinter" # title comment
+enabled = true
+count = 3
+ratio = 2.5
+hex = 0xff
+bin = 0b1010
+
+# dates
+offset_dt = 1979-05-27T07:32:00.999999-07:30
+local_dt = 1979-05-27T07:32:00
+local_date = 1979-05-27
+local_time = 07:32:00.5
+
+# arrays with comments
+tags = [ # open
+    "a", # first
+    # second
+    "b",
+]
+
+[server] # server comment
+host = "localhost"
+port = 8080
+
+[server.tls]
+enabled = false
+
+[[products]] # first product
+name = "hammer"
+price = 10
+
+[[products]]
+name = "nail"
+price = 1
+
+[products.details]
+weight = 2.5
+
+# file tail

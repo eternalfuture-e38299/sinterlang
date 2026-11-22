@@ -1,0 +1,303 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted sinterc entry point: modules, syntax, C backend.
+module main
+
+import std
+import std.file
+import std.string
+import std.list
+import std.io
+import syntax
+import lexer
+import parser
+import codegen
+import sem
+import rt
+import sver
+
+fun version(): str => sver.text()
+
+fun defaultOut(path: str): str {
+    if path.endsWith(".sinter") { ret path.substring(0, path.length() - 7) + ".c" }
+    ret path + ".c"
+}
+
+fun printDiags(diags: Diagnostics): void {
+    var i: i64 = 0
+    while i < diags.size() {
+        writeErrLine("" + fromInt(diags.line(i)) + ":" + fromInt(diags.col(i)) + ": " + diags.message(i))
+        i = i + 1
+    }
+}
+
+fun dirOf(path: str): str {
+    val i = path.lastIndexOf("/")
+    if i < 0 { ret "." }
+    ret path.substring(0, i)
+}
+
+fun joinPath(a: str, b: str): str {
+    if a.length() == 0 { ret b }
+    if a.endsWith("/") { ret a + b }
+    ret a + "/" + b
+}
+
+fun importRel(name: str): str {
+    var out = ""
+    var i: i64 = 0
+    while i < name.length() {
+        if name.at(i) == 46 { out = out + "/" } else { out = out + name.substring(i, i + 1) }
+        i = i + 1
+    }
+    ret out
+}
+
+fun resolveImport(name: str, base: str, incs: List<str>): str {
+    val rel = importRel(name)
+    var cand = joinPath(base, rel + ".sinter")
+    if std.file.exists(cand) { ret cand }
+    cand = joinPath(base, rel)
+    if std.file.exists(cand) { ret cand }
+    var i: i64 = 0
+    while i < incs.size() {
+        cand = joinPath(incs.get(i), rel + ".sinter")
+        if std.file.exists(cand) { ret cand }
+        cand = joinPath(incs.get(i), rel)
+        if std.file.exists(cand) { ret cand }
+        i = i + 1
+    }
+    ret ""
+}
+
+fun firstModule(ast: Ast, root: i64): str {
+    var i: i64 = 0
+    while i < ast.size(root) {
+        val n = ast.child(root, i)
+        if ast.kind(n) == NodeKind.Module { ret ast.text(n) }
+        i = i + 1
+    }
+    ret ""
+}
+
+fun loadModule(ast: Ast, root: i64, path: str, diags: Diagnostics, incs: List<str>, seen: List<str>): void {
+    if seen.indexOf(path) >= 0 { ret }
+    seen.add(path)
+    val src = readText(path)
+    if src.length() == 0 && !std.file.exists(path) {
+        diags.add(1, 1, "cannot read " + path)
+        ret
+    }
+    val toks = Tokens()
+    Lexer(src).tokenize(toks, diags)
+    val before = ast.size(root)
+    Parser(toks, ast, diags).parseModuleInto(root)
+    val base = dirOf(path)
+    var i: i64 = before
+    while i < ast.size(root) {
+        val n = ast.child(root, i)
+        if ast.kind(n) == NodeKind.Import {
+            val p = resolveImport(ast.text(n), base, incs)
+            if p.length() == 0 {
+                diags.add(ast.line(n), ast.col(n), "import not found: " + ast.text(n))
+            } else {
+                loadModule(ast, root, p, diags, incs, seen)
+            }
+        }
+        i = i + 1
+    }
+}
+
+fun checkFile(path: str): i64 {
+    resetCleanup()
+    val toks = Tokens()
+    val diags = Diagnostics()
+    Lexer(readText(path)).tokenize(toks, diags)
+    val ast = Ast()
+    Parser(toks, ast, diags).parseProgram()
+    printDiags(diags)
+    ret diags.size()
+}
+
+fun safeName(m: str): str {
+    var out = ""
+    var i: i64 = 0
+    while i < m.length() {
+        val c = m.at(i)
+        if c == 46 { out = out + "_" } else { out = out + m.substring(i, i + 1) }
+        i = i + 1
+    }
+    ret out
+}
+
+fun collectModules(ast: Ast, root: i64, entry: str, mods: List<str>): void {
+    if entry.length() > 0 { mods.add(cloneText(entry)) }
+    var i: i64 = 0
+    while i < ast.size(root) {
+        val n = ast.child(root, i)
+        if ast.kind(n) == NodeKind.Module {
+            var m = cloneText(ast.text(n))
+            if m.length() == 0 { m = "program" }
+            if mods.indexOf(m) < 0 { mods.add(m) }
+        }
+        i = i + 1
+    }
+    if mods.size() == 0 { mods.add("program") }
+}
+
+fun writeTextIfChanged(path: str, text: str): void {
+    if std.file.exists(path) && readText(path) == text { ret }
+    std.file.writeText(path, text)
+}
+
+fun usage(): void {
+    writeLine("sinterc " + version() + " — Sinter compiler (Sinter -> C)")
+    writeLine("")
+    writeLine("Usage: sinterc <entry.sinter> [-o <out_dir>] [-I <dir> ...]")
+    writeLine("                [--emit-sources-list <file.cmake>]")
+    writeLine("                [-D key=value ...]")
+    writeLine("                [--cstd <std>]")
+    writeLine("                [--target-os=<os>] [--target-arch=<arch>]")
+    writeLine("                [--release|--debug]")
+    writeLine("")
+    writeLine("  --emit-sources-list <file>")
+    writeLine("      Write all C sources produced by this run (one per module plus the")
+    writeLine("      runtime) as a CMake-includable script.")
+    writeLine("  --cstd <std>")
+    writeLine("      C standard to print in the manual link command (e.g. c17 / gnu11).")
+    writeLine("      It does not affect codegen; the actual flag lives in the build system.")
+    writeLine("  --version, -V")
+    writeLine("      Print the compiler version and exit.")
+}
+
+fun emitDir(path: str, outDir: str, incs: List<str>, listPath: str, cstd: str): i64 {
+    resetCleanup()
+    if !std.file.exists(path) {
+        writeErrLine("entry not found: " + path)
+        ret 1
+    }
+    val diags = Diagnostics()
+    val ast = Ast()
+    val root = ast.add(NodeKind.Program, "", 1, 1)
+    val seen = List<str>()
+    loadModule(ast, root, path, diags, incs, seen)
+    printDiags(diags)
+    if diags.size() > 0 { ret 1 }
+    val entry = firstModule(ast, root)
+    qualifyModules(ast, root, entry)
+    val mods = List<str>()
+    collectModules(ast, root, entry, mods)
+    std.file.mkdirs(outDir)
+
+    val headerDiags = Diagnostics()
+    val headerGen = CodeGen(ast, headerDiags)
+    val headerBody = headerGen.generateDeclarations(root)
+    printDiags(headerDiags)
+    if headerDiags.size() > 0 { ret 1 }
+
+    val rtH = runtimeHeaderText()
+    val rtPath = joinPath(outDir, "sinter_runtime.c")
+    val rtHPath = joinPath(outDir, "sinter_runtime.h")
+    writeTextIfChanged(rtHPath, rtH)
+    writeTextIfChanged(rtPath, rtH + "\n" + runtimeSourceText())
+
+    val srcs = List<str>()
+    val srcNames = List<str>()
+    srcs.add(rtPath)
+    srcNames.add("sinter_runtime.c")
+    var bad: i64 = 0
+    var mi: i64 = 0
+    while mi < mods.size() {
+        val mod = mods.get(mi)
+        val stem = "sinter_" + safeName(mod)
+        val cfile = joinPath(outDir, stem + ".c")
+        val hfile = joinPath(outDir, stem + ".h")
+        val guard = "SINTER_MODULE_" + safeName(mod) + "_H"
+        var htext = "/* Sinter module " + mod + " public interface - generated by sinterc */\n"
+        htext = htext + "#ifndef " + guard + "\n#define " + guard + "\n\n"
+        htext = htext + headerBody + "\n#endif /* " + guard + " */\n"
+        val moduleDiags = Diagnostics()
+        val cg = CodeGen(ast, moduleDiags)
+        val c = cg.generateModule(root, mod)
+        printDiags(moduleDiags)
+        bad = bad + moduleDiags.size()
+        writeTextIfChanged(cfile, c)
+        writeTextIfChanged(hfile, htext)
+        srcs.add(cfile)
+        srcNames.add(stem + ".c")
+        writeLine("  [module] " + mod + " -> " + cfile + " + " + hfile)
+        mi = mi + 1
+    }
+    if listPath.length() > 0 {
+        var list = "# Generated by sinterc: C sources produced by this run (for CMake include)\nset(SINTER_SOURCE_LIST\n"
+        var si: i64 = 0
+        while si < srcNames.size() {
+            list = list + "        \"" + "$" + "{CMAKE_CURRENT_LIST_DIR}/" + srcNames.get(si) + "\"\n"
+            si = si + 1
+        }
+        list = list + ")\n"
+        writeTextIfChanged(listPath, list)
+    }
+    var cmd = "gcc "
+    if cstd.length() > 0 { cmd = cmd + "-std=" + cstd + " " }
+    var ci: i64 = 0
+    while ci < srcs.size() {
+        cmd = cmd + srcs.get(ci) + " "
+        ci = ci + 1
+    }
+    cmd = cmd + "-o " + joinPath(outDir, "program") + " -I " + outDir + " -lm -pthread"
+    writeLine("")
+    writeLine("Link command:")
+    writeLine("  " + cmd)
+    if bad > 0 { ret 1 }
+    ret 0
+}
+
+fun main(argc: i32, argv: **u8): i32 {
+    val args = List<str>()
+    var i: i32 = 1
+    while i < argc {
+        args.add(fromCStr(argv[i]))
+        i = i + 1
+    }
+    if args.size() == 0 { usage(); ret 1 }
+    if args.get(0) == "--version" || args.get(0) == "-V" { writeLine("sinterc " + version()); ret 0 }
+    if args.get(0) == "--help" || args.get(0) == "-h" { usage(); ret 0 }
+    if args.get(0) == "--check" {
+        if args.size() < 2 { usage(); ret 1 }
+        var bad: i64 = 0
+        var k: i64 = 1
+        while k < args.size() {
+            bad = bad + checkFile(args.get(k))
+            k = k + 1
+        }
+        if bad > 0 { ret 1 }
+        ret 0
+    }
+    var outDir = "."
+    var input = ""
+    var listPath = ""
+    var cstd = ""
+    val incs = List<str>()
+    var j: i64 = 0
+    while j < args.size() {
+        val a = args.get(j)
+        if a == "-o" && j + 1 < args.size() { outDir = args.get(j + 1); j = j + 2 }
+        else if a == "-I" && j + 1 < args.size() { incs.add(args.get(j + 1)); j = j + 2 }
+        else if a == "--emit-sources-list" && j + 1 < args.size() { listPath = args.get(j + 1); j = j + 2 }
+        else if a == "--cstd" && j + 1 < args.size() { cstd = args.get(j + 1); j = j + 2 }
+        else if a.startsWith("--cstd=") { cstd = a.substring(7, a.length()); j = j + 1 }
+        else if a == "-D" && j + 1 < args.size() { j = j + 2 }
+        else if a.startsWith("--target-os=") || a.startsWith("--target-arch=") || a.startsWith("--target-endian=") { j = j + 1 }
+        else if a == "--release" || a == "--debug" { j = j + 1 }
+        else if a == "--help" || a == "-h" { usage(); ret 0 }
+        else if a.length() > 0 && a.at(0) == 45 { writeErrLine("unknown option: " + a); ret 1 }
+        else {
+            if input.length() == 0 { input = a } else { outDir = a }
+            j = j + 1
+        }
+    }
+    if input.length() == 0 { usage(); ret 1 }
+    ret emitDir(input, outDir, incs, listPath, cstd) as i32
+}

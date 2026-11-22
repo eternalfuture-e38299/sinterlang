@@ -1,0 +1,16 @@
+[package]
+name = "sinter"
+version = "file:../version.txt"
+entry = "src/main.sinter"
+description = "Self-hosted Sinter package manager and build frontend"
+authors = ["sinter"]
+license = "MIT"
+artifact = "exe"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../packages/std" }
+sfmt = { version = "1.0.0", source = "path:../libs/sfmt" }
+sver = { version = "1.0.0", source = "path:../libs/sver" }
+
+[build]
+opt = "2"

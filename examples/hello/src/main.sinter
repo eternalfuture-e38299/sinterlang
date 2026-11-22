@@ -1,0 +1,32 @@
+// examples/hello —— 入门项目：输出、字符串工具、泛型容器
+//
+// 构建：sinter build --run
+// 容器是泛型的：`List<str>` 与 `HashMap<str, i64>` 在编译期单态化，
+// 字符串特化出结构体 `std_generic_list_str` / `std_generic_hash_map_str_i64`。
+module hello
+import std
+// 容器与字符串工具都要显式 import：`import std` 只带 prelude。
+import std.string
+import std.list
+import std.hashmap
+
+fun main(): void {
+    println("hello, sinter")
+    println(42)
+    println(3.14159)
+    println("sqrt(16) = ${sqrt(16.0)}")
+    println("upper = ${"sinter".uppercase()}")
+
+    val names = List<str>()
+    names.add("ada")
+    names.add("grace")
+    println("names = ${names.size()}")
+    println(names.get(0))
+    println(names.get(1))
+
+    val scores = HashMap<str, i64>()
+    scores.put("ada", 100)
+    scores.put("grace", 99)
+    println("ada = ${scores.get("ada")}")
+    println("grace = ${scores.getOr("grace", -1)}")
+}

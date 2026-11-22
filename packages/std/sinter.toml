@@ -1,0 +1,10 @@
+[package]
+name = "std"
+version = "1.5.2"
+entry = "src/std.sinter"
+description = "Sinter standard library: prelude (std) + std.core / std.string / std.arrays / std.generic / std.box / std.pair / std.list / std.map / std.hashmap / std.io / std.filesystem / std.path / std.file / std.stream / std.thread / std.async / std.result / std.option / std.text / std.math / std.time / std.random / std.set / std.env / std.memory / std.sys / std.binary / std.algo; every non-prelude module must be imported explicitly"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "std_sinter"

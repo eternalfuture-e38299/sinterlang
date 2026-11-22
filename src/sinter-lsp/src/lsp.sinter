@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Minimal self-hosted LSP server: JSON-RPC over stdio, syntax diagnostics,
+// document symbols and hover.  It reuses the same lexer/parser as the
+// bootstrap compiler.
+module lsp
+
+import std
+import std.io
+import std.string
+import std.text
+import std.list
+import std.hashmap
+import json
+import syntax
+import lexer
+import parser
+import rt
+
+fun jquote(s: str): str {
+    val sb = StringBuilder()
+    sb.appendByte(34u8)
+    var i: i64 = 0
+    while i < s.length() {
+        val c = s.at(i)
+        if c == 34 { sb.append("\\\"") }
+        else if c == 92 { sb.append("\\\\") }
+        else if c == 10 { sb.append("\\n") }
+        else if c == 13 { sb.append("\\r") }
+        else if c == 9 { sb.append("\\t") }
+        else if c < 32 { sb.append(" ") }
+        else { sb.appendByte((c % 256) as u8) }
+        i = i + 1
+    }
+    sb.appendByte(34u8)
+    ret sb.toString()
+}
+
+fun readHeaderLine(): str {
+    val sb = StringBuilder()
+    while true {
+        val c = readByte()
+        if c < 0 { ret sb.toString() }
+        if c == 10 { ret sb.toString() }
+        if c != 13 { sb.appendByte((c % 256) as u8) }
+    }
+    ret sb.toString()
+}
+
+fun readMessage(): str {
+    var len: i64 = -1
+    while true {
+        val line = readHeaderLine()
+        if line.length() == 0 { break }
+        if line.startsWith("Content-Length:") {
+            len = line.substring(15, line.length()).trim().toInt()
+        }
+    }
+    if len < 0 { ret "" }
+    val sb = StringBuilder()
+    var i: i64 = 0
+    while i < len {
+        val c = readByte()
+        if c < 0 { break }
+        sb.appendByte((c % 256) as u8)
+        i = i + 1
+    }
+    ret sb.toString()
+}
+
+fun send(msg: str): void {
+    write("Content-Length: " + fromInt(msg.length()) + "\r\n\r\n")
+    write(msg)
+}
+
+fun idText(req: Json, idn: i64): str {
+    if idn < 0 { ret "null" }
+    if req.isString(idn) { ret jquote(req.asString(idn)) }
+    ret req.asString(idn)
+}
+
+fun responseResult(req: Json, idn: i64, result: str): str {
+    ret "{\"jsonrpc\":\"2.0\",\"id\":" + idText(req, idn) + ",\"result\":" + result + "}"
+}
+
+fun signature(ast: Ast, node: i64): str {
+    val k = ast.kind(node)
+    if k == NodeKind.Class { ret "class " + ast.text(node) }
+    if k == NodeKind.Enum { ret "enum " + ast.text(node) }
+    var out = "fun " + ast.text(node) + "("
+    var first = true
+    var i: i64 = 0
+    while i < ast.size(node) {
+        val p = ast.child(node, i)
+        if ast.kind(p) == NodeKind.Param {
+            if !first { out = out + ", " }
+            out = out + ast.text(p) + ": " + ast.auxText(p)
+            first = false
+        }
+        i = i + 1
+    }
+    out = out + "): " + ast.auxText(node)
+    ret out
+}
+
+fun rangeJson(j: Json, line: i64, col: i64, length: i64): i64 {
+    val r = j.objectValue()
+    val s = j.objectValue()
+    val e = j.objectValue()
+    j.put(r, "start", s)
+    j.put(r, "end", e)
+    j.putInt(s, "line", line)
+    j.putInt(s, "character", col)
+    j.putInt(e, "line", line)
+    j.putInt(e, "character", col + length)
+    ret r
+}
+
+fun diagnosticsMessage(uri: str, diags: Diagnostics): str {
+    val j = Json()
+    val o = j.objectValue()
+    j.putString(o, "jsonrpc", "2.0")
+    j.putString(o, "method", "textDocument/publishDiagnostics")
+    val p = j.objectValue()
+    j.put(o, "params", p)
+    j.putString(p, "uri", uri)
+    val arr = j.arrayValue()
+    j.put(p, "diagnostics", arr)
+    var i: i64 = 0
+    while i < diags.size() {
+        val d = j.objectValue()
+        j.add(arr, d)
+        var ln = diags.line(i) - 1
+        if ln < 0 { ln = 0 }
+        var cl = diags.col(i) - 1
+        if cl < 0 { cl = 0 }
+        j.put(d, "range", rangeJson(j, ln, cl, 1))
+        j.putInt(d, "severity", 1)
+        j.putString(d, "source", "sinter-selfhost")
+        j.putString(d, "message", diags.message(i))
+        i = i + 1
+    }
+    ret j.compact()
+}
+
+fun symbolResult(text: str): str {
+    val toks = Tokens()
+    val diags = Diagnostics()
+    Lexer(text).tokenize(toks, diags)
+    val ast = Ast()
+    Parser(toks, ast, diags).parseProgram()
+    val j = Json()
+    val arr = j.arrayValue()
+    var i: i64 = 0
+    while i < ast.size(0) {
+        val n = ast.child(0, i)
+        val k = ast.kind(n)
+        if k == NodeKind.Fun || k == NodeKind.Class || k == NodeKind.Enum {
+            val o = j.objectValue()
+            j.add(arr, o)
+            j.putString(o, "name", ast.text(n))
+            var sk: i64 = 12
+            if k == NodeKind.Class { sk = 5 }
+            if k == NodeKind.Enum { sk = 10 }
+            j.putInt(o, "kind", sk)
+            var ln = ast.line(n) - 1
+            if ln < 0 { ln = 0 }
+            var cl = ast.col(n) - 1
+            if cl < 0 { cl = 0 }
+            j.put(o, "range", rangeJson(j, ln, cl, ast.text(n).length()))
+            j.put(o, "selectionRange", rangeJson(j, ln, cl, ast.text(n).length()))
+        }
+        i = i + 1
+    }
+    ret j.compact()
+}
+
+fun hoverResult(text: str, line: i64, character: i64): str {
+    val toks = Tokens()
+    val diags = Diagnostics()
+    Lexer(text).tokenize(toks, diags)
+    val ast = Ast()
+    Parser(toks, ast, diags).parseProgram()
+    var i: i64 = 0
+    while i < ast.size(0) {
+        val n = ast.child(0, i)
+        val k = ast.kind(n)
+        if ((k == NodeKind.Fun || k == NodeKind.Class || k == NodeKind.Enum) && ast.line(n) - 1 == line) {
+            val j = Json()
+            val o = j.objectValue()
+            val c = j.objectValue()
+            j.putString(c, "kind", "markdown")
+            j.putString(c, "value", "```sinter\n" + signature(ast, n) + "\n```")
+            j.put(o, "contents", c)
+            var cl = ast.col(n) - 1
+            if cl < 0 { cl = 0 }
+            j.put(o, "range", rangeJson(j, line, cl, ast.text(n).length()))
+            ret j.compact()
+        }
+        i = i + 1
+    }
+    ret "null"
+}
+
+pub class Server {
+    var docs: HashMap<str, str>
+    var running: bool
+
+    Server() {
+        self.docs = HashMap<str, str>()
+        self.running = true
+    }
+
+    fun field(node: i64, key: str, doc: Json): i64 {
+        if node < 0 { ret -1 }
+        ret doc.get(node, key)
+    }
+
+    fun analyzeAndPublish(uri: str, text: str): void {
+        val toks = Tokens()
+        val diags = Diagnostics()
+        Lexer(text).tokenize(toks, diags)
+        val ast = Ast()
+        Parser(toks, ast, diags).parseProgram()
+        send(diagnosticsMessage(uri, diags))
+    }
+
+    fun handle(msg: str): void {
+        val req = Json()
+        if !req.parse(msg) { ret }
+        val root = req.root()
+        if root < 0 { ret }
+        val method = req.getString(root, "method", "")
+        if method.length() == 0 { ret }
+        val idn = self.field(root, "id", req)
+        val isReq = idn >= 0
+        if method == "initialize" {
+            val caps = "{\"capabilities\":{\"textDocumentSync\":1,\"documentSymbolProvider\":true,\"hoverProvider\":true}}"
+            if isReq { send(responseResult(req, idn, caps)) }
+            ret
+        }
+        if method == "initialized" { ret }
+        if method == "shutdown" {
+            if isReq { send(responseResult(req, idn, "null")) }
+            ret
+        }
+        if method == "exit" { self.running = false; ret }
+
+        val params = self.field(root, "params", req)
+        val td = self.field(params, "textDocument", req)
+        val uri = req.getString(td, "uri", "")
+
+        if method == "textDocument/didOpen" {
+            val text = req.getString(td, "text", "")
+            self.docs.put(uri, text)
+            self.analyzeAndPublish(uri, text)
+            ret
+        }
+        if method == "textDocument/didChange" {
+            val changes = self.field(params, "contentChanges", req)
+            var text = ""
+            if changes >= 0 && req.size(changes) > 0 {
+                val c0 = req.indexAt(changes, 0)
+                text = req.getString(c0, "text", "")
+            }
+            self.docs.put(uri, text)
+            self.analyzeAndPublish(uri, text)
+            ret
+        }
+        if method == "textDocument/didSave" {
+            val text = self.docs.get(uri)
+            self.analyzeAndPublish(uri, text)
+            ret
+        }
+        if method == "textDocument/documentSymbol" {
+            val text = self.docs.get(uri)
+            if isReq { send(responseResult(req, idn, symbolResult(text))) }
+            ret
+        }
+        if method == "textDocument/hover" {
+            val text = self.docs.get(uri)
+            val pos = self.field(params, "position", req)
+            var line = req.getInt(pos, "line", 0)
+            var ch = req.getInt(pos, "character", 0)
+            if isReq { send(responseResult(req, idn, hoverResult(text, line, ch))) }
+            ret
+        }
+        if isReq { send(responseResult(req, idn, "null")) }
+    }
+
+    pub fun run(): void {
+        while self.running {
+            resetCleanup()
+            val msg = readMessage()
+            if msg.length() == 0 { ret }
+            self.handle(msg)
+        }
+    }
+}

@@ -1,0 +1,17 @@
+module binary
+import std
+import std.binary
+
+fun main(): void {
+    println(hexEncode("Sinter"))
+    println(hexDecode("53696e746572"))
+    println(base64Encode("Hello"))
+    println(base64Decode("SGVsbG8="))
+    println(base64Decode("SGk="))
+    val b = ByteBuffer()
+    b.appendU16(0x1234)
+    b.appendU32(0x01020304)
+    b.appendByte(33u8)
+    println(hexEncode(b.bytes()))
+    println(b.length())
+}

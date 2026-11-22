@@ -1,0 +1,216 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: async task execution (thread pool)
+//
+// There is no `async/await` sugar; asynchrony is provided as a "thread pool + task queue":
+//
+//     fun work(arg: ptr): ptr {
+//         val id = intFromPtr(arg)
+//         println("task ${id}")
+//         ret null
+//     }
+//
+//     val pool = Executor(4)
+//     pool.submit(work, ptrFromInt(1))
+//     pool.submit(work, ptrFromInt(2))
+//     pool.shutdown()      // wait for all submitted tasks to finish
+//
+// Task functions are `(ptr) -> ptr`, matching std.thread's thread entry: the C-side worker
+// calls the Sinter function pointer directly, so no C -> Sinter reverse callback is needed.
+// Each Executor owns its own queue and workers; after `shutdown` you can create a new one.
+module std.async
+
+import std.core
+import std.thread
+
+embed C {
+#ifdef _WIN32
+    #include <windows.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    typedef CRITICAL_SECTION sinter_async_mutex;
+    typedef CONDITION_VARIABLE sinter_async_cond;
+    typedef HANDLE sinter_async_thread;
+    #define SINTER_ASYNC_LOCK(p)    EnterCriticalSection(&(p)->mu)
+    #define SINTER_ASYNC_UNLOCK(p)  LeaveCriticalSection(&(p)->mu)
+    #define SINTER_ASYNC_WAIT(p)    SleepConditionVariableCS(&(p)->cv, &(p)->mu, INFINITE)
+    #define SINTER_ASYNC_SIGNAL(p)  WakeConditionVariable(&(p)->cv)
+    #define SINTER_ASYNC_BROADCAST(p) WakeAllConditionVariable(&(p)->cv)
+    #define SINTER_ASYNC_MUTEX_INIT(p)   InitializeCriticalSection(&(p)->mu)
+    #define SINTER_ASYNC_MUTEX_DESTROY(p) DeleteCriticalSection(&(p)->mu)
+    #define SINTER_ASYNC_COND_INIT(p)    InitializeConditionVariable(&(p)->cv)
+    #define SINTER_ASYNC_COND_DESTROY(p) ((void)0)
+    static int sinter_async_thread_create(sinter_async_thread* t, LPTHREAD_START_ROUTINE fn, void* arg) {
+        *t = CreateThread(NULL, 0, fn, arg, 0, NULL);
+        return *t ? 0 : -1;
+    }
+    static void sinter_async_thread_join(sinter_async_thread t) {
+        WaitForSingleObject(t, INFINITE);
+        CloseHandle(t);
+    }
+#else
+    #include <pthread.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    typedef pthread_mutex_t sinter_async_mutex;
+    typedef pthread_cond_t sinter_async_cond;
+    typedef pthread_t sinter_async_thread;
+    #define SINTER_ASYNC_LOCK(p)    pthread_mutex_lock(&(p)->mu)
+    #define SINTER_ASYNC_UNLOCK(p)  pthread_mutex_unlock(&(p)->mu)
+    #define SINTER_ASYNC_WAIT(p)    pthread_cond_wait(&(p)->cv, &(p)->mu)
+    #define SINTER_ASYNC_SIGNAL(p)  pthread_cond_signal(&(p)->cv)
+    #define SINTER_ASYNC_BROADCAST(p) pthread_cond_broadcast(&(p)->cv)
+    #define SINTER_ASYNC_MUTEX_INIT(p)   pthread_mutex_init(&(p)->mu, NULL)
+    #define SINTER_ASYNC_MUTEX_DESTROY(p) pthread_mutex_destroy(&(p)->mu)
+    #define SINTER_ASYNC_COND_INIT(p)    pthread_cond_init(&(p)->cv, NULL)
+    #define SINTER_ASYNC_COND_DESTROY(p) pthread_cond_destroy(&(p)->cv)
+    static int sinter_async_thread_create(sinter_async_thread* t, void* (*fn)(void*), void* arg) {
+        return pthread_create(t, NULL, fn, arg) == 0 ? 0 : -1;
+    }
+    static void sinter_async_thread_join(sinter_async_thread t) {
+        pthread_join(t, NULL);
+    }
+#endif
+
+    typedef void* (*sinter_async_fn)(void*);
+
+    typedef struct sinter_async_job {
+        sinter_async_fn fn;
+        void* arg;
+        struct sinter_async_job* next;
+    } sinter_async_job;
+
+    typedef struct {
+        sinter_async_mutex mu;
+        sinter_async_cond cv;
+        sinter_async_job* head;
+        sinter_async_job* tail;
+        sinter_async_thread* workers;
+        int64_t count;
+        int stop;
+    } sinter_async_pool;
+
+    static void sinter_async_run(sinter_async_pool* pool) {
+        for (;;) {
+            SINTER_ASYNC_LOCK(pool);
+            while (!pool->head && !pool->stop) SINTER_ASYNC_WAIT(pool);
+            if (pool->stop && !pool->head) {
+                SINTER_ASYNC_UNLOCK(pool);
+                break;
+            }
+            sinter_async_job* job = pool->head;
+            pool->head = job->next;
+            if (!pool->head) pool->tail = NULL;
+            SINTER_ASYNC_UNLOCK(pool);
+
+            job->fn(job->arg);
+            free(job);
+        }
+    }
+
+#ifdef _WIN32
+    static DWORD WINAPI sinter_async_worker(LPVOID raw) {
+        sinter_async_run((sinter_async_pool*)raw);
+        return 0;
+    }
+#else
+    static void* sinter_async_worker(void* raw) {
+        sinter_async_run((sinter_async_pool*)raw);
+        return NULL;
+    }
+#endif
+
+    static void* std_async_new(int64_t count) {
+        if (count < 1) count = 1;
+        sinter_async_pool* pool = (sinter_async_pool*)calloc(1, sizeof(sinter_async_pool));
+        if (!pool) return NULL;
+        SINTER_ASYNC_MUTEX_INIT(pool);
+        SINTER_ASYNC_COND_INIT(pool);
+        pool->count = count;
+        pool->workers = (sinter_async_thread*)calloc((size_t)count, sizeof(sinter_async_thread));
+        if (!pool->workers) {
+            SINTER_ASYNC_COND_DESTROY(pool);
+            SINTER_ASYNC_MUTEX_DESTROY(pool);
+            free(pool);
+            return NULL;
+        }
+        for (int64_t i = 0; i < count; ++i) {
+            if (sinter_async_thread_create(&pool->workers[i], sinter_async_worker, pool) != 0) {
+                pool->count = i;
+                pool->stop = 1;
+                SINTER_ASYNC_BROADCAST(pool);
+                for (int64_t k = 0; k < i; ++k) sinter_async_thread_join(pool->workers[k]);
+                free(pool->workers);
+                SINTER_ASYNC_COND_DESTROY(pool);
+                SINTER_ASYNC_MUTEX_DESTROY(pool);
+                free(pool);
+                return NULL;
+            }
+        }
+        return pool;
+    }
+
+    static void std_async_submit(void* raw, sinter_async_fn fn, void* arg) {
+        sinter_async_pool* pool = (sinter_async_pool*)raw;
+        if (!pool || !fn || pool->stop) return;
+        sinter_async_job* job = (sinter_async_job*)calloc(1, sizeof(sinter_async_job));
+        if (!job) return;
+        job->fn = fn;
+        job->arg = arg;
+        SINTER_ASYNC_LOCK(pool);
+        if (pool->tail) pool->tail->next = job; else pool->head = job;
+        pool->tail = job;
+        SINTER_ASYNC_SIGNAL(pool);
+        SINTER_ASYNC_UNLOCK(pool);
+    }
+
+    static void std_async_stop(void* raw) {
+        sinter_async_pool* pool = (sinter_async_pool*)raw;
+        if (!pool) return;
+        SINTER_ASYNC_LOCK(pool);
+        pool->stop = 1;
+        SINTER_ASYNC_BROADCAST(pool);
+        SINTER_ASYNC_UNLOCK(pool);
+        for (int64_t i = 0; i < pool->count; ++i) sinter_async_thread_join(pool->workers[i]);
+        // Remaining jobs in the queue must be freed too (workers no longer consume them).
+        sinter_async_job* job = pool->head;
+        while (job) {
+            sinter_async_job* next = job->next;
+            free(job);
+            job = next;
+        }
+        free(pool->workers);
+        SINTER_ASYNC_COND_DESTROY(pool);
+        SINTER_ASYNC_MUTEX_DESTROY(pool);
+        free(pool);
+    }
+}
+
+/// Fixed-size thread pool. `shutdown()` waits for submitted tasks to finish.
+pub class Executor {
+    var pool: ptr
+    var size: i64
+
+    Executor(threads: i64) {
+        self.size = threads
+        self.pool = std_async_new(threads)
+    }
+
+    ~Executor() { self.shutdown() }
+
+    pub fun isRunning(): bool => self.pool != null
+
+    pub fun submit(fn: (ptr) -> ptr, arg: ptr): void {
+        if self.pool != null { std_async_submit(self.pool, fn, arg) }
+    }
+
+    pub fun shutdown(): void {
+        if self.pool != null {
+            std_async_stop(self.pool)
+            self.pool = null
+        }
+    }
+}
+
+pub fun newExecutor(threads: i64): Executor => Executor(threads)

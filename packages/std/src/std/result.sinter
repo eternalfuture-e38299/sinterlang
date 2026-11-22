@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: runtime error handling (Result style, no exceptions / no try-catch)
+//
+// The language has no exception mechanism and does not plan to add setjmp/longjmp for it (it would break RAII destructor paths).
+// Error handling here is explicit:
+//
+//     val r = parseInt("42")          // Result<i64>
+//     if r.isOk() { println(r.expect("bad input")) }
+//
+//     val e = parseInt("x")
+//     println(e.getOr(-1))            // -1
+//
+// Behavior of `expect` / `getOr` on failure:
+//   * `expect` panics directly (prints file:line, then aborts) — good for errors that "should not happen";
+//   * `getOr` returns a fallback value — good for recoverable cases.
+module std.result
+
+import std
+
+embed C {
+    static inline sinter_string sinter_result_clone(sinter_string s) {
+        return sinter_string_clone(s);
+    }
+    static inline void sinter_result_free(sinter_string s) {
+        sinter_string_free(s);
+    }
+}
+
+pub class Result<T> : Any {
+    Result(okay: bool, v: T, err: str) {
+        self.okay = okay
+        self.v = sinter_gen_clone(v)
+        self.err = sinter_result_clone(err)
+    }
+
+    ~Result() {
+        sinter_gen_drop(self.v)
+        sinter_result_free(self.err)
+    }
+
+    pub fun isOk(): bool => self.okay
+    pub fun isErr(): bool => !self.okay
+
+    /// Clone of the success value; panics on failure (with the caller's file and line).
+    pub fun expect(message: str): T {
+        if !self.okay { panic(message + ": " + self.err) }
+        ret sinter_gen_clone(self.v)
+    }
+
+    /// Returns a clone on success, the fallback value on failure.
+    pub fun getOr(fallback: T): T {
+        if self.okay { ret sinter_gen_clone(self.v) }
+        ret fallback
+    }
+
+    pub fun errorOr(fallback: str): str {
+        if self.okay { ret fallback }
+        ret sinter_string_clone(self.err)
+    }
+}
+
+// Generic classes only support built-in types / str as arguments, so Result currently provides two
+// concrete factories, i64 and str. For other types, write a `Result<f64>` version following these two.
+pub fun okInt(v: i64): Result<i64> => Result<i64>(true, v, "")
+pub fun errInt(message: str): Result<i64> => Result<i64>(false, 0, message)
+pub fun okStr(v: str): Result<str> => Result<str>(true, v, "")
+pub fun errStr(message: str): Result<str> => Result<str>(false, "", message)

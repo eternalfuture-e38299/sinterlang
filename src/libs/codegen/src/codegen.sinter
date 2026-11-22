@@ -1,0 +1,3458 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// C emitter for the practical core subset: free functions, scalar types,
+// locals, assignments, arithmetic, calls, if/else, while, return/break/
+// continue, println/print, classes (fields/methods/constructors), enums,
+// module globals, monomorphized generic classes and generic functions,
+// fixed arrays/indexing, `${...}` string templates, multi-module imports
+// with module prefixes, RAII/destructors, try/catch/finally and `embed C`.
+// The runtime is emitted inline (sinter_string ABI).  Generic containers
+// (pointer fields, indexing, destructors) are covered.  `when` is emitted as
+// an if/else chain.  Lambdas, data classes, annotations and extension
+// functions are still unsupported.
+module codegen
+
+import std
+import std.list
+import std.text
+import std.string
+import syntax
+import runtime_text
+
+const F_VARARG: i64 = 128
+const F_NORAII: i64 = 512
+const F_EXTERN: i64 = 4096
+const F_STATIC: i64 = 2
+const F_INTERFACE: i64 = 64
+const F_PRIV: i64 = 8192
+const F_PUB: i64 = 1
+const F_NAMED: i64 = 16384
+const F_DATA: i64 = 256
+
+const GEN_FULL: i64 = 0
+const GEN_MODULE_C: i64 = 1
+const GEN_DECLS: i64 = 2
+
+pub fun runtimeHeaderText(): str => runtimeHeader()
+pub fun runtimeSourceText(): str => runtimeSource()
+
+fun hasFlag(flags: i64, want: i64): bool {
+    if want == 0 { ret false }
+    ret (flags / want) % 2 == 1
+}
+
+fun stripSuffixSuffix(t: str): str {
+    var base = cloneText(t)
+    var ptr = ""
+    while base.length() > 0 && base.at(base.length() - 1) == 42 {
+        ptr = ptr + "*"
+        base = base.substring(0, base.length() - 1)
+    }
+    if base.length() > 0 && base.at(base.length() - 1) == 63 {
+        base = base.substring(0, base.length() - 1)
+    }
+    ret base + "|" + ptr
+}
+
+fun cBase(t: str): str {
+    if t == "i8" { ret "int8_t" }
+    if t == "i16" { ret "int16_t" }
+    if t == "i32" || t == "int" { ret "int32_t" }
+    if t == "i64" || t == "long" { ret "int64_t" }
+    if t == "u8" || t == "byte" { ret "uint8_t" }
+    if t == "u16" { ret "uint16_t" }
+    if t == "u32" { ret "uint32_t" }
+    if t == "u64" { ret "uint64_t" }
+    if t == "f32" { ret "float" }
+    if t == "f64" || t == "float" { ret "double" }
+    if t == "bool" { ret "uint8_t" }
+    if t == "str" { ret "sinter_string" }
+    if t == "ptr" { ret "void*" }
+    if t == "cstr" { ret "const char*" }
+    if t == "char" { ret "char" }
+    if t == "void" { ret "void" }
+    ret ""
+}
+
+fun mapType(t: str): str {
+    if t.length() > 0 && (t.at(0) == 42 || t.at(0) == 38) {
+        ret mapType(t.substring(1, t.length())) + "*"
+    }
+    val parts = stripSuffixSuffix(t)
+    val sep = parts.indexOf("|")
+    val base = parts.substring(0, sep)
+    val ptr = parts.substring(sep + 1, parts.length())
+    val c = cBase(base)
+    if c.length() == 0 { ret "" }
+    ret c + ptr
+}
+
+pub class CodeGen {
+    var ast: Ast
+    var diags: Diagnostics
+    var sb: StringBuilder
+    var fnodes: List<i64>
+    var fnames: List<str>
+    var fret: List<str>
+    var vars: List<str>
+    var vtypes: List<str>
+    var gnames: List<str>
+    var gtypes: List<str>
+    var classes: List<i64>
+    var enums: List<i64>
+    var globals: List<i64>
+    var inst_names: List<str>
+    var inst_bases: List<str>
+    var inst_args_text: List<str>
+    var fn_inst_names: List<str>
+    var fn_inst_nodes: List<i64>
+    var fn_inst_args: List<str>
+    var cur_params: List<str>
+    var cur_args: List<str>
+    var curmangle: str
+    var curclass: str
+    var param_mark: i64
+    var exc_id: i64
+    var indent: i64
+    var currentret: str
+    var failed: bool
+    var cur_noraij: bool
+    var retvar: str
+    var seq_slot: i64
+    var lambda_nodes: List<i64>
+    var pre: List<str>
+    var post: List<str>
+    var preid: i64
+    var loop_cond: bool
+    var cond_decls: List<str>
+    var cond_assigns: List<str>
+    var cond_frees: List<str>
+    var gen_mode: i64
+    var gen_module: str
+
+    CodeGen(tree: Ast, errors: Diagnostics) {
+        self.ast = tree
+        self.diags = errors
+        self.sb = StringBuilder()
+        self.fnodes = List<i64>()
+        self.fnames = List<str>()
+        self.fret = List<str>()
+        self.vars = List<str>()
+        self.vtypes = List<str>()
+        self.gnames = List<str>()
+        self.gtypes = List<str>()
+        self.classes = List<i64>()
+        self.enums = List<i64>()
+        self.globals = List<i64>()
+        self.inst_names = List<str>()
+        self.inst_bases = List<str>()
+        self.inst_args_text = List<str>()
+        self.fn_inst_names = List<str>()
+        self.fn_inst_nodes = List<i64>()
+        self.fn_inst_args = List<str>()
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+        self.curmangle = ""
+        self.curclass = ""
+        self.param_mark = 0
+        self.exc_id = 0
+        self.indent = 0
+        self.currentret = "void"
+        self.failed = false
+        self.cur_noraij = false
+        self.retvar = ""
+        self.seq_slot = 0
+        self.lambda_nodes = List<i64>()
+        self.pre = List<str>()
+        self.post = List<str>()
+        self.preid = 0
+        self.loop_cond = false
+        self.cond_decls = List<str>()
+        self.cond_assigns = List<str>()
+        self.cond_frees = List<str>()
+        self.gen_mode = GEN_FULL
+        self.gen_module = ""
+    }
+
+    fun inModule(n: i64): bool {
+        if self.gen_mode != GEN_MODULE_C { ret true }
+        val m = self.ast.moduleOf(n)
+        // A source file without an explicit `module` declaration belongs to
+        // the synthetic "program" module used by collectModules().
+        if m.length() == 0 { ret self.gen_module == "program" }
+        ret m == self.gen_module
+    }
+
+    fun classInModule(cls: i64): bool {
+        if self.gen_mode != GEN_MODULE_C { ret true }
+        val m = self.ast.moduleOf(cls)
+        if m.length() > 0 { ret m == self.gen_module }
+        ret true
+    }
+
+    fun instInModule(name: str): bool {
+        if self.gen_mode != GEN_MODULE_C { ret true }
+        val cls = self.findClass(self.instBase(name))
+        if cls < 0 { ret true }
+        ret self.classInModule(cls)
+    }
+
+    fun fnInstInModule(i: i64): bool {
+        if self.gen_mode != GEN_MODULE_C { ret true }
+        val node = self.fn_inst_nodes.get(i)
+        if node < 0 { ret true }
+        ret self.ast.moduleOf(node) == self.gen_module
+    }
+
+    fun emitGlobalExtern(g: i64): void {
+        val name = self.ast.text(g)
+        var t = self.ast.auxText(g)
+        if t.length() == 0 && self.ast.size(g) > 0 { t = self.typeOf(self.ast.child(g, 0)) }
+        if t.length() == 0 { t = "i64" }
+        self.sb.append("extern " + self.declOf(t, name) + ";\n")
+    }
+
+    pub fun generateFull(root: i64): str {
+        self.gen_mode = GEN_FULL
+        self.gen_module = ""
+        ret self.generate(root)
+    }
+
+    pub fun generateModule(root: i64, moduleName: str): str {
+        self.gen_mode = GEN_MODULE_C
+        self.gen_module = cloneText(moduleName)
+        ret self.generate(root)
+    }
+
+    pub fun generateDeclarations(root: i64): str {
+        self.gen_mode = GEN_DECLS
+        self.gen_module = ""
+        ret self.generate(root)
+    }
+
+    fun pad(): void {
+        var i: i64 = 0
+        while i < self.indent * 4 {
+            self.sb.append(" ")
+            i = i + 1
+        }
+    }
+
+    fun line(s: str): void {
+        self.pad()
+        self.sb.append(s)
+        self.sb.append("\n")
+    }
+
+    fun err(node: i64, msg: str): void {
+        self.diags.add(self.ast.line(node), self.ast.col(node), msg)
+    }
+
+    fun sanitizeMod(m: str): str {
+        var out = ""
+        var i: i64 = 0
+        while i < m.length() {
+            if m.at(i) == 46 { out = out + "_" } else { out = out + m.substring(i, i + 1) }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun snakeName(s: str): str {
+        val upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        val lower = "abcdefghijklmnopqrstuvwxyz"
+        var out = ""
+        var i: i64 = 0
+        while i < s.length() {
+            val c = s.at(i)
+            if c >= 65 && c <= 90 {
+                if out.length() > 0 && out.at(out.length() - 1) != 95 { out = out + "_" }
+                val k = upper.indexOf(s.substring(i, i + 1))
+                if k >= 0 { out = out + lower.substring(k, k + 1) } else { out = out + s.substring(i, i + 1) }
+            } else {
+                out = out + s.substring(i, i + 1)
+            }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun classCName(name: str): str {
+        if self.isGenericType(name) {
+            val id = self.cnameOfType(name)
+            if id.length() > 0 && id != name { ret self.classCName(id) }
+        }
+        var base = cloneText(name)
+        var suffix = ""
+        val ib = self.instBase(name)
+        if ib.length() > 0 { base = cloneText(ib); suffix = name.substring(base.length(), name.length()) }
+        val cls = self.findClassAny(base)
+        if cls < 0 { ret "snt_" + name }
+        val mod = self.sanitizeMod(self.ast.moduleOf(cls))
+        val raw = self.ast.text(cls)
+        var part = cloneText(raw)
+        if mod.length() > 0 && raw.length() > mod.length() { part = raw.substring(mod.length() + 1, raw.length()) }
+        var c = ""
+        if mod.length() > 0 { c = mod + "_" }
+        ret c + self.snakeName(part) + suffix
+    }
+
+    fun cname(name: str): str {
+        if name == "main" { ret "main" }
+        ret "sh_" + cloneText(name)
+    }
+
+    fun fnCName(fn: i64): str {
+        if hasFlag(self.ast.flag(fn), F_EXTERN) { ret self.ast.text(fn) }
+        val a = self.ast.aliasOf(fn)
+        if a.length() > 0 { ret self.cname(a) }
+        ret self.cname(self.ast.text(fn))
+    }
+
+    fun vname(name: str): str => "v_" + cloneText(name)
+
+    fun findFn(name: str): i64 {
+        var i: i64 = 0
+        while i < self.fnames.size() {
+            if self.fnames.get(i) == name { ret i }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun findFnNode(fn: i64): i64 {
+        var i: i64 = 0
+        while i < self.fnodes.size() {
+            if self.fnodes.get(i) == fn { ret i }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun isIntName(t: str): bool {
+        if t == "i8" || t == "i16" || t == "i32" || t == "i64" || t == "int" || t == "long" { ret true }
+        if t == "u8" || t == "u16" || t == "u32" || t == "u64" || t == "byte" { ret true }
+        ret false
+    }
+
+    fun isFloatName(t: str): bool => t == "f32" || t == "f64" || t == "float" || t == "double"
+
+    fun fnVararg(fn: i64): bool {
+        val pn = self.paramNodes(fn)
+        if pn.size() == 0 { ret false }
+        ret hasFlag(self.ast.flag(pn.get(pn.size() - 1)), F_VARARG)
+    }
+
+    fun paramMatches(pty: str, aty: str, fn: i64): bool {
+        if pty.length() == 0 || aty.length() == 0 { ret true }
+        val tps = self.fnParams(fn)
+        var ti: i64 = 0
+        while ti < tps.size() {
+            if pty == tps.get(ti) { ret true }
+            if pty.length() > 1 && pty.at(0) == 42 && pty.substring(1, pty.length()) == tps.get(ti) { ret true }
+            ti = ti + 1
+        }
+        val ps = self.substWith(pty, self.fnParams(fn), self.cur_args)
+        if ps == aty { ret true }
+        if ps == "str" && aty == "str" { ret true }
+        if self.isIntName(ps) && self.isIntName(aty) { ret true }
+        if self.isFloatName(ps) && self.isFloatName(aty) { ret true }
+        if ps == "bool" && aty == "bool" { ret true }
+        if self.classForType(ps) >= 0 && self.classForType(aty) >= 0 {
+            if self.typeBase(ps) == self.typeBase(aty) || self.isDerived(aty, ps) { ret true }
+        }
+        if self.typeBase(ps) == self.typeBase(aty) { ret true }
+        ret false
+    }
+
+    fun inferCallArgs(fn: i64, node: i64): str {
+        val tps = self.fnParams(fn)
+        if tps.size() == 0 { ret "" }
+        val vals = List<str>()
+        var z: i64 = 0
+        while z < tps.size() { vals.add(""); z = z + 1 }
+        val pn = self.paramNodes(fn)
+        var i: i64 = 0
+        while i < pn.size() && i + 1 < self.ast.size(node) {
+            val pty = self.ast.auxText(pn.get(i))
+            val aty = self.typeOf(self.ast.child(node, i + 1))
+            self.unifyType(pty, aty, tps, vals)
+            i = i + 1
+        }
+        if self.fnVararg(fn) && pn.size() > 1 && self.ast.size(node) - 1 >= pn.size() - 1 {
+            val pty = self.ast.auxText(pn.get(pn.size() - 1))
+            var vi: i64 = pn.size() - 1
+            while vi < self.ast.size(node) - 1 {
+                self.unifyType(pty, self.typeOf(self.ast.child(node, vi + 1)), tps, vals)
+                vi = vi + 1
+            }
+        }
+        var out = ""
+        var k: i64 = 0
+        while k < vals.size() {
+            if k > 0 { out = out + "," }
+            out = out + vals.get(k)
+            k = k + 1
+        }
+        ret out
+    }
+
+    fun unifyType(pty: str, aty: str, tps: List<str>, vals: List<str>): void {
+        if pty.length() == 0 || aty.length() == 0 { ret }
+        var k: i64 = 0
+        while k < tps.size() {
+            if pty == tps.get(k) {
+                if vals.get(k).length() == 0 { vals.set(k, aty) }
+                ret
+            }
+            k = k + 1
+        }
+        if pty.at(0) == 42 && aty.at(0) == 42 {
+            self.unifyType(pty.substring(1, pty.length()), aty.substring(1, aty.length()), tps, vals)
+            ret
+        }
+        if self.isGenericType(pty) && self.isGenericType(aty) {
+            val pin = self.splitArgs(self.typeArgsText(pty))
+            val ain = self.splitArgs(self.typeArgsText(aty))
+            var j: i64 = 0
+            while j < pin.size() && j < ain.size() {
+                self.unifyType(pin.get(j), ain.get(j), tps, vals)
+                j = j + 1
+            }
+        }
+    }
+
+    fun lambdaName(n: i64): str => "__lambda" + fromInt(n)
+
+    fun fnTypeText(fn: i64): str {
+        val pn = self.paramNodes(fn)
+        var ps = "("
+        var i: i64 = 0
+        while i < pn.size() {
+            if i > 0 { ps = ps + ", " }
+            ps = ps + self.ast.auxText(pn.get(i))
+            i = i + 1
+        }
+        ps = ps + ") -> "
+        var rt = self.ast.auxText(fn)
+        if rt.length() == 0 { rt = "void" }
+        ret ps + rt
+    }
+
+    fun lambdaType(n: i64): str {
+        val pn = self.paramNodes(n)
+        val recv = self.ast.extOf(n)
+        var ps = "("
+        if recv.length() > 0 { ps = ps + recv; if pn.size() > 0 { ps = ps + ", " } }
+        var i: i64 = 0
+        while i < pn.size() {
+            if i > 0 { ps = ps + ", " }
+            ps = ps + self.ast.auxText(pn.get(i))
+            i = i + 1
+        }
+        ps = ps + ") -> "
+        var rt = self.ast.auxText(n)
+        if rt == "void" && self.ast.size(n) > 0 && self.ast.kind(self.ast.child(n, 0)) != NodeKind.Block {
+            rt = self.typeOf(self.ast.child(n, 0))
+        }
+        if rt.length() == 0 { rt = "void" }
+        ret ps + rt
+    }
+
+    fun bindLambdaReceivers(n: i64): void {
+        if self.ast.kind(n) == NodeKind.Call && self.ast.size(n) > 0 {
+            val callee = self.ast.child(n, 0)
+            if self.ast.kind(callee) == NodeKind.Member && self.ast.text(callee) == "apply" && self.ast.size(n) > 1 {
+                val lam = self.ast.child(n, 1)
+                if self.ast.kind(lam) == NodeKind.Lambda {
+                    val ot = self.typeOf(self.ast.child(callee, 0))
+                    if ot.length() > 0 { self.ast.setExt(lam, ot); self.ast.setAux(lam, ot) }
+                }
+            }
+            if self.ast.kind(callee) == NodeKind.IdentExpr {
+                val fi = self.findFnForCall(self.ast.text(callee), n)
+                if fi >= 0 {
+                    val pn = self.paramNodes(self.fnodes.get(fi))
+                    var ai: i64 = 1
+                    while ai < self.ast.size(n) && ai - 1 < pn.size() {
+                        val a = self.ast.child(n, ai)
+                        if self.ast.kind(a) == NodeKind.Lambda {
+                            val fc = self.fnTypeFirstClass(self.ast.auxText(pn.get(ai - 1)))
+                            if fc.length() > 0 { self.ast.setExt(a, fc) }
+                        }
+                        ai = ai + 1
+                    }
+                }
+            }
+        }
+        var i: i64 = 0
+        while i < self.ast.size(n) {
+            self.bindLambdaReceivers(self.ast.child(n, i))
+            i = i + 1
+        }
+    }
+
+    fun collectLambdas(n: i64): void {
+        if self.ast.kind(n) == NodeKind.Lambda && self.lambda_nodes.indexOf(n) < 0 { self.lambda_nodes.add(n) }
+        var i: i64 = 0
+        while i < self.ast.size(n) {
+            self.collectLambdas(self.ast.child(n, i))
+            i = i + 1
+        }
+    }
+
+    fun emitLambda(n: i64): void {
+        val nm = self.lambdaName(n)
+        val rtText = self.lambdaType(n)
+        val ar = rtText.indexOf("->")
+        val rt = self.trimSpaces(rtText.substring(ar + 2, rtText.length()))
+        val ct = self.resolveType(rt)
+        val pn = self.paramNodes(n)
+        val recv = self.ast.extOf(n)
+        var params = ""
+        if recv.length() > 0 { params = self.declOf(recv, "self") }
+        var i: i64 = 0
+        while i < pn.size() {
+            if params.length() > 0 { params = params + ", " }
+            params = params + self.declOf(self.ast.auxText(pn.get(i)), self.vname(self.ast.text(pn.get(i))))
+            i = i + 1
+        }
+        if params.length() == 0 { params = "void" }
+        self.sb.append("static " + ct + " " + nm + "(" + params + ") {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.indent = 1
+        self.currentret = rt
+        if recv.length() > 0 { self.curclass = cloneText(recv); self.pushVar("self", recv) }
+        i = 0
+        while i < pn.size() {
+            self.pushVar(self.ast.text(pn.get(i)), self.ast.auxText(pn.get(i)))
+            i = i + 1
+        }
+        self.param_mark = self.vars.size()
+        var body: i64 = -1
+        var bi: i64 = 0
+        while bi < self.ast.size(n) {
+            val ch = self.ast.child(n, bi)
+            if self.ast.kind(ch) != NodeKind.Param && self.ast.kind(ch) != NodeKind.TypeParam { body = ch }
+            bi = bi + 1
+        }
+        if body >= 0 {
+            if self.ast.kind(body) == NodeKind.Block {
+                self.stmt(body)
+                if recv.length() > 0 && self.typeBase(rt) == self.typeBase(recv) { self.line("return self;") }
+            }
+            else { self.line("return " + self.expr(body) + ";") }
+        } else { self.line("return " + self.zeroOf(rt) + ";") }
+        self.indent = 0
+        self.sb.append("}\n\n")
+    }
+
+    @no_raii
+    fun copyList(xs: List<str>): List<str> {
+        val out = List<str>()
+        var i: i64 = 0
+        while i < xs.size() {
+            out.add(xs.get(i))
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun findFnForCall(name: str, node: i64): i64 {
+        val argc = self.ast.size(node) - 1
+        var i: i64 = 0
+        while i < self.fnames.size() {
+            if self.fnames.get(i) == name || self.ast.aliasOf(self.fnodes.get(i)) == name {
+                val fn = self.fnodes.get(i)
+                val pn = self.paramNodes(fn)
+                val va = self.fnVararg(fn)
+                val fixed = va ? pn.size() - 1 : pn.size()
+                var ok = false
+                if va { ok = argc >= fixed } else { ok = argc == fixed }
+                if ok {
+                    var k: i64 = 0
+                    while k < fixed {
+                        if !self.paramMatches(self.ast.auxText(pn.get(k)), self.typeOf(self.ast.child(node, k + 1)), fn) { ok = false; break }
+                        k = k + 1
+                    }
+                    if ok && va {
+                        val et = self.ast.auxText(pn.get(pn.size() - 1))
+                        while k < argc {
+                            if !self.paramMatches(et, self.typeOf(self.ast.child(node, k + 1)), fn) { ok = false; break }
+                            k = k + 1
+                        }
+                    }
+                }
+                if ok { ret i }
+            }
+            i = i + 1
+        }
+        ret self.findFn(name)
+    }
+
+    fun findExt(objt: str, name: str): i64 {
+        var i: i64 = 0
+        while i < self.fnodes.size() {
+            val fn = self.fnodes.get(i)
+            val r = self.ast.extOf(fn)
+            if r.length() > 0 && self.typeBase(r) == self.typeBase(objt) {
+                val t = self.ast.text(fn)
+                if t == name || t.endsWith("_" + name) { ret fn }
+            }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun pushVar(name: str, t: str): void {
+        self.vars.add(name)
+        self.vtypes.add(t)
+    }
+
+    fun findVar(name: str): i64 {
+        var i: i64 = self.vars.size() - 1
+        while i >= 0 {
+            if self.vars.get(i) == name { ret i }
+            i = i - 1
+        }
+        ret -1
+    }
+
+    fun truncVars(mark: i64): void {
+        while self.vars.size() > mark {
+            self.vars.removeLast()
+            self.vtypes.removeLast()
+        }
+    }
+
+    fun fnReturn(name: str): str {
+        val i = self.findFn(name)
+        if i < 0 { ret "" }
+        ret self.fret.get(i)
+    }
+
+    // ---- classes / enums / globals -----------------------------------------
+    fun findNamed(nodes: List<i64>, name: str): i64 {
+        var i: i64 = 0
+        while i < nodes.size() {
+            if self.ast.text(nodes.get(i)) == name { ret nodes.get(i) }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun findClass(name: str): i64 => self.findNamed(self.classes, name)
+
+    fun findClassAny(name: str): i64 {
+        val c = self.findClass(name)
+        if c >= 0 { ret c }
+        var i: i64 = 0
+        while i < self.classes.size() {
+            val t = self.ast.text(self.classes.get(i))
+            if t == name || t.endsWith("_" + name) { ret self.classes.get(i) }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun findEnum(name: str): i64 => self.findNamed(self.enums, name)
+
+    fun isInterface(cls: i64): bool => hasFlag(self.ast.flag(cls), F_INTERFACE)
+
+    fun ifaceOf(cls: i64): i64 {
+        val bases = self.splitArgs(self.ast.extOf(cls))
+        var i: i64 = 0
+        while i < bases.size() {
+            val c = self.findClassAny(self.typeBase(bases.get(i)))
+            if c >= 0 && self.isInterface(c) { ret c }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun ifaceSlot(iface: i64, name: str): i64 {
+        var i: i64 = 0
+        var slot: i64 = 0
+        while i < self.ast.size(iface) {
+            val m = self.ast.child(iface, i)
+            if self.ast.kind(m) == NodeKind.Fun {
+                if self.ast.text(m) == name { ret slot }
+                slot = slot + 1
+            }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun classCtor(cls: i64): i64 {
+        var i: i64 = 0
+        while i < self.ast.size(cls) {
+            val n = self.ast.child(cls, i)
+            if self.ast.kind(n) == NodeKind.Fun && (self.ast.auxText(n) == "ctor" || self.ast.text(n) == self.ast.text(cls)) { ret n }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun isStatic(n: i64): bool => hasFlag(self.ast.flag(n), F_STATIC)
+    fun isData(cls: i64): bool => hasFlag(self.ast.flag(cls), F_DATA)
+
+    fun fnTypeFirstClass(t: str): str {
+        if !self.isFnType(t) { ret "" }
+        val close = t.indexOf(")")
+        val inner = self.trimSpaces(t.substring(1, close))
+        if inner.length() == 0 { ret "" }
+        val parts = self.splitArgs(inner)
+        val first = parts.get(0)
+        if self.findClassAny(self.typeBase(first)) >= 0 { ret first }
+        ret ""
+    }
+
+    fun isDestructor(n: i64): bool {
+        val t = self.ast.text(n)
+        ret t.length() > 0 && t.at(0) == 126
+    }
+
+    fun classDtor(cls: i64): i64 {
+        var i: i64 = 0
+        while i < self.ast.size(cls) {
+            val n = self.ast.child(cls, i)
+            if self.ast.kind(n) == NodeKind.Fun && self.isDestructor(n) { ret n }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun emitCleanup(start: i64): void {
+        if self.cur_noraij { ret }
+        var i: i64 = start
+        if i < self.param_mark { i = self.param_mark }
+        while i < self.vars.size() {
+            if self.retvar.length() > 0 && self.vars.get(i) == self.retvar { i = i + 1; continue }
+            val t = self.vtypes.get(i)
+            val cls = self.classForType(t)
+            if cls >= 0 && (t.length() == 0 || t.at(0) != 42) {
+                val vn = self.vname(self.vars.get(i))
+                val cn = self.cnameOfType(t)
+                self.pad()
+                self.sb.append("if (")
+                self.sb.append(vn)
+                self.sb.append(") { ")
+                self.sb.append(self.classCName(self.valueType(t)))
+                self.sb.append("_del(")
+                self.sb.append(vn)
+                self.sb.append("); ")
+                self.sb.append(vn)
+                self.sb.append(" = NULL; }\n")
+            }
+            i = i + 1
+        }
+    }
+
+    fun methodCName(m: i64): str {
+        val a = self.ast.aliasOf(m)
+        if a.length() > 0 { ret a }
+        ret self.ast.text(m)
+    }
+
+    fun classMethod(cls: i64, name: str): i64 {
+        var i: i64 = 0
+        while i < self.ast.size(cls) {
+            val n = self.ast.child(cls, i)
+            if self.ast.kind(n) == NodeKind.Fun && !self.isDestructor(n) {
+                if self.ast.text(n) == name || self.ast.aliasOf(n) == name { ret n }
+            }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun fieldType(cls: i64, name: str): str {
+        val ctor = self.classCtor(cls)
+        if ctor >= 0 {
+            var i: i64 = 0
+            while i < self.ast.size(ctor) {
+                val p = self.ast.child(ctor, i)
+                if self.ast.kind(p) == NodeKind.Param && self.ast.text(p) == name { ret self.ast.auxText(p) }
+                i = i + 1
+            }
+        }
+        var k: i64 = 0
+        while k < self.ast.size(cls) {
+            val n = self.ast.child(cls, k)
+            if self.ast.kind(n) == NodeKind.Field && self.ast.text(n) == name { ret self.ast.auxText(n) }
+            k = k + 1
+        }
+        ret ""
+    }
+
+    fun findGlobal(name: str): i64 {
+        var i: i64 = 0
+        while i < self.gnames.size() {
+            if self.gnames.get(i) == name { ret i }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    // ---- generics ----------------------------------------------------------
+    @no_raii
+    fun trimSpaces(s: str): str {
+        var a: i64 = 0
+        var b: i64 = s.length()
+        while a < b && s.at(a) == 32 { a = a + 1 }
+        while b > a && s.at(b - 1) == 32 { b = b - 1 }
+        ret s.substring(a, b)
+    }
+
+    @no_raii
+    fun splitArgs(s: str): List<str> {
+        val out = List<str>()
+        var depth: i64 = 0
+        var start: i64 = 0
+        var i: i64 = 0
+        while i < s.length() {
+            val c = s.at(i)
+            if c == 60 { depth = depth + 1 }
+            else if c == 62 { depth = depth - 1 }
+            else if c == 44 && depth == 0 {
+                out.add(self.trimSpaces(s.substring(start, i)))
+                start = i + 1
+            }
+            i = i + 1
+        }
+        out.add(self.trimSpaces(s.substring(start, s.length())))
+        ret out
+    }
+
+    fun joinArgs(xs: List<str>): str {
+        var out = ""
+        var i: i64 = 0
+        while i < xs.size() {
+            if i > 0 { out = out + "," }
+            out = out + xs.get(i)
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun typeBase(t: str): str {
+        val i = t.indexOf("<")
+        if i < 0 { ret cloneText(t) }
+        ret t.substring(0, i)
+    }
+
+    fun typeArgsText(t: str): str {
+        val a = t.indexOf("<")
+        val b = t.lastIndexOf(">")
+        if a < 0 || b <= a { ret "" }
+        ret t.substring(a + 1, b)
+    }
+
+    fun isGenericType(t: str): bool => t.indexOf("<") >= 0 && t.lastIndexOf(">") > t.indexOf("<")
+
+    fun valueType(t: str): str {
+        if t.length() > 0 && (t.at(t.length() - 1) == 63 || t.at(t.length() - 1) == 38) { ret t.substring(0, t.length() - 1) }
+        ret cloneText(t)
+    }
+
+    fun classForType(t: str): i64 {
+        var b = cloneText(t)
+        while b.length() > 0 && (b.at(b.length() - 1) == 63 || b.at(b.length() - 1) == 38) { b = b.substring(0, b.length() - 1) }
+        ret self.findClassAny(self.typeBase(b))
+    }
+
+    fun pathOf(n: i64): str {
+        val k = self.ast.kind(n)
+        if k == NodeKind.IdentExpr { ret self.ast.text(n) }
+        if k == NodeKind.Member {
+            if self.ast.size(n) > 0 {
+                val b = self.pathOf(self.ast.child(n, 0))
+                if b.length() > 0 { ret b + "." + self.ast.text(n) }
+            }
+        }
+        ret ""
+    }
+
+    fun qualifiedName(path: str): str {
+        val dot = path.lastIndexOf(".")
+        if dot <= 0 { ret "" }
+        ret self.sanitizeMod(path.substring(0, dot)) + "_" + path.substring(dot + 1, path.length())
+    }
+
+    @no_raii
+    fun paramsOf(cls: i64): List<str> => self.splitArgs(self.ast.auxText(cls))
+
+    @no_raii
+    fun paramNodes(fn: i64): List<i64> {
+        val out = List<i64>()
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val n = self.ast.child(fn, i)
+            if self.ast.kind(n) == NodeKind.Param { out.add(n) }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun isDerived(derived: str, base: str): bool {
+        val db = self.typeBase(derived)
+        val bb = self.typeBase(base)
+        if db == bb || bb.endsWith("_" + db) || db.endsWith("_" + bb) { ret true }
+        val cls = self.findClassAny(db)
+        if cls < 0 { ret false }
+        val bases = self.splitArgs(self.ast.extOf(cls))
+        var i: i64 = 0
+        while i < bases.size() {
+            val b = bases.get(i)
+            if b.length() > 0 && self.isDerived(b, bb) { ret true }
+            i = i + 1
+        }
+        ret false
+    }
+
+    fun coerce(node: i64, want: str): str {
+        val e = self.expr(node)
+        val at = self.typeOf(node)
+        if self.classForType(want) >= 0 && self.classForType(at) >= 0 && self.typeBase(at) != self.typeBase(want) {
+            if self.isDerived(at, want) { ret "(" + self.classCName(want) + "*)" + e }
+        }
+        ret e
+    }
+
+    @no_raii
+    fun isTempStr(n: i64): bool {
+        val k = self.ast.kind(n)
+        ret k == NodeKind.StringLit || k == NodeKind.Call || k == NodeKind.Binary || k == NodeKind.StringTemplate
+    }
+
+    fun hoistStr(n: i64): str {
+        if !self.isTempStr(n) || self.typeOf(n) != "str" { ret "" }
+        val nm = "__tmpstr" + fromInt(self.preid)
+        self.preid = self.preid + 1
+        val e = self.expr(n)
+        if self.loop_cond {
+            self.cond_decls.add("sinter_string " + nm + ";")
+            self.cond_assigns.add(nm + " = " + e)
+            self.cond_frees.add("sinter_string_free(" + nm + ")")
+        } else {
+            self.pre.add("sinter_string " + nm + " = " + e + ";")
+            self.post.add("sinter_string_free(" + nm + ");")
+        }
+        ret nm
+    }
+
+    fun condExpr(cond: str): str {
+        if self.cond_assigns.size() == 0 { ret cloneText(cond) }
+        var i: i64 = 0
+        while i < self.cond_decls.size() {
+            self.line(self.cond_decls.get(i))
+            i = i + 1
+        }
+        val cv = "__tmpcond" + fromInt(self.preid)
+        self.preid = self.preid + 1
+        self.line("int " + cv + ";")
+        var asg = ""
+        i = 0
+        while i < self.cond_assigns.size() {
+            if i > 0 { asg = asg + ", " }
+            asg = asg + self.cond_assigns.get(i)
+            i = i + 1
+        }
+        var frees = ""
+        i = 0
+        while i < self.cond_frees.size() {
+            frees = frees + self.cond_frees.get(i) + ", "
+            i = i + 1
+        }
+        self.cond_decls.clear()
+        self.cond_assigns.clear()
+        self.cond_frees.clear()
+        ret "(" + asg + ", " + cv + " = (" + cond + "), " + frees + cv + ")"
+    }
+
+    fun emitPre(): void {
+        var i: i64 = 0
+        while i < self.pre.size() { self.line(self.pre.get(i)); i = i + 1 }
+        self.pre.clear()
+    }
+
+    fun emitPost(): void {
+        var i: i64 = 0
+        while i < self.post.size() { self.line(self.post.get(i)); i = i + 1 }
+        self.post.clear()
+    }
+
+    fun plainArgs(node: i64): str {
+        var args = ""
+        var i: i64 = 1
+        while i < self.ast.size(node) {
+            if i > 1 { args = args + ", " }
+            args = args + self.expr(self.ast.child(node, i))
+            i = i + 1
+        }
+        ret args
+    }
+
+    fun findParamIdx(pnodes: List<i64>, name: str): i64 {
+        var i: i64 = 0
+        while i < pnodes.size() {
+            if self.ast.text(pnodes.get(i)) == name { ret i }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun bindArgs(pnodes: List<i64>, node: i64): str {
+        val vals = List<str>()
+        var i: i64 = 0
+        while i < pnodes.size() { vals.add(""); i = i + 1 }
+        var pos: i64 = 0
+        var ai: i64 = 1
+        while ai < self.ast.size(node) {
+            val arg = self.ast.child(node, ai)
+            val nm = self.ast.auxText(arg)
+            if hasFlag(self.ast.flag(arg), F_NAMED) {
+                val idx = self.findParamIdx(pnodes, nm)
+                if idx >= 0 {
+                    val hv = self.hoistStr(arg)
+                    vals.set(idx, hv.length() > 0 ? cloneText(hv) : self.coerce(arg, self.ast.auxText(pnodes.get(idx))))
+                }
+                else { self.err(arg, "unknown named argument '" + nm + "'") }
+            } else {
+                while pos < pnodes.size() && vals.get(pos).length() > 0 { pos = pos + 1 }
+                if pos < pnodes.size() {
+                    if self.ast.kind(arg) == NodeKind.Lambda {
+                        val fc = self.fnTypeFirstClass(self.ast.auxText(pnodes.get(pos)))
+                        if fc.length() > 0 { self.ast.setExt(arg, fc) }
+                    }
+                    val hv = self.hoistStr(arg)
+                    vals.set(pos, hv.length() > 0 ? cloneText(hv) : self.coerce(arg, self.ast.auxText(pnodes.get(pos))))
+                    pos = pos + 1
+                }
+            }
+            ai = ai + 1
+        }
+        i = 0
+        while i < pnodes.size() {
+            if vals.get(i).length() == 0 {
+                val p = pnodes.get(i)
+                if self.ast.size(p) > 0 { vals.set(i, self.expr(self.ast.child(p, 0))) }
+                else {
+                    self.err(node, "missing argument for parameter '" + self.ast.text(p) + "'")
+                    vals.set(i, "0")
+                }
+            }
+            i = i + 1
+        }
+        ret self.joinArgs(vals)
+    }
+
+    @no_raii
+    fun fnParams(fn: i64): List<str> {
+        val out = List<str>()
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val n = self.ast.child(fn, i)
+            if self.ast.kind(n) == NodeKind.TypeParam { out.add(self.ast.text(n)) }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun ensureFnInst(fn: i64, argsText: str): str {
+        if argsText.length() == 0 { ret "" }
+        val args = self.splitArgs(argsText)
+        var name = self.cname(self.ast.text(fn))
+        var i: i64 = 0
+        while i < args.size() {
+            name = name + "_" + self.mangle(args.get(i))
+            self.scanType(args.get(i))
+            i = i + 1
+        }
+        if self.fn_inst_names.indexOf(name) >= 0 { ret name }
+        self.fn_inst_names.add(name)
+        self.fn_inst_nodes.add(fn)
+        self.fn_inst_args.add(self.joinArgs(args))
+        ret name
+    }
+
+    fun isGenericFn(fn: i64): bool => self.fnParams(fn).size() > 0
+
+    fun mangle(t: str): str {
+        var out = ""
+        var i: i64 = 0
+        while i < t.length() {
+            val c = t.at(i)
+            if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+                out = out + t.substring(i, i + 1)
+            } else if c == 42 {
+                out = out + "p"
+            } else if c == 60 || c == 62 || c == 44 || c == 32 {
+                if c == 44 { out = out + "_" }
+            } else {
+                out = out + "_"
+            }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun substWith(t: str, params: List<str>, args: List<str>): str {
+        if t.indexOf(",") >= 0 {
+            val parts = self.splitArgs(t)
+            if parts.size() > 1 {
+                val done = List<str>()
+                var pi: i64 = 0
+                while pi < parts.size() {
+                    done.add(self.substWith(parts.get(pi), params, args))
+                    pi = pi + 1
+                }
+                ret self.joinArgs(done)
+            }
+        }
+        var i: i64 = 0
+        while i < params.size() {
+            if t == params.get(i) && i < args.size() { ret args.get(i) }
+            i = i + 1
+        }
+        if t.length() > 0 && t.at(0) == 42 { ret "*" + self.substWith(t.substring(1, t.length()), params, args) }
+        if self.isArrayType(t) {
+            val i = t.lastIndexOf("[")
+            if i > 0 { ret self.substWith(t.substring(0, i), params, args) + t.substring(i, t.length()) }
+        }
+        if self.isGenericType(t) {
+            val base = self.typeBase(t)
+            val inner = self.splitArgs(self.typeArgsText(t))
+            val done = List<str>()
+            var k: i64 = 0
+            while k < inner.size() {
+                done.add(self.substWith(inner.get(k), params, args))
+                k = k + 1
+            }
+            ret base + "<" + self.joinArgs(done) + ">"
+        }
+        ret cloneText(t)
+    }
+
+    fun substType(t: str): str => self.substWith(t, self.cur_params, self.cur_args)
+
+    fun ensureInst(t: str): str {
+        if !self.isGenericType(t) { ret "" }
+        val base = self.typeBase(t)
+        val cls = self.findClass(base)
+        if cls < 0 { ret "" }
+        val args = self.splitArgs(self.typeArgsText(t))
+        var name = cloneText(base)
+        var i: i64 = 0
+        while i < args.size() {
+            name = name + "_" + self.mangle(args.get(i))
+            if self.isGenericType(args.get(i)) { self.ensureInst(args.get(i)) }
+            i = i + 1
+        }
+        if self.inst_names.indexOf(name) >= 0 { ret name }
+        self.inst_names.add(name)
+        self.inst_bases.add(base)
+        self.inst_args_text.add(self.joinArgs(args))
+        ret name
+    }
+
+    fun cnameOfType(t0: str): str {
+        val t = self.substType(t0)
+        if self.isGenericType(t) {
+            val n = self.ensureInst(t)
+            if n.length() > 0 { ret n }
+            ret self.mangle(t)
+        }
+        ret cloneText(t)
+    }
+
+    fun fieldTypeOf(objt: str, name: str): str {
+        val cls = self.classForType(objt)
+        if cls < 0 { ret "" }
+        val raw = self.fieldType(cls, name)
+        if !self.isGenericType(objt) { ret raw }
+        ret self.substWith(raw, self.paramsOf(cls), self.splitArgs(self.typeArgsText(objt)))
+    }
+
+    fun methodTypeOf(objt: str, name: str): str {
+        val cls = self.classForType(objt)
+        if cls < 0 { ret "" }
+        val m = self.classMethod(cls, name)
+        if m < 0 { ret "" }
+        val raw = self.ast.auxText(m)
+        if !self.isGenericType(objt) { ret raw }
+        ret self.substWith(raw, self.paramsOf(cls), self.splitArgs(self.typeArgsText(objt)))
+    }
+
+    fun scanType(t: str): void {
+        if self.isGenericType(t) { self.ensureInst(t) }
+    }
+
+    fun scanNode(n: i64): void {
+        val k = self.ast.kind(n)
+        if k == NodeKind.Var || k == NodeKind.Field || k == NodeKind.Param {
+            val t = self.ast.auxText(n)
+            if t.length() > 0 { self.scanType(self.substType(t)) }
+        }
+        if k == NodeKind.Fun {
+            val rt = self.ast.auxText(n)
+            if rt.length() > 0 {
+                self.scanType(self.substType(rt))
+            }
+        }
+        if k == NodeKind.Call {
+            val callee = self.ast.child(n, 0)
+            if self.ast.kind(callee) == NodeKind.IdentExpr {
+                val name = self.ast.text(callee)
+                var ta = self.substType(self.ast.text(n))
+                if self.findClass(name) >= 0 {
+                    if ta.length() > 0 { self.ensureInst(name + "<" + ta + ">") }
+                } else {
+                    val fi = self.findFnForCall(name, n)
+                    if fi >= 0 && self.isGenericFn(self.fnodes.get(fi)) {
+                        if ta.length() == 0 { ta = self.inferCallArgs(self.fnodes.get(fi), n) }
+                        self.ensureFnInst(self.fnodes.get(fi), ta)
+                    }
+                }
+            }
+        }
+        var i: i64 = 0
+        while i < self.ast.size(n) {
+            self.scanNode(self.ast.child(n, i))
+            i = i + 1
+        }
+    }
+
+    fun scanProgram(root: i64): void {
+        var i: i64 = 0
+        while i < self.ast.size(root) {
+            val n = self.ast.child(root, i)
+            if self.ast.kind(n) == NodeKind.Fun {
+                if !self.isGenericFn(n) { self.scanNode(n) }
+            } else if self.ast.kind(n) != NodeKind.Class { self.scanNode(n) }
+            else if self.ast.auxText(n).length() == 0 { self.scanNode(n) }
+            i = i + 1
+        }
+        // Generic bodies: substitute each known instance and scan again.
+        var at: i64 = 0
+        while at < self.inst_names.size() {
+            val base = self.inst_bases.get(at)
+            val cls = self.findClass(base)
+            if cls >= 0 {
+                val args = self.splitArgs(self.inst_args_text.get(at))
+                self.cur_params = self.paramsOf(cls)
+                self.cur_args = args
+                var k: i64 = 0
+                while k < self.ast.size(cls) {
+                    self.scanNode(self.ast.child(cls, k))
+                    k = k + 1
+                }
+            }
+            at = at + 1
+        }
+        var fat: i64 = 0
+        while fat < self.fn_inst_names.size() {
+            val fn = self.fn_inst_nodes.get(fat)
+            self.setFnInst(fn, self.fn_inst_args.get(fat))
+            self.scanNode(fn)
+            fat = fat + 1
+        }
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+    }
+
+    fun isArrayType(t: str): bool => t.length() > 0 && t.at(t.length() - 1) == 93
+
+    fun isFnType(t: str): bool => t.length() > 1 && t.at(0) == 40 && t.indexOf(")") >= 0 && t.indexOf("->") > 0
+
+    fun fnTypeReturn(t: str): str {
+        val i = t.indexOf("->")
+        if i < 0 { ret "" }
+        ret self.trimSpaces(t.substring(i + 2, t.length()))
+    }
+
+    fun fnTypeDecl(t: str, name: str): str {
+        val close = t.indexOf(")")
+        val inner = t.substring(1, close)
+        val rtp = self.trimSpaces(t.substring(t.indexOf("->") + 2, t.length()))
+        var args = ""
+        if inner.length() > 0 {
+            val parts = self.splitArgs(inner)
+            var i: i64 = 0
+            while i < parts.size() {
+                if i > 0 { args = args + "" }
+                args = args + self.resolveType(parts.get(i))
+                if i + 1 < parts.size() { args = args + ", " }
+                i = i + 1
+            }
+            if args.length() == 0 { args = "void" }
+        } else {
+            args = "void"
+        }
+        ret self.resolveType(rtp) + " (*" + name + ")(" + args + ")"
+    }
+
+    fun declOf(t: str, name: str): str {
+        val st = self.substType(t)
+        if self.isFnType(st) { ret self.fnTypeDecl(st, name) }
+        if self.isArrayType(st) {
+            val i = st.lastIndexOf("[")
+            if i >= 0 {
+                ret self.declOf(st.substring(0, i), name + st.substring(i, st.length()))
+            }
+        }
+        ret self.resolveType(st) + " " + name
+    }
+
+    fun arrayElement(t: str): str {
+        if self.isArrayType(t) {
+            val i = t.lastIndexOf("[")
+            if i > 0 { ret t.substring(0, i) }
+        }
+        if t.length() > 0 && t.at(0) == 42 { ret t.substring(1, t.length()) }
+        ret ""
+    }
+
+    fun resolveType(t: str): str {
+        var st = self.substType(t)
+        if st.length() > 0 && st.at(st.length() - 1) == 63 { st = st.substring(0, st.length() - 1) }
+        if st.length() > 0 && st.at(st.length() - 1) == 38 {
+            val inner = st.substring(0, st.length() - 1)
+            if self.classForType(inner) >= 0 { ret self.classCName(inner) + "*" }
+            val c = self.resolveType(inner)
+            if c.length() > 0 { ret c + "*" }
+            ret ""
+        }
+        if st.length() > 0 && (st.at(0) == 42 || st.at(0) == 38) {
+            val inner = st.substring(1, st.length())
+            if self.classForType(inner) >= 0 { ret self.classCName(inner) + "**" }
+            if self.isGenericType(inner) {
+                val n = self.ensureInst(inner)
+                if n.length() > 0 { ret self.classCName(n) + "**" }
+            }
+            val c = self.resolveType(inner)
+            if c.length() > 0 { ret c + "*" }
+            ret ""
+        }
+        if self.isArrayType(st) { ret "array" }
+        if self.isGenericType(st) {
+            val n = self.ensureInst(st)
+            if n.length() > 0 { ret self.classCName(n) + "*" }
+        }
+        if self.findClassAny(st) >= 0 { ret self.classCName(st) + "*" }
+        if self.findEnum(st) >= 0 { ret cloneText(st) }
+        ret mapType(st)
+    }
+
+    fun zeroOf(t0: str): str {
+        var t = self.substType(t0)
+        if t.length() > 0 && t.at(t.length() - 1) == 63 { ret "NULL" }
+        if t == "str" { ret "sinter_string_from_literal(\"\", 0)" }
+        if self.isArrayType(t) { ret "{0}" }
+        if t.length() > 0 && (t.at(0) == 42 || t.at(0) == 38) { ret "NULL" }
+        if self.findClass(self.typeBase(t)) >= 0 { ret "NULL" }
+        if self.isGenericType(t) { ret "NULL" }
+        return "0"
+    }
+
+    // ---- generic intrinsic dispatch (sinter_gen_* families) ----------------
+    fun isTypeName(name: str): bool {
+        if cBase(name).length() > 0 { ret true }
+        if name == "ptr" || name == "cstr" { ret true }
+        var i: i64 = 0
+        while i < self.cur_params.size() {
+            if self.cur_params.get(i) == name { ret true }
+            i = i + 1
+        }
+        if self.findClass(name) >= 0 || self.findEnum(name) >= 0 { ret true }
+        ret false
+    }
+
+    fun genFamily(name: str): str {
+        if !name.startsWith("sinter_gen_") { ret "" }
+        val rest = name.substring(11, name.length())
+        val fams = List<str>()
+        fams.add("clone"); fams.add("free"); fams.add("drop"); fams.add("grow")
+        fams.add("hash"); fams.add("cmp"); fams.add("blank"); fams.add("text")
+        fams.add("alloc"); fams.add("fill"); fams.add("index_of"); fams.add("reverse")
+        fams.add("sort"); fams.add("copy"); fams.add("sum")
+        var i: i64 = 0
+        while i < fams.size() {
+            if rest == fams.get(i) { ret rest }
+            i = i + 1
+        }
+        ret ""
+    }
+
+    fun genTypeSuffix(t0: str): str {
+        var t = self.substType(t0)
+        while t.length() > 0 && (t.at(0) == 42 || t.at(0) == 38) { t = t.substring(1, t.length()) }
+        if self.isArrayType(t) { t = self.arrayElement(t) }
+        if t == "i8" || t == "i16" || t == "i32" || t == "int" || t == "i64" || t == "long" { ret "i64" }
+        if t == "u8" || t == "byte" { ret "u8" }
+        if t == "u16" || t == "u32" || t == "u64" { ret "i64" }
+        if t == "f32" || t == "f64" || t == "float" { ret "f64" }
+        if t == "bool" { ret "bool" }
+        if t == "str" { ret "str" }
+        if self.isGenericType(t) {
+            val n = self.ensureInst(t)
+            if n.length() > 0 { ret "ptr" }
+        }
+        if self.findClass(t) >= 0 { ret "ptr" }
+        ret ""
+    }
+
+    fun genCall(node: i64, name: str): str {
+        val fam = self.genFamily(name)
+        if fam.length() == 0 { ret "" }
+        val args = List<i64>()
+        var i: i64 = 1
+        while i < self.ast.size(node) {
+            args.add(self.ast.child(node, i))
+            i = i + 1
+        }
+        var t = ""
+        if args.size() > 0 {
+            val last = args.get(args.size() - 1)
+            if self.ast.kind(last) == NodeKind.IdentExpr && self.isTypeName(self.ast.text(last)) {
+                t = self.ast.text(last)
+                args.removeLast()
+            }
+        }
+        if t.length() == 0 && (fam == "alloc" || fam == "blank") && self.cur_args.size() > 0 {
+            t = self.cur_args.get(0)
+        }
+        if t.length() == 0 && args.size() > 0 {
+            t = self.typeOf(args.get(0))
+        }
+        if t.length() == 0 && self.cur_args.size() > 0 { t = self.cur_args.get(0) }
+        val sfx = self.genTypeSuffix(t)
+        if sfx.length() == 0 { ret "" }
+        var a = ""
+        var k: i64 = 0
+        while k < args.size() {
+            if k > 0 { a = a + ", " }
+            a = a + self.expr(args.get(k))
+            k = k + 1
+        }
+        ret "sinter_gen_" + fam + "_" + sfx + "(" + a + ")"
+    }
+
+    // ---- type inference ----------------------------------------------------
+    fun binaryType(op: str, a: str, b: str): str {
+        if op == "==" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" || op == "&&" || op == "||" || op == "is" || op == "in" { ret "bool" }
+        if op == "+" && (a == "str" || b == "str") { ret "str" }
+        if a == "f32" || a == "f64" || b == "f32" || b == "f64" { ret "f64" }
+        ret "i64"
+    }
+
+    fun typeOf(node: i64): str {
+        val k = self.ast.kind(node)
+        if k == NodeKind.IntLit { ret "i64" }
+        if k == NodeKind.FloatLit { ret "f64" }
+        if k == NodeKind.StringLit || k == NodeKind.StringTemplate { ret "str" }
+        if k == NodeKind.CharLit { ret "char" }
+        if k == NodeKind.BoolLit { ret "bool" }
+        if k == NodeKind.NullLit { ret "void*" }
+        if k == NodeKind.Lambda { ret self.lambdaType(node) }
+        if k == NodeKind.Group {
+            if self.ast.size(node) > 0 { ret self.typeOf(self.ast.child(node, 0)) }
+            ret "i64"
+        }
+        if k == NodeKind.IdentExpr {
+            val name = self.ast.text(node)
+            val v = self.findVar(name)
+            if v >= 0 { ret self.valueType(self.vtypes.get(v)) }
+            val g = self.findGlobal(name)
+            if g >= 0 { ret self.gtypes.get(g) }
+            if self.curclass.length() > 0 {
+                val fl = self.fieldTypeOf(self.curclass, name)
+                if fl.length() > 0 { ret fl }
+            }
+            ret ""
+        }
+        if k == NodeKind.ThisExpr { ret cloneText(self.curclass) }
+        if k == NodeKind.Member {
+            val obj = self.ast.child(node, 0)
+            if self.ast.kind(obj) == NodeKind.IdentExpr && self.findEnum(self.ast.text(obj)) >= 0 { ret self.ast.text(obj) }
+            val objt = self.typeOf(obj)
+            if objt == "str" && self.ast.text(node) == "len" { ret "i64" }
+            if self.classForType(objt) >= 0 { ret self.fieldTypeOf(objt, self.ast.text(node)) }
+            ret ""
+        }
+        if k == NodeKind.Unary {
+            val op = self.ast.text(node)
+            if op == "!" { ret "bool" }
+            if self.ast.size(node) > 0 {
+                val inner = self.typeOf(self.ast.child(node, 0))
+                if op == "!!" { ret self.valueType(inner) }
+                if op == "&" { ret "*" + inner }
+                if op == "*" && inner.length() > 0 && inner.at(0) == 42 { ret inner.substring(1, inner.length()) }
+                ret inner
+            }
+            ret "i64"
+        }
+        if k == NodeKind.Index {
+            ret self.arrayElement(self.typeOf(self.ast.child(node, 0)))
+        }
+        if k == NodeKind.ArrayLit {
+            if self.ast.size(node) == 0 { ret "i64[0]" }
+            ret self.typeOf(self.ast.child(node, 0)) + "[" + fromInt(self.ast.size(node)) + "]"
+        }
+        if k == NodeKind.Binary {
+            val a = self.typeOf(self.ast.child(node, 0))
+            val b = self.typeOf(self.ast.child(node, 1))
+            ret self.binaryType(self.ast.text(node), a, b)
+        }
+        if k == NodeKind.Assign {
+            ret self.typeOf(self.ast.child(node, 0))
+        }
+        if k == NodeKind.Ternary {
+            ret self.typeOf(self.ast.child(node, 1))
+        }
+        if k == NodeKind.Cast { ret self.ast.text(node) }
+        if k == NodeKind.Call {
+            val callee = self.ast.child(node, 0)
+            if self.ast.kind(callee) == NodeKind.IdentExpr {
+                val name = self.ast.text(callee)
+                if name == "println" || name == "print" || name == "eprintln" || name == "eprint" { ret "void" }
+                if name == "std_println" || name == "std_print" || name == "std_eprintln" || name == "std_eprint" { ret "void" }
+                val lv = self.findVar(name)
+                if lv >= 0 && self.isFnType(self.vtypes.get(lv)) {
+                    ret self.fnTypeReturn(self.vtypes.get(lv))
+                }
+                if self.findClass(name) >= 0 {
+                    if self.ast.text(node).length() > 0 { ret name + "<" + self.substType(self.ast.text(node)) + ">" }
+                    ret name
+                }
+                val fi = self.findFnForCall(name, node)
+                if fi >= 0 && self.isGenericFn(self.fnodes.get(fi)) {
+                    var ta = self.substType(self.ast.text(node))
+                    if ta.length() == 0 { ta = self.inferCallArgs(self.fnodes.get(fi), node) }
+                    if ta.length() > 0 { ret self.substWith(self.fret.get(fi), self.fnParams(self.fnodes.get(fi)), self.splitArgs(ta)) }
+                }
+                if fi >= 0 { ret self.fret.get(fi) }
+                if name == "sinter_gen_text" || name.startsWith("sinter_gen_text_") { ret "str" }
+                if name.startsWith("sinter_str_from") || name.startsWith("sinter_num_from") { ret "str" }
+                ret self.fnReturn(name)
+            }
+            if self.ast.kind(callee) == NodeKind.Member {
+                val q = self.qualifiedName(self.pathOf(callee))
+                if q.length() > 0 {
+                    val fi = self.findFn(q)
+                    if fi >= 0 { ret self.fret.get(fi) }
+                }
+                val ob = self.ast.child(callee, 0)
+                if self.ast.kind(ob) == NodeKind.IdentExpr {
+                    val cn = self.ast.text(ob)
+                    val ci = self.findClassAny(cn)
+                    if ci >= 0 {
+                        val mi = self.classMethod(ci, self.ast.text(callee))
+                        if mi >= 0 { ret self.ast.auxText(mi) }
+                    }
+                }
+                val objt = self.typeOf(ob)
+                if self.classForType(objt) >= 0 {
+                    val cl = self.classForType(objt)
+                    val mn = self.ast.text(callee)
+                    if mn == "apply" { ret objt }
+                    if self.isData(cl) {
+                        if mn == "toString" { ret "str" }
+                        if mn == "equals" { ret "bool" }
+                        if mn == "copy" || mn == "copyWith" { ret objt }
+                        if mn.startsWith("component") {
+                            val idx = self.intOf(mn.substring(9, mn.length())) - 1
+                            val ctor = self.classCtor(cl)
+                            if ctor >= 0 && idx >= 0 && idx < self.paramNodes(ctor).size() { ret self.ast.auxText(self.paramNodes(ctor).get(idx)) }
+                        }
+                    }
+                    ret self.methodTypeOf(objt, mn)
+                }
+                val efn = self.findExt(objt, self.ast.text(callee))
+                if efn >= 0 { ret self.ast.auxText(efn) }
+            }
+            ret ""
+        }
+        ret ""
+    }
+
+    // ---- expressions -------------------------------------------------------
+    fun escapeString(s: str): str {
+        var out = ""
+        var i: i64 = 0
+        while i < s.length() {
+            val c = s.at(i)
+            if c == 92 {
+                out = out + s.substring(i, i + 1)
+                if i + 1 < s.length() { out = out + s.substring(i + 1, i + 2); i = i + 2 } else { i = i + 1 }
+            } else if c == 34 {
+                out = out + "\\\""
+                i = i + 1
+            } else if c == 10 {
+                out = out + "\\n"
+                i = i + 1
+            } else if c == 13 {
+                i = i + 1
+            } else {
+                out = out + s.substring(i, i + 1)
+                i = i + 1
+            }
+        }
+        ret out
+    }
+
+    fun intOf(s: str): i64 {
+        var n: i64 = 0
+        var i: i64 = 0
+        while i < s.length() {
+            val c = s.at(i)
+            if c >= 48 && c <= 57 { n = n * 10 + (c - 48) }
+            i = i + 1
+        }
+        ret n
+    }
+
+    fun shortName(name: str): str {
+        var sn = cloneText(name)
+        val i = sn.lastIndexOf("_")
+        if i >= 0 { sn = sn.substring(i + 1, sn.length()) }
+        ret sn
+    }
+
+    fun cStringLen(s: str): i64 {
+        var n: i64 = 0
+        var i: i64 = 0
+        while i < s.length() {
+            if s.at(i) == 92 && i + 1 < s.length() { i = i + 2 } else { i = i + 1 }
+            n = n + 1
+        }
+        ret n
+    }
+
+    fun embedBody(node: i64): str {
+        val t = self.ast.auxText(node)
+        val a = t.indexOf("{")
+        val b = t.lastIndexOf("}")
+        if a >= 0 && b > a { ret t.substring(a + 1, b) }
+        ret t
+    }
+
+    fun embedIsHeader(node: i64): bool {
+        val t = self.ast.auxText(node)
+        val b = t.indexOf("{")
+        if b < 0 { ret t.indexOf("header") >= 0 }
+        ret t.substring(0, b).indexOf("header") >= 0
+    }
+
+    fun expr(node: i64): str {
+        val k = self.ast.kind(node)
+        if k == NodeKind.Lambda { ret self.lambdaName(node) }
+        if k == NodeKind.IntLit {
+            var t = self.ast.text(node)
+            var i: i64 = 0
+            while i < t.length() {
+                val c = t.at(i)
+                if !(c >= 48 && c <= 57) && c != 120 && c != 88 && c != 98 && c != 66 && c != 111 && c != 79 && c != 95 {
+                    t = t.substring(0, i)
+                    break
+                }
+                i = i + 1
+            }
+            ret t
+        }
+        if k == NodeKind.FloatLit {
+            var t = self.ast.text(node)
+            if t.length() > 0 {
+                val c = t.at(t.length() - 1)
+                if c == 102 || c == 100 { t = t.substring(0, t.length() - 1) }
+            }
+            ret t
+        }
+        if k == NodeKind.StringLit {
+            val lit = self.escapeString(self.ast.text(node))
+            ret "sinter_string_from_literal(\"" + cloneText(lit) + "\", " + fromInt(self.cStringLen(lit)) + ")"
+        }
+        if k == NodeKind.CharLit {
+            val t = self.ast.text(node)
+            if t.length() == 0 { ret "'\\0'" }
+            ret "'" + t + "'"
+        }
+        if k == NodeKind.BoolLit { ret self.ast.text(node) == "true" ? "1" : "0" }
+        if k == NodeKind.NullLit { ret "NULL" }
+        if k == NodeKind.IdentExpr {
+            val name = self.ast.text(node)
+            val v = self.findVar(name)
+            if v >= 0 {
+                val vt = self.vtypes.get(v)
+                if vt.length() > 0 && vt.at(vt.length() - 1) == 38 {
+                    val inner = vt.substring(0, vt.length() - 1)
+                    if self.classForType(inner) >= 0 { ret self.vname(name) }
+                    ret "(*" + self.vname(name) + ")"
+                }
+                ret self.vname(name)
+            }
+            if self.findGlobal(name) >= 0 { ret name }
+            val fni = self.findFn(name)
+            if fni >= 0 { ret self.fnCName(self.fnodes.get(fni)) }
+            if self.curclass.length() > 0 && self.fieldTypeOf(self.curclass, name).length() > 0 {
+                ret "self->" + name
+            }
+            ret name
+        }
+        if k == NodeKind.ThisExpr { ret "self" }
+        if k == NodeKind.Index {
+            if self.ast.size(node) > 1 { ret "(" + self.expr(self.ast.child(node, 0)) + ")[" + self.expr(self.ast.child(node, 1)) + "]" }
+            ret "0"
+        }
+        if k == NodeKind.Member {
+            val obj = self.ast.child(node, 0)
+            if self.ast.kind(obj) == NodeKind.IdentExpr {
+                val en = self.findEnum(self.ast.text(obj))
+                if en >= 0 { ret self.ast.text(obj) + "_" + self.ast.text(node) }
+            }
+            if self.typeOf(obj) == "str" && self.ast.text(node) == "len" { ret "(" + self.expr(obj) + ").len" }
+            if self.classForType(self.typeOf(obj)) >= 0 { ret self.expr(obj) + "->" + self.ast.text(node) }
+            self.err(node, "unknown member '" + self.ast.text(node) + "'")
+            ret "0"
+        }
+        if k == NodeKind.Group {
+            if self.ast.size(node) > 0 { ret "(" + self.expr(self.ast.child(node, 0)) + ")" }
+            ret "(0)"
+        }
+        if k == NodeKind.Unary {
+            val op = self.ast.text(node)
+            if op == "++" || op == "--" { self.err(node, "++/-- are not supported by the bootstrap backend"); ret "0" }
+            val e = self.ast.size(node) > 0 ? self.expr(self.ast.child(node, 0)) : "0"
+            if op == "!!" { ret "(" + e + ")" }
+            if op == "*" && self.ast.size(node) > 0 {
+                val ch = self.ast.child(node, 0)
+                if self.ast.kind(ch) == NodeKind.IdentExpr {
+                    val vi = self.findVar(self.ast.text(ch))
+                    if vi >= 0 {
+                        val vt = self.vtypes.get(vi)
+                        if vt.length() > 0 && vt.at(vt.length() - 1) == 38 { ret "(" + e + ")" }
+                    }
+                }
+                val it = self.typeOf(ch)
+                if it.length() > 0 && it.at(it.length() - 1) == 38 { ret "(" + e + ")" }
+            }
+            ret "(" + op + e + ")"
+        }
+        if k == NodeKind.Binary {
+            val op = self.ast.text(node)
+            if op == "is" || op == "in" || op == ".." {
+                self.err(node, "operator '" + op + "' is not supported by the bootstrap backend")
+                ret "0"
+            }
+            val ta = self.typeOf(self.ast.child(node, 0))
+            val tb = self.typeOf(self.ast.child(node, 1))
+            val ha = self.hoistStr(self.ast.child(node, 0))
+            val a = ha.length() > 0 ? cloneText(ha) : self.expr(self.ast.child(node, 0))
+            val hb = self.hoistStr(self.ast.child(node, 1))
+            val b = hb.length() > 0 ? cloneText(hb) : self.expr(self.ast.child(node, 1))
+            if (op == "+" && (ta == "str" || tb == "str")) {
+                val la = ta == "str" ? cloneText(a) : (ta == "f32" || ta == "f64" ? "sinter_string_from_num((double)(" + a + "))" : "sinter_string_from_int((int64_t)(" + a + "))")
+                val lb = tb == "str" ? cloneText(b) : (tb == "f32" || tb == "f64" ? "sinter_string_from_num((double)(" + b + "))" : "sinter_string_from_int((int64_t)(" + b + "))")
+                ret "sinter_string_concat(" + la + ", " + lb + ")"
+            }
+            if ((op == "==" || op == "!=") && (ta == "str" || tb == "str")) {
+                if op == "==" { ret "(sinter_string_equals(" + a + ", " + b + ") != 0)" }
+                ret "(!(sinter_string_equals(" + a + ", " + b + ") != 0))"
+            }
+            ret "(" + a + " " + op + " " + b + ")"
+        }
+        if k == NodeKind.Assign {
+            val target = self.ast.child(node, 0)
+            val op = self.ast.text(node)
+            val valNode = self.ast.size(node) > 1 ? self.expr(self.ast.child(node, 1)) : "0"
+            if self.ast.kind(target) == NodeKind.Member {
+                val objt = self.typeOf(self.ast.child(target, 0))
+                if self.classForType(objt) < 0 {
+                    self.err(node, "member assignment needs a class object")
+                    ret "0"
+                }
+                ret "(" + self.expr(target) + " " + op + " " + valNode + ")"
+            }
+            if self.ast.kind(target) == NodeKind.Index {
+                ret "(" + self.expr(target) + " " + op + " " + valNode + ")"
+            }
+            if self.ast.kind(target) == NodeKind.Unary {
+                ret "(" + self.expr(target) + " " + op + " " + valNode + ")"
+            }
+            if self.ast.kind(target) != NodeKind.IdentExpr {
+                self.err(node, "unsupported assignment target in the bootstrap backend")
+                ret "0"
+            }
+            val name = self.ast.text(target)
+            val v = self.findVar(name)
+            if v < 0 && self.findGlobal(name) < 0 && !(self.curclass.length() > 0 && self.fieldTypeOf(self.curclass, name).length() > 0) { self.err(node, "unknown variable '" + name + "'") }
+            val lhs = self.expr(target)
+            ret "(" + lhs + " " + op + " " + valNode + ")"
+        }
+        if k == NodeKind.Ternary {
+            val c = self.expr(self.ast.child(node, 0))
+            val a = self.expr(self.ast.child(node, 1))
+            val b = self.expr(self.ast.child(node, 2))
+            ret "(" + c + " ? " + a + " : " + b + ")"
+        }
+        if k == NodeKind.Cast {
+            val t = self.resolveType(self.ast.text(node))
+            if t.length() == 0 { self.err(node, "unsupported cast type '" + self.ast.text(node) + "'"); ret "0" }
+            ret "((" + t + ")" + self.expr(self.ast.child(node, 0)) + ")"
+        }
+        if k == NodeKind.Call {
+            val callee = self.ast.child(node, 0)
+            if self.ast.kind(callee) == NodeKind.IdentExpr {
+                val name = self.ast.text(callee)
+                if name.startsWith("sinter_gen_") {
+                    val g = self.genCall(node, name)
+                    if g.length() > 0 { ret g }
+                }
+                var pname = cloneText(name)
+                if pname == "std_println" { pname = "println" }
+                else if pname == "std_print" { pname = "print" }
+                else if pname == "std_eprintln" { pname = "eprintln" }
+                else if pname == "std_eprint" { pname = "eprint" }
+                if pname == "println" || pname == "print" || pname == "eprintln" || pname == "eprint" {
+                    val stream = (pname == "eprintln" || pname == "eprint") ? "stderr" : "stdout"
+                    val nl = (pname == "println" || pname == "eprintln") ? "ln" : ""
+                    if self.ast.size(node) > 1 {
+                        val t = self.typeOf(self.ast.child(node, 1))
+                        val e = self.expr(self.ast.child(node, 1))
+                        if t == "str" { ret "snt_out" + nl + "_s(" + e + ", " + stream + ")" }
+                        if t == "cstr" { ret "snt_out" + nl + "_s(sinter_string_from_cstr(" + e + "), " + stream + ")" }
+                        if t == "bool" { ret "snt_out" + nl + "_b(" + e + ", " + stream + ")" }
+                        if t == "f32" || t == "f64" { ret "snt_out" + nl + "_f(" + e + ", " + stream + ")" }
+                        ret "snt_out" + nl + "_i(" + e + ", " + stream + ")"
+                    }
+                    if nl == "ln" { ret "(fputc('\\n', " + stream + "), fflush(" + stream + "))" }
+                    ret "0"
+                }
+                if self.findVar(name) >= 0 {
+                    ret self.vname(name) + "(" + self.plainArgs(node) + ")"
+                }
+                if self.findClass(name) >= 0 {
+                    var gt = cloneText(name)
+                    if self.ast.text(node).length() > 0 { gt = name + "<" + self.substType(self.ast.text(node)) + ">" }
+                    val ci = self.findClass(name)
+                    val cc = self.classCtor(ci)
+                    var cargs = self.plainArgs(node)
+                    if cc >= 0 && !self.fnVararg(cc) { cargs = self.bindArgs(self.paramNodes(cc), node) }
+                    ret self.classCName(gt) + "_new(" + cargs + ")"
+                }
+                val fi = self.findFnForCall(name, node)
+                if fi < 0 {
+                    ret name + "(" + self.plainArgs(node) + ")"
+                }
+                val fn = self.fnodes.get(fi)
+                var genArgs = ""
+                val oldp = self.copyList(self.cur_params)
+                val olda = self.copyList(self.cur_args)
+                if self.isGenericFn(fn) {
+                    genArgs = self.substType(self.ast.text(node))
+                    if genArgs.length() == 0 { genArgs = self.inferCallArgs(fn, node) }
+                    if genArgs.length() > 0 {
+                        self.cur_params = self.fnParams(fn)
+                        self.cur_args = self.splitArgs(genArgs)
+                    }
+                }
+                val pnodes = self.paramNodes(fn)
+                val va = self.fnVararg(fn)
+                val fixed = va ? pnodes.size() - 1 : pnodes.size()
+                var args = ""
+                if !va { args = self.bindArgs(pnodes, node) }
+                else {
+                    var ai: i64 = 1
+                    while ai <= fixed && ai < self.ast.size(node) {
+                        if ai > 1 { args = args + ", " }
+                        args = args + self.coerce(self.ast.child(node, ai), self.ast.auxText(pnodes.get(ai - 1)))
+                        ai = ai + 1
+                    }
+                }
+                if va {
+                    val lastp = pnodes.get(pnodes.size() - 1)
+                    val elem = self.substType(self.ast.auxText(lastp))
+                    val ect = self.resolveType(elem)
+                    val count = self.ast.size(node) - 1 - fixed
+                    if args.length() > 0 { args = args + ", " }
+                    if count > 0 {
+                        var lit = ""
+                        var vi: i64 = fixed + 1
+                        while vi < self.ast.size(node) {
+                            if vi > fixed + 1 { lit = lit + ", " }
+                            lit = lit + self.expr(self.ast.child(node, vi))
+                            vi = vi + 1
+                        }
+                        args = args + "(" + ect + "[]){" + lit + "}"
+                    } else {
+                        args = args + "(" + ect + "*)0"
+                    }
+                    args = args + ", " + fromInt(count)
+                }
+                if self.isGenericFn(fn) {
+                    val gn = self.ensureFnInst(self.fnodes.get(fi), genArgs)
+                    if gn.length() > 0 { ret gn + "(" + args + ")" }
+                    self.err(node, "generic function needs explicit type arguments")
+                    ret "0"
+                }
+                ret self.fnCName(self.fnodes.get(fi)) + "(" + args + ")"
+            }
+            if self.ast.kind(callee) == NodeKind.Member {
+                val qpath = self.qualifiedName(self.pathOf(callee))
+                if qpath.length() > 0 {
+                    val qfi = self.findFn(qpath)
+                    if qfi >= 0 {
+                        val qp = self.paramNodes(self.fnodes.get(qfi))
+                        var qargs = ""
+                        var qi: i64 = 1
+                        while qi < self.ast.size(node) {
+                            if qi > 1 { qargs = qargs + ", " }
+                            if qi - 1 < qp.size() { qargs = qargs + self.coerce(self.ast.child(node, qi), self.ast.auxText(qp.get(qi - 1))) }
+                            else { qargs = qargs + self.expr(self.ast.child(node, qi)) }
+                            qi = qi + 1
+                        }
+                        ret self.fnCName(self.fnodes.get(qfi)) + "(" + qargs + ")"
+                    }
+                    val qcls = self.findClass(qpath)
+                    if qcls >= 0 {
+                        var qargs = ""
+                        var qi: i64 = 1
+                        while qi < self.ast.size(node) {
+                            if qi > 1 { qargs = qargs + ", " }
+                            qargs = qargs + self.expr(self.ast.child(node, qi))
+                            qi = qi + 1
+                        }
+                        ret self.classCName(qpath) + "_new(" + qargs + ")"
+                    }
+                }
+                val obj = self.ast.child(callee, 0)
+                val mname = self.ast.text(callee)
+                val objt0 = self.typeOf(obj)
+                val cls0 = self.classForType(objt0)
+                if mname == "apply" && self.ast.size(node) > 1 && self.ast.kind(self.ast.child(node, 1)) == NodeKind.Lambda {
+                    val lam = self.ast.child(node, 1)
+                    self.ast.setExt(lam, objt0)
+                    self.ast.setAux(lam, objt0)
+                    ret self.lambdaName(lam) + "(" + self.expr(obj) + ")"
+                }
+                if cls0 >= 0 && self.isData(cls0) {
+                    if mname == "toString" { ret self.classCName(objt0) + "__to_str(" + self.expr(obj) + ")" }
+                    if mname == "equals" { ret self.classCName(objt0) + "__equals(" + self.expr(obj) + ", " + self.expr(self.ast.child(node, 1)) + ")" }
+                    if mname.startsWith("component") {
+                        val idx = self.intOf(mname.substring(9, mname.length())) - 1
+                        val ctor = self.classCtor(cls0)
+                        if ctor >= 0 && idx >= 0 && idx < self.paramNodes(ctor).size() {
+                            ret self.expr(obj) + "->" + self.ast.text(self.paramNodes(ctor).get(idx))
+                        }
+                    }
+                    if mname == "copy" || mname == "copyWith" {
+                        val ctor = self.classCtor(cls0)
+                        val pn = self.paramNodes(ctor)
+                        val vals = List<str>()
+                        var pi: i64 = 0
+                        while pi < pn.size() {
+                            val f = self.ast.text(pn.get(pi))
+                            var got = ""
+                            var ai: i64 = 1
+                            var pos: i64 = 0
+                            while ai < self.ast.size(node) {
+                                val a = self.ast.child(node, ai)
+                                if hasFlag(self.ast.flag(a), F_NAMED) {
+                                    if self.ast.auxText(a) == f { got = self.expr(a) }
+                                } else {
+                                    if pos == pi { got = self.expr(a) }
+                                    pos = pos + 1
+                                }
+                                ai = ai + 1
+                            }
+                            if got.length() == 0 { got = self.expr(obj) + "->" + f }
+                            vals.add(got)
+                            pi = pi + 1
+                        }
+                        ret self.classCName(objt0) + "_new(" + self.joinArgs(vals) + ")"
+                    }
+                }
+                if self.ast.kind(obj) == NodeKind.IdentExpr {
+                    val cn = self.ast.text(obj)
+                    val ci = self.findClassAny(cn)
+                    if ci >= 0 {
+                        val sm = self.classMethod(ci, mname)
+                        if sm >= 0 {
+                            val sp = self.paramNodes(sm)
+                            var sargs = ""
+                            var si: i64 = 1
+                            while si < self.ast.size(node) {
+                                if si > 1 { sargs = sargs + ", " }
+                                if si - 1 < sp.size() { sargs = sargs + self.coerce(self.ast.child(node, si), self.ast.auxText(sp.get(si - 1))) }
+                                else { sargs = sargs + self.expr(self.ast.child(node, si)) }
+                                si = si + 1
+                            }
+                            ret self.classCName(cn) + "_" + self.methodCName(sm) + "(" + sargs + ")"
+                        }
+                    }
+                }
+                val objt = self.typeOf(obj)
+                val cls = self.classForType(objt)
+                if cls >= 0 {
+                    val fv0 = self.findVar(mname)
+                    if fv0 >= 0 && self.isFnType(self.vtypes.get(fv0)) { ret self.vname(mname) + "(" + self.expr(obj) + ")" }
+                }
+                if cls < 0 {
+                    val fv = self.findVar(mname)
+                    if fv >= 0 && self.isFnType(self.vtypes.get(fv)) {
+                        ret self.vname(mname) + "(" + self.expr(obj) + ")"
+                    }
+                    val efn = self.findExt(objt, mname)
+                    if efn >= 0 {
+                        val ep = self.paramNodes(efn)
+                        var eargs = self.expr(obj)
+                        var ei: i64 = 1
+                        while ei < self.ast.size(node) {
+                            if ei - 1 < ep.size() {
+                                eargs = eargs + ", " + self.coerce(self.ast.child(node, ei), self.ast.auxText(ep.get(ei - 1)))
+                            } else {
+                                eargs = eargs + ", " + self.expr(self.ast.child(node, ei))
+                            }
+                            ei = ei + 1
+                        }
+                        ret self.fnCName(efn) + "(" + eargs + ")"
+                    }
+                    self.err(node, "method call needs a class object")
+                    ret "0"
+                }
+                if self.classMethod(cls, mname) < 0 {
+                    self.err(node, "[E0306] type has no member named `" + mname + "`; semantic analysis failed")
+                    ret "0"
+                }
+                val mm = self.classMethod(cls, mname)
+                if mm >= 0 && !hasFlag(self.ast.flag(mm), F_PUB) && self.ast.moduleOf(node) != self.ast.moduleOf(cls) {
+                    self.err(node, "[E0207] member '" + mname + "' is private to module '" + self.ast.moduleOf(cls) + "'")
+                }
+                val mp = self.paramNodes(mm)
+                if self.isInterface(cls) {
+                    val slot = self.ifaceSlot(cls, mname)
+                    val rt = self.resolveType(self.ast.auxText(mm))
+                    var pty = ""
+                    var pi: i64 = 0
+                    while pi < mp.size() {
+                        pty = pty + ", " + self.resolveType(self.ast.auxText(mp.get(pi)))
+                        pi = pi + 1
+                    }
+                    var fargs = self.expr(obj)
+                    var ai: i64 = 1
+                    while ai < self.ast.size(node) {
+                        fargs = fargs + ", " + self.coerce(self.ast.child(node, ai), self.ast.auxText(mp.get(ai - 1)))
+                        ai = ai + 1
+                    }
+                    ret "((" + rt + " (*)(void*" + pty + "))" + self.expr(obj) + "->__vptr[" + fromInt(slot) + "])(" + fargs + ")"
+                }
+                var args = self.coerce(obj, objt)
+                if mp.size() > 0 {
+                    val ba = self.bindArgs(mp, node)
+                    if ba.length() > 0 { args = args + ", " + ba }
+                }
+                ret self.classCName(objt) + "_" + self.methodCName(mm) + "(" + args + ")"
+            }
+            self.err(node, "unsupported call target in the bootstrap backend")
+            ret "0"
+        }
+        if k == NodeKind.StringTemplate {
+            if self.ast.size(node) == 0 { ret "sinter_string_from_literal(\"\", 0)" }
+            val count = self.ast.size(node)
+            val base = self.seq_slot
+            self.seq_slot = self.seq_slot + count
+            var seq = "("
+            var i: i64 = 0
+            while i < count {
+                val part = self.ast.child(node, i)
+                var ps = ""
+                if self.ast.kind(part) == NodeKind.StringLit {
+                    ps = self.expr(part)
+                } else {
+                    val pt = self.typeOf(part)
+                    val pe = self.expr(part)
+                    if pt == "str" { ps = cloneText(pe) }
+                    else if pt == "f32" || pt == "f64" { ps = "sinter_string_from_num((double)(" + pe + "))" }
+                    else { ps = "sinter_string_from_int((int64_t)(" + pe + "))" }
+                }
+                seq = seq + "snt_seq_set(" + fromInt(base + i) + ", " + ps + "), "
+                i = i + 1
+            }
+            ret seq + "snt_seq_join(" + fromInt(base) + ", " + fromInt(count) + "))"
+        }
+        if k == NodeKind.ArrayLit {
+            var out = "{"
+            var i: i64 = 0
+            while i < self.ast.size(node) {
+                if i > 0 { out = out + ", " }
+                out = out + self.expr(self.ast.child(node, i))
+                i = i + 1
+            }
+            if self.ast.size(node) == 0 { out = out + "0" }
+            ret out + "}"
+        }
+        if k == NodeKind.When || k == NodeKind.BlockExpr {
+            self.err(node, "construct is not supported by the bootstrap backend")
+            ret "0"
+        }
+        self.err(node, "unsupported expression in the bootstrap backend")
+        ret "0"
+    }
+
+    // ---- statements --------------------------------------------------------
+    fun stmt(node: i64): void {
+        val k = self.ast.kind(node)
+        if k == NodeKind.Block {
+            self.line("{")
+            self.indent = self.indent + 1
+            val mark = self.vars.size()
+            var i: i64 = 0
+            while i < self.ast.size(node) {
+                self.stmt(self.ast.child(node, i))
+                i = i + 1
+            }
+            self.emitCleanup(mark)
+            self.truncVars(mark)
+            self.indent = self.indent - 1
+            self.line("}")
+            ret
+        }
+        if k == NodeKind.Var {
+            val name = self.ast.text(node)
+            var t = self.ast.auxText(node)
+            if t.length() == 0 && self.ast.size(node) > 0 { t = self.typeOf(self.ast.child(node, 0)) }
+            if t.length() == 0 { t = "i64" }
+            val ct = self.resolveType(t)
+            if ct.length() == 0 { self.err(node, "unsupported local type '" + t + "'"); ret }
+            var init = ""
+            if self.ast.size(node) > 0 {
+                init = self.expr(self.ast.child(node, 0))
+            } else {
+                init = self.zeroOf(t)
+            }
+            self.emitPre()
+            self.pad()
+            self.sb.append(self.declOf(t, self.vname(name)))
+            self.sb.append(" = ")
+            self.sb.append(init)
+            self.sb.append(";\n")
+            self.emitPost()
+            self.pushVar(name, t)
+            ret
+        }
+        if k == NodeKind.ExprStmt {
+            if self.ast.size(node) > 0 {
+                val e = self.expr(self.ast.child(node, 0))
+                self.emitPre()
+                if e != "0" || self.ast.kind(self.ast.child(node, 0)) != NodeKind.Unknown { self.line(e + ";") }
+                self.emitPost()
+            }
+            ret
+        }
+        if k == NodeKind.If {
+            self.loop_cond = true
+            val cond = self.expr(self.ast.child(node, 0))
+            self.loop_cond = false
+            val ce = self.condExpr(cond)
+            self.line("if (" + ce + ") {")
+            self.indent = self.indent + 1
+            val mark = self.vars.size()
+            if self.ast.size(node) > 1 { self.stmt(self.ast.child(node, 1)) }
+            self.emitCleanup(mark)
+            self.truncVars(mark)
+            self.indent = self.indent - 1
+            if self.ast.size(node) > 2 {
+                self.line("} else {")
+                self.indent = self.indent + 1
+                val mark2 = self.vars.size()
+                self.stmt(self.ast.child(node, 2))
+                self.emitCleanup(mark2)
+                self.truncVars(mark2)
+                self.indent = self.indent - 1
+            }
+            self.line("}")
+            ret
+        }
+        if k == NodeKind.While {
+            self.loop_cond = true
+            val cond = self.expr(self.ast.child(node, 0))
+            self.loop_cond = false
+            val ce = self.condExpr(cond)
+            self.line("while (" + ce + ") {")
+            self.indent = self.indent + 1
+            val mark = self.vars.size()
+            if self.ast.size(node) > 1 { self.stmt(self.ast.child(node, 1)) }
+            self.emitCleanup(mark)
+            self.truncVars(mark)
+            self.indent = self.indent - 1
+            self.line("}")
+            ret
+        }
+        if k == NodeKind.Ret {
+            if self.currentret == "void" {
+                if self.ast.size(node) > 0 {
+                    self.line(self.expr(self.ast.child(node, 0)) + ";")
+                }
+                self.emitCleanup(self.param_mark)
+                self.line("return;")
+                ret
+            }
+            var tmp = ""
+            if self.ast.size(node) > 0 {
+                val rn = self.ast.child(node, 0)
+                val rt = self.resolveType(self.currentret)
+                if rt.length() == 0 { tmp = "" } else {
+                    tmp = "__ret" + fromInt(self.exc_id)
+                    self.exc_id = self.exc_id + 1
+                    val re = self.expr(rn)
+                    self.emitPre()
+                    self.line(rt + " " + tmp + " = " + re + ";")
+                    self.emitPost()
+                }
+                if self.ast.kind(rn) == NodeKind.IdentExpr { self.retvar = self.ast.text(rn) }
+            }
+            self.emitCleanup(self.param_mark)
+            self.retvar = ""
+            if tmp.length() > 0 {
+                self.line("return " + tmp + ";")
+            } else {
+                self.line("return " + self.zeroOf(self.currentret) + ";")
+            }
+            ret
+        }
+        if k == NodeKind.Del { ret }
+        if k == NodeKind.Break { self.line("break;"); ret }
+        if k == NodeKind.Continue { self.line("continue;"); ret }
+        if k == NodeKind.For {
+            val range = self.ast.size(node) > 0 ? self.ast.child(node, 0) : -1
+            val body = self.ast.size(node) > 1 ? self.ast.child(node, 1) : -1
+            if range >= 0 && self.ast.kind(range) == NodeKind.Range && self.ast.size(range) > 1 {
+                val name = self.ast.text(node)
+                val start = self.expr(self.ast.child(range, 0))
+                val end = self.expr(self.ast.child(range, 1))
+                self.line("for (int64_t " + self.vname(name) + " = " + start + "; " + self.vname(name) + " <= " + end + "; " + self.vname(name) + "++) {")
+                self.indent = self.indent + 1
+                val mark = self.vars.size()
+                self.pushVar(name, "i64")
+                if body >= 0 { self.stmt(body) }
+                self.emitCleanup(mark)
+                self.truncVars(mark)
+                self.indent = self.indent - 1
+                self.line("}")
+            } else {
+                if body >= 0 { self.stmt(body) }
+            }
+            ret
+        }
+        if k == NodeKind.DoWhile {
+            val body = self.ast.size(node) > 0 ? self.ast.child(node, 0) : -1
+            self.loop_cond = true
+            val cond = self.ast.size(node) > 1 ? self.expr(self.ast.child(node, 1)) : "1"
+            self.loop_cond = false
+            val ce = self.condExpr(cond)
+            self.line("do {")
+            self.indent = self.indent + 1
+            val mark = self.vars.size()
+            if body >= 0 { self.stmt(body) }
+            self.emitCleanup(mark)
+            self.truncVars(mark)
+            self.indent = self.indent - 1
+            self.line("} while (" + ce + ");")
+            ret
+        }
+        if k == NodeKind.When {
+            val subject = self.ast.size(node) > 0 ? self.expr(self.ast.child(node, 0)) : "0"
+            val st = self.ast.size(node) > 0 ? self.typeOf(self.ast.child(node, 0)) : "i64"
+            var first: bool = true
+            var i: i64 = 1
+            while i < self.ast.size(node) {
+                val br = self.ast.child(node, i)
+                val count = self.ast.flag(br)
+                var cond = "1"
+                if self.ast.text(br) != "else" {
+                    cond = ""
+                    var p: i64 = 0
+                    while p < count {
+                        val pat = self.ast.child(br, p)
+                        var pc = ""
+                        if self.ast.kind(pat) == NodeKind.Range {
+                            val lo = self.expr(self.ast.child(pat, 0))
+                            val hi = self.expr(self.ast.child(pat, 1))
+                            pc = "(" + subject + " >= " + lo + " && " + subject + " <= " + hi + ")"
+                        } else if self.ast.kind(pat) == NodeKind.Unknown {
+                            pc = "1"
+                        } else {
+                            val pe = self.expr(pat)
+                            if st == "str" { pc = "(sinter_string_equals(" + subject + ", " + pe + ") != 0)" }
+                            else { pc = "(" + subject + " == " + pe + ")" }
+                        }
+                        if p > 0 { cond = cond + " || " }
+                        cond = cond + pc
+                        p = p + 1
+                    }
+                }
+                if first {
+                    self.line("if (" + cond + ") {")
+                    first = false
+                } else {
+                    self.line("} else if (" + cond + ") {")
+                }
+                self.indent = self.indent + 1
+                val body = self.ast.child(br, count)
+                if self.ast.kind(body) == NodeKind.Block { self.stmt(body) } else { self.line(self.expr(body) + ";") }
+                self.indent = self.indent - 1
+                i = i + 1
+            }
+            if !first { self.line("}") }
+            ret
+        }
+        if k == NodeKind.EmbedC {
+            self.pad()
+            self.sb.append(self.embedBody(node))
+            self.sb.append("\n")
+            ret
+        }
+        if k == NodeKind.Throw {
+            if self.ast.size(node) > 0 {
+                val msg = "__excmsg" + fromInt(self.exc_id)
+                self.line("sinter_string " + msg + " = " + self.expr(self.ast.child(node, 0)) + ";")
+                self.emitCleanup(self.param_mark)
+                self.line("sinter_throw(" + msg + ", \"\", " + fromInt(self.ast.line(node)) + ");")
+            }
+            ret
+        }
+        if k == NodeKind.Try {
+            val id = self.exc_id
+            self.exc_id = self.exc_id + 1
+            var tryBody = -1
+            var catchBody = -1
+            var finallyBody = -1
+            var i: i64 = 0
+            while i < self.ast.size(node) {
+                val ch = self.ast.child(node, i)
+                if self.ast.auxText(ch) == "try" { tryBody = ch }
+                else if self.ast.auxText(ch) == "catch" { catchBody = ch }
+                else if self.ast.auxText(ch) == "finally" { finallyBody = ch }
+                i = i + 1
+            }
+            val frame = "__exc" + fromInt(id)
+            self.line("{")
+            self.indent = self.indent + 1
+            self.line("sinter_exc_frame " + frame + ";")
+            self.line(frame + ".prev = sinter_exc_top;")
+            self.line(frame + ".cleanup_top = sinter_cleanup_mark();")
+            self.line("sinter_exc_top = &" + frame + ";")
+            self.line("if (setjmp(" + frame + ".buf) == 0) {")
+            self.indent = self.indent + 1
+            if tryBody >= 0 { self.stmt(tryBody) }
+            self.indent = self.indent - 1
+            self.line("} else {")
+            self.indent = self.indent + 1
+            if catchBody >= 0 {
+                val mark = self.vars.size()
+                self.pushVar(self.ast.text(node), "str")
+                self.line("sinter_string v_" + self.ast.text(node) + " = sinter_exc_take();")
+                self.stmt(catchBody)
+                self.truncVars(mark)
+            } else {
+                self.line("sinter_string __excmsg" + fromInt(id) + " = sinter_exc_take(); (void)__excmsg" + fromInt(id) + ";")
+            }
+            self.indent = self.indent - 1
+            self.line("}")
+            self.line("sinter_exc_top = " + frame + ".prev;")
+            if finallyBody >= 0 { self.stmt(finallyBody) }
+            self.indent = self.indent - 1
+            self.line("}")
+            ret
+        }
+        self.err(node, "unsupported statement in the bootstrap backend")
+    }
+
+    fun collect(root: i64): void {
+        var i: i64 = 0
+        while i < self.ast.size(root) {
+            val n = self.ast.child(root, i)
+            if self.ast.kind(n) == NodeKind.Fun {
+                var dup: i64 = 0
+                while dup < self.fnodes.size() {
+                    if self.fnames.get(dup) == self.ast.text(n) && self.ast.moduleOf(self.fnodes.get(dup)) == self.ast.moduleOf(n) && self.ast.aliasOf(self.fnodes.get(dup)).length() == 0 && self.ast.aliasOf(n).length() == 0 && !hasFlag(self.ast.flag(n), F_EXTERN) {
+                        var sn = self.ast.text(n)
+                        val mm = self.ast.moduleOf(n) + "_"
+                        if sn.startsWith(mm) { sn = sn.substring(mm.length(), sn.length()) }
+                        self.diags.add(self.ast.line(n), self.ast.col(n), "[E0204] duplicate function '" + sn + "' in module '" + self.ast.moduleOf(n) + "'")
+                        break
+                    }
+                    dup = dup + 1
+                }
+                self.fnodes.add(n)
+                self.fnames.add(self.ast.text(n))
+                var rt = self.ast.auxText(n)
+                if rt.length() == 0 { rt = "void" }
+                if self.ast.text(n) == "main" { rt = "int" }
+                self.fret.add(rt)
+            } else if self.ast.kind(n) == NodeKind.Class {
+                self.classes.add(n)
+            } else if self.ast.kind(n) == NodeKind.Enum {
+                self.enums.add(n)
+            } else if self.ast.kind(n) == NodeKind.Field {
+                self.globals.add(n)
+                self.gnames.add(self.ast.text(n))
+                self.gtypes.add(self.ast.auxText(n))
+            }
+            i = i + 1
+        }
+    }
+
+    fun varargsLenName(name: str): str => "v_" + cloneText(name) + "__n"
+
+    fun paramList(fn: i64): str {
+        var out = ""
+        var first = true
+        val recv = self.ast.extOf(fn)
+        if recv.length() > 0 {
+            out = self.declOf(recv, "self")
+            first = false
+        }
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val p = self.ast.child(fn, i)
+            if self.ast.kind(p) == NodeKind.Param {
+                val t = self.substType(self.ast.auxText(p))
+                val vararg = hasFlag(self.ast.flag(p), F_VARARG)
+                val ct = self.isFnType(t) ? "fn" : self.resolveType(t)
+                if ct.length() == 0 {
+                    self.err(p, "unsupported parameter type '" + t + "'")
+                } else {
+                    if !first { out = out + ", " }
+                    val pname = self.vname(self.ast.text(p))
+                    val pt = vararg ? "*" + t : cloneText(t)
+                    out = out + self.declOf(pt, pname)
+                    if vararg { out = out + ", int64_t " + self.varargsLenName(self.ast.text(p)) }
+                    first = false
+                }
+            }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun findBody(fn: i64): i64 {
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val p = self.ast.child(fn, i)
+            if self.ast.kind(p) == NodeKind.Block { ret p }
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun emitEnum(en: i64): void {
+        val name = self.ast.text(en)
+        self.line("typedef enum " + name + " {")
+        self.indent = self.indent + 1
+        var i: i64 = 0
+        var count: i64 = 0
+        while i < self.ast.size(en) {
+            val v = self.ast.child(en, i)
+            if self.ast.kind(v) == NodeKind.Field {
+                self.line(name + "_" + self.ast.text(v) + ",")
+                count = count + 1
+            }
+            i = i + 1
+        }
+        if count == 0 { self.line(name + "_dummy = 0,") }
+        self.indent = self.indent - 1
+        self.line("} " + name + ";")
+        self.line("")
+    }
+
+    fun emitClassStruct(cls: i64): void {
+        val name = self.ast.text(cls)
+        self.line("struct " + self.classCName(name) + " {")
+        self.indent = self.indent + 1
+        if self.ifaceOf(cls) >= 0 || self.isInterface(cls) { self.line("sinter_vfn* __vptr;") }
+        var names = List<str>()
+        var types = List<str>()
+        val ctor = self.classCtor(cls)
+        if ctor >= 0 {
+            var i: i64 = 0
+            while i < self.ast.size(ctor) {
+                val p = self.ast.child(ctor, i)
+                if self.ast.kind(p) == NodeKind.Param && names.indexOf(self.ast.text(p)) < 0 {
+                    names.add(self.ast.text(p))
+                    types.add(self.ast.auxText(p))
+                }
+                i = i + 1
+            }
+        }
+        var k: i64 = 0
+        while k < self.ast.size(cls) {
+            val n = self.ast.child(cls, k)
+            if self.ast.kind(n) == NodeKind.Field && names.indexOf(self.ast.text(n)) < 0 {
+                names.add(self.ast.text(n))
+                types.add(self.ast.auxText(n))
+            }
+            k = k + 1
+        }
+        if names.size() == 0 {
+            self.line("int64_t __dummy;")
+        } else {
+            var f: i64 = 0
+            while f < names.size() {
+                val ft = self.substType(types.get(f))
+                val ct = self.isFnType(ft) ? "fn" : self.resolveType(ft)
+                if ct.length() == 0 { self.line("int64_t " + names.get(f) + ";") } else { self.line(self.declOf(ft, names.get(f)) + ";") }
+                f = f + 1
+            }
+        }
+        self.indent = self.indent - 1
+        self.line("};")
+        self.line("")
+    }
+
+    fun emitClassProto(cls: i64): void {
+        val name = self.ast.text(cls)
+        val ctor = self.classCtor(cls)
+        var cparams = ""
+        if ctor >= 0 { cparams = self.paramList(ctor) }
+        if cparams.length() == 0 { cparams = "void" }
+        self.sb.append(self.classCName(name) + "* " + self.classCName(name) + "_new(" + cparams + ");\n")
+        self.sb.append("void " + self.classCName(name) + "_del(" + self.classCName(name) + "* self);\n")
+        var i: i64 = 0
+        while i < self.ast.size(cls) {
+            val m = self.ast.child(cls, i)
+            if self.ast.kind(m) == NodeKind.Fun && m != ctor && !self.isDestructor(m) {
+                val rt = self.resolveType(self.ast.auxText(m))
+                var params = self.paramList(m)
+                if !self.isStatic(m) {
+                    if params.length() > 0 { params = self.classCName(name) + "* self, " + params } else { params = self.classCName(name) + "* self" }
+                }
+                if params.length() == 0 { params = "void" }
+                if rt.length() == 0 { self.err(m, "unsupported return type"); rt = "void" }
+                self.sb.append("" + rt + " " + self.classCName(name) + "_" + self.methodCName(m) + "(" + params + ");\n")
+            }
+            i = i + 1
+        }
+    }
+
+    fun emitClassCtor(cls: i64): void {
+        val name = self.ast.text(cls)
+        val ctor = self.classCtor(cls)
+        var params = ""
+        if ctor >= 0 { params = self.paramList(ctor) }
+        if params.length() == 0 { params = "void" }
+        self.sb.append(self.classCName(name) + "* " + self.classCName(name) + "_new(" + params + ") {\n")
+        self.indent = 1
+        self.line(self.classCName(name) + "* self = (" + self.classCName(name) + "*)calloc(1, sizeof(" + self.classCName(name) + "));")
+        if self.ifaceOf(cls) >= 0 { self.line("self->__vptr = " + self.classCName(name) + "_vtable;") }
+        self.vars.clear()
+        self.vtypes.clear()
+        self.curclass = cloneText(name)
+        self.curmangle = cloneText(name)
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+        self.pushVar("self", name)
+        self.param_mark = self.vars.size()
+        if ctor >= 0 {
+            var i: i64 = 0
+            while i < self.ast.size(ctor) {
+                val p = self.ast.child(ctor, i)
+                if self.ast.kind(p) == NodeKind.Param {
+                    val pn = self.ast.text(p)
+                    self.pushVar(pn, self.substType(self.ast.auxText(p)))
+                    if self.fieldType(cls, pn).length() > 0 { self.line("self->" + pn + " = v_" + pn + ";") }
+                }
+                i = i + 1
+            }
+            self.param_mark = self.vars.size()
+            var fi: i64 = 0
+            while fi < self.ast.size(cls) {
+                val fld = self.ast.child(cls, fi)
+                if self.ast.kind(fld) == NodeKind.Field && self.ast.size(fld) > 0 {
+                    var isparam = false
+                    var pi: i64 = 0
+                    while pi < self.ast.size(ctor) {
+                        val pp = self.ast.child(ctor, pi)
+                        if self.ast.kind(pp) == NodeKind.Param && self.ast.text(pp) == self.ast.text(fld) { isparam = true }
+                        pi = pi + 1
+                    }
+                    if !isparam { self.line("self->" + self.ast.text(fld) + " = " + self.expr(self.ast.child(fld, 0)) + ";") }
+                }
+                fi = fi + 1
+            }
+            val body = self.findBody(ctor)
+            if body >= 0 {
+                var j: i64 = 0
+                while j < self.ast.size(body) {
+                    self.stmt(self.ast.child(body, j))
+                    j = j + 1
+                }
+            }
+        } else {
+            var fi: i64 = 0
+            while fi < self.ast.size(cls) {
+                val fld = self.ast.child(cls, fi)
+                if self.ast.kind(fld) == NodeKind.Field && self.ast.size(fld) > 0 {
+                    self.line("self->" + self.ast.text(fld) + " = " + self.expr(self.ast.child(fld, 0)) + ";")
+                }
+                fi = fi + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        self.line("return self;")
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+    }
+
+    fun emitClassDel(cls: i64): void {
+        val name = self.ast.text(cls)
+        val dtor = self.classDtor(cls)
+        self.sb.append("void " + self.classCName(name) + "_del(" + self.classCName(name) + "* self) {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.curclass = cloneText(name)
+        self.curmangle = cloneText(name)
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+        self.pushVar("self", name)
+        self.param_mark = self.vars.size()
+        self.indent = 1
+        self.line("if (!self) return;")
+        if dtor >= 0 {
+            val body = self.findBody(dtor)
+            if body >= 0 {
+                var j: i64 = 0
+                while j < self.ast.size(body) {
+                    self.stmt(self.ast.child(body, j))
+                    j = j + 1
+                }
+            }
+        }
+        self.line("free(self);")
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+    }
+
+    fun emitMethod(cls: i64, m: i64): void {
+        val cname = self.ast.text(cls)
+        val name = self.ast.text(m)
+        var rt = self.ast.auxText(m)
+        if rt.length() == 0 { rt = "void" }
+        val ct = self.resolveType(rt)
+        var params = self.paramList(m)
+        if !self.isStatic(m) {
+            if params.length() > 0 { params = self.classCName(cname) + "* self, " + params } else { params = self.classCName(cname) + "* self" }
+        }
+        if params.length() == 0 { params = "void" }
+        self.sb.append("" + ct + " " + self.classCName(cname) + "_" + self.methodCName(m) + "(" + params + ") {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.curclass = cloneText(cname)
+        self.curmangle = cloneText(cname)
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+        self.cur_noraij = hasFlag(self.ast.flag(m), F_NORAII)
+        if !self.isStatic(m) { self.pushVar("self", cname) }
+        var i: i64 = 0
+        while i < self.ast.size(m) {
+            val p = self.ast.child(m, i)
+            if self.ast.kind(p) == NodeKind.Param {
+                val pn = self.ast.text(p)
+                if hasFlag(self.ast.flag(p), F_VARARG) { self.pushVar(pn, "*" + self.substType(self.ast.auxText(p))); self.pushVar(pn + "__n", "i64") }
+                else { self.pushVar(pn, self.substType(self.ast.auxText(p))) }
+            }
+            i = i + 1
+        }
+        self.param_mark = self.vars.size()
+        self.indent = 1
+        self.currentret = rt
+        val body = self.findBody(m)
+        if body >= 0 {
+            var j: i64 = 0
+            while j < self.ast.size(body) {
+                self.stmt(self.ast.child(body, j))
+                j = j + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        if rt == "void" { self.line("return;") } else { self.line("return " + self.zeroOf(rt) + ";") }
+        self.indent = 0
+        self.curclass = ""
+        self.sb.append("}\n\n")
+        self.cur_noraij = false
+    }
+
+    fun emitGlobal(g: i64): void {
+        val name = self.ast.text(g)
+        var t = self.ast.auxText(g)
+        if t.length() == 0 && self.ast.size(g) > 0 { t = self.typeOf(self.ast.child(g, 0)) }
+        if t.length() == 0 { t = "i64" }
+        var init = self.zeroOf(t)
+        if self.ast.size(g) > 0 { init = self.expr(self.ast.child(g, 0)) }
+        self.sb.append(self.declOf(t, name) + " = " + init + ";\n")
+    }
+
+    @no_raii
+    fun instArgs(name: str): List<str> {
+        val i = self.inst_names.indexOf(name)
+        if i < 0 { ret List<str>() }
+        ret self.splitArgs(self.inst_args_text.get(i))
+    }
+
+    fun instBase(name: str): str {
+        val i = self.inst_names.indexOf(name)
+        if i < 0 { ret "" }
+        ret self.inst_bases.get(i)
+    }
+
+    fun setInst(name: str): void {
+        val base = self.instBase(name)
+        self.cur_params = self.paramsOf(self.findClass(base))
+        self.cur_args = self.instArgs(name)
+        self.curclass = base + "<" + self.joinArgs(self.cur_args) + ">"
+        self.curmangle = name
+    }
+
+    fun clearInst(): void {
+        self.cur_params = List<str>()
+        self.cur_args = List<str>()
+        self.curclass = ""
+        self.curmangle = ""
+    }
+
+    fun emitInstStruct(name: str): void {
+        val base = self.instBase(name)
+        val cls = self.findClass(base)
+        if cls < 0 { ret }
+        val params = self.paramsOf(cls)
+        val args = self.instArgs(name)
+        self.line("struct " + self.classCName(name) + " {")
+        self.indent = self.indent + 1
+        if self.ifaceOf(cls) >= 0 || self.isInterface(cls) { self.line("sinter_vfn* __vptr;") }
+        var names = List<str>()
+        var types = List<str>()
+        val ctor = self.classCtor(cls)
+        if ctor >= 0 {
+            var i: i64 = 0
+            while i < self.ast.size(ctor) {
+                val p = self.ast.child(ctor, i)
+                if self.ast.kind(p) == NodeKind.Param && names.indexOf(self.ast.text(p)) < 0 {
+                    names.add(self.ast.text(p))
+                    types.add(self.substWith(self.ast.auxText(p), params, args))
+                }
+                i = i + 1
+            }
+        }
+        var k: i64 = 0
+        while k < self.ast.size(cls) {
+            val n = self.ast.child(cls, k)
+            if self.ast.kind(n) == NodeKind.Field && names.indexOf(self.ast.text(n)) < 0 {
+                names.add(self.ast.text(n))
+                types.add(self.substWith(self.ast.auxText(n), params, args))
+            }
+            k = k + 1
+        }
+        if names.size() == 0 {
+            self.line("int64_t __dummy;")
+        } else {
+            var f: i64 = 0
+            while f < names.size() {
+                self.cur_params = params
+                self.cur_args = args
+                val ft = self.substType(types.get(f))
+                val ct = self.isFnType(ft) ? "fn" : self.resolveType(ft)
+                if ct.length() == 0 { self.line("int64_t " + names.get(f) + ";") } else { self.line(self.declOf(ft, names.get(f)) + ";") }
+                f = f + 1
+            }
+        }
+        self.clearInst()
+        self.indent = self.indent - 1
+        self.line("};")
+        self.line("")
+    }
+
+    fun emitInstProto(name: str): void {
+        self.setInst(name)
+        val base = self.instBase(name)
+        val cls = self.findClass(base)
+        val ctor = self.classCtor(cls)
+        var cparams = ""
+        if ctor >= 0 { cparams = self.paramList(ctor) }
+        if cparams.length() == 0 { cparams = "void" }
+        self.sb.append(self.classCName(name) + "* " + self.classCName(name) + "_new(" + cparams + ");\n")
+        self.sb.append("void " + self.classCName(name) + "_del(" + self.classCName(name) + "* self);\n")
+        var i: i64 = 0
+        while i < self.ast.size(cls) {
+            val m = self.ast.child(cls, i)
+            if self.ast.kind(m) == NodeKind.Fun && m != ctor && !self.isDestructor(m) {
+                var rt = self.resolveType(self.ast.auxText(m))
+                var params = self.paramList(m)
+                if !self.isStatic(m) {
+                    if params.length() > 0 { params = self.classCName(name) + "* self, " + params } else { params = self.classCName(name) + "* self" }
+                }
+                if params.length() == 0 { params = "void" }
+                if rt.length() == 0 { self.err(m, "unsupported return type"); rt = "void" }
+                self.sb.append("" + rt + " " + self.classCName(name) + "_" + self.methodCName(m) + "(" + params + ");\n")
+            }
+            i = i + 1
+        }
+        self.clearInst()
+    }
+
+    fun emitInstCtor(name: str): void {
+        self.setInst(name)
+        val base = self.instBase(name)
+        val cls = self.findClass(base)
+        val ctor = self.classCtor(cls)
+        var params = ""
+        if ctor >= 0 { params = self.paramList(ctor) }
+        if params.length() == 0 { params = "void" }
+        self.sb.append(self.classCName(name) + "* " + self.classCName(name) + "_new(" + params + ") {\n")
+        self.indent = 1
+        self.line(self.classCName(name) + "* self = (" + self.classCName(name) + "*)calloc(1, sizeof(" + self.classCName(name) + "));")
+        if self.ifaceOf(cls) >= 0 { self.line("self->__vptr = " + self.classCName(name) + "_vtable;") }
+        self.vars.clear()
+        self.vtypes.clear()
+        self.pushVar("self", self.curclass)
+        self.param_mark = self.vars.size()
+        if ctor >= 0 {
+            var i: i64 = 0
+            while i < self.ast.size(ctor) {
+                val p = self.ast.child(ctor, i)
+                if self.ast.kind(p) == NodeKind.Param {
+                    val pn = self.ast.text(p)
+                    self.pushVar(pn, self.substType(self.ast.auxText(p)))
+                    if self.fieldType(cls, pn).length() > 0 { self.line("self->" + pn + " = v_" + pn + ";") }
+                }
+                i = i + 1
+            }
+            self.param_mark = self.vars.size()
+            var fi: i64 = 0
+            while fi < self.ast.size(cls) {
+                val fld = self.ast.child(cls, fi)
+                if self.ast.kind(fld) == NodeKind.Field && self.ast.size(fld) > 0 {
+                    var isparam = false
+                    var pi: i64 = 0
+                    while pi < self.ast.size(ctor) {
+                        val pp = self.ast.child(ctor, pi)
+                        if self.ast.kind(pp) == NodeKind.Param && self.ast.text(pp) == self.ast.text(fld) { isparam = true }
+                        pi = pi + 1
+                    }
+                    if !isparam { self.line("self->" + self.ast.text(fld) + " = " + self.expr(self.ast.child(fld, 0)) + ";") }
+                }
+                fi = fi + 1
+            }
+            val body = self.findBody(ctor)
+            if body >= 0 {
+                var j: i64 = 0
+                while j < self.ast.size(body) {
+                    self.stmt(self.ast.child(body, j))
+                    j = j + 1
+                }
+            }
+        } else {
+            var fi: i64 = 0
+            while fi < self.ast.size(cls) {
+                val fld = self.ast.child(cls, fi)
+                if self.ast.kind(fld) == NodeKind.Field && self.ast.size(fld) > 0 {
+                    self.line("self->" + self.ast.text(fld) + " = " + self.expr(self.ast.child(fld, 0)) + ";")
+                }
+                fi = fi + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        self.line("return self;")
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+    }
+
+    fun emitInstDel(name: str): void {
+        self.setInst(name)
+        val base = self.instBase(name)
+        val cls = self.findClass(base)
+        val dtor = self.classDtor(cls)
+        self.sb.append("void " + self.classCName(name) + "_del(" + self.classCName(name) + "* self) {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.pushVar("self", self.curclass)
+        self.param_mark = self.vars.size()
+        self.indent = 1
+        self.line("if (!self) return;")
+        if dtor >= 0 {
+            val body = self.findBody(dtor)
+            if body >= 0 {
+                var j: i64 = 0
+                while j < self.ast.size(body) {
+                    self.stmt(self.ast.child(body, j))
+                    j = j + 1
+                }
+            }
+        }
+        self.line("free(self);")
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+    }
+
+    fun emitInstMethod(name: str, m: i64): void {
+        self.setInst(name)
+        var rt = self.ast.auxText(m)
+        if rt.length() == 0 { rt = "void" }
+        val ct = self.resolveType(rt)
+        var params = self.paramList(m)
+        if params.length() > 0 { params = self.classCName(name) + "* self, " + params } else { params = self.classCName(name) + "* self" }
+        self.sb.append("" + ct + " " + self.classCName(name) + "_" + self.methodCName(m) + "(" + params + ") {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.cur_noraij = hasFlag(self.ast.flag(m), F_NORAII)
+        self.pushVar("self", self.curclass)
+        var i: i64 = 0
+        while i < self.ast.size(m) {
+            val p = self.ast.child(m, i)
+            if self.ast.kind(p) == NodeKind.Param {
+                val pn = self.ast.text(p)
+                if hasFlag(self.ast.flag(p), F_VARARG) { self.pushVar(pn, "*" + self.substType(self.ast.auxText(p))); self.pushVar(pn + "__n", "i64") }
+                else { self.pushVar(pn, self.substType(self.ast.auxText(p))) }
+            }
+            i = i + 1
+        }
+        self.param_mark = self.vars.size()
+        self.indent = 1
+        self.currentret = rt
+        val body = self.findBody(m)
+        if body >= 0 {
+            var j: i64 = 0
+            while j < self.ast.size(body) {
+                self.stmt(self.ast.child(body, j))
+                j = j + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        if self.resolveType(rt) == "void" { self.line("return;") } else { self.line("return " + self.zeroOf(rt) + ";") }
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+        self.cur_noraij = false
+    }
+
+    fun setFnInst(fn: i64, argsText: str): str {
+        self.cur_params = self.fnParams(fn)
+        self.cur_args = self.splitArgs(argsText)
+        ret self.joinArgs(self.cur_args)
+    }
+
+    fun emitFnProto(fn: i64, name: str, argsText: str): void {
+        self.setFnInst(fn, argsText)
+        var rt = self.resolveType(self.ast.auxText(fn))
+        if rt.length() == 0 { rt = "void" }
+        val params = self.paramList(fn)
+        self.sb.append("" + rt + " " + name + "(" + (params.length() == 0 ? "void" : cloneText(params)) + ");\n")
+        self.clearInst()
+    }
+
+    fun emitGenericFn(fn: i64, name: str, argsText: str): void {
+        self.setFnInst(fn, argsText)
+        self.cur_noraij = hasFlag(self.ast.flag(fn), F_NORAII)
+        var rt = self.ast.auxText(fn)
+        if rt.length() == 0 { rt = "void" }
+        val ct = self.resolveType(rt)
+        val params = self.paramList(fn)
+        self.sb.append("" + ct + " " + name + "(" + (params.length() == 0 ? "void" : cloneText(params)) + ") {\n")
+        self.vars.clear()
+        self.vtypes.clear()
+        self.indent = 1
+        self.currentret = rt
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val p = self.ast.child(fn, i)
+            if self.ast.kind(p) == NodeKind.Param {
+                val pn = self.ast.text(p)
+                if hasFlag(self.ast.flag(p), F_VARARG) { self.pushVar(pn, "*" + self.substType(self.ast.auxText(p))); self.pushVar(pn + "__n", "i64") }
+                else { self.pushVar(pn, self.substType(self.ast.auxText(p))) }
+            }
+            i = i + 1
+        }
+        self.param_mark = self.vars.size()
+        val body = self.findBody(fn)
+        if body >= 0 {
+            var j: i64 = 0
+            while j < self.ast.size(body) {
+                self.stmt(self.ast.child(body, j))
+                j = j + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        if rt == "void" { self.line("return;") }
+        self.indent = 0
+        self.clearInst()
+        self.sb.append("}\n\n")
+        self.cur_noraij = false
+    }
+
+    fun emitFunction(fn: i64): void {
+        if self.isGenericFn(fn) { ret }
+        if hasFlag(self.ast.flag(fn), F_EXTERN) { ret }
+        val name = self.ast.text(fn)
+        val cfn = self.fnCName(fn)
+        val fidx = self.findFnNode(fn)
+        self.cur_noraij = hasFlag(self.ast.flag(fn), F_NORAII)
+        var rt = "void"
+        if fidx >= 0 { rt = self.fret.get(fidx) }
+        val ct = self.resolveType(rt)
+        self.vars.clear()
+        self.vtypes.clear()
+        var params = self.paramList(fn)
+        var sig = ""
+        if name == "main" {
+            val pc = self.paramNodes(fn).size()
+            if pc == 2 {
+                val mp = self.paramNodes(fn)
+                sig = "int main(int " + self.vname(self.ast.text(mp.get(0))) + ", char** " + self.vname(self.ast.text(mp.get(1))) + ")"
+            }
+            else if pc == 1 {
+                val mp = self.paramNodes(fn)
+                sig = "int main(int " + self.vname(self.ast.text(mp.get(0))) + ")"
+            }
+            else { sig = "int main(void)" }
+        } else {
+            if ct.length() == 0 { self.err(fn, "unsupported return type '" + rt + "'"); ret }
+            if params.length() == 0 { params = "void" }
+            sig = "" + ct + " " + cfn + "(" + params + ")"
+        }
+        self.sb.append(sig + " {\n")
+        self.indent = 1
+        self.currentret = rt
+        val recv = self.ast.extOf(fn)
+        if recv.length() > 0 {
+            self.curclass = cloneText(recv)
+            self.pushVar("self", recv)
+        }
+        var i: i64 = 0
+        while i < self.ast.size(fn) {
+            val p = self.ast.child(fn, i)
+            if self.ast.kind(p) == NodeKind.Param {
+                val pn = self.ast.text(p)
+                var pt = self.ast.auxText(p)
+                if name == "main" {
+                    if self.paramNodes(fn).size() == 2 && self.paramNodes(fn).get(1) == p { pt = "**cstr" }
+                    else { pt = "i32" }
+                }
+                if hasFlag(self.ast.flag(p), F_VARARG) { self.pushVar(pn, "*" + pt); self.pushVar(pn + "__n", "i64") }
+                else { self.pushVar(pn, pt) }
+            }
+            i = i + 1
+        }
+        self.param_mark = self.vars.size()
+        val body = self.findBody(fn)
+        if body >= 0 {
+            var j: i64 = 0
+            while j < self.ast.size(body) {
+                self.stmt(self.ast.child(body, j))
+                j = j + 1
+            }
+        }
+        self.emitCleanup(self.param_mark)
+        if name == "main" { self.line("return 0;") }
+        self.indent = 0
+        self.sb.append("}\n\n")
+        self.cur_noraij = false
+    }
+
+    fun ownNode(n: i64, locals: List<str>, aliases: List<str>, deleted: List<str>): void {
+        val k = self.ast.kind(n)
+        if k == NodeKind.Var {
+            val vn = self.ast.text(n)
+            if self.ast.size(n) > 0 {
+                val init = self.ast.child(n, 0)
+                if self.ast.kind(init) == NodeKind.Unary && self.ast.text(init) == "&" && self.ast.size(init) > 0 {
+                    val tgt = self.ast.child(init, 0)
+                    if self.ast.kind(tgt) == NodeKind.IdentExpr { aliases.add(vn + "=" + self.ast.text(tgt)) }
+                }
+            }
+            locals.add(vn)
+        }
+        if k == NodeKind.Del && self.ast.size(n) > 0 {
+            val t = self.ast.child(n, 0)
+            if self.ast.kind(t) == NodeKind.IdentExpr {
+                val vn = self.ast.text(t)
+                if deleted.indexOf(vn) >= 0 { self.err(n, "deleted more than once") }
+                deleted.add(vn)
+            }
+        }
+        if k == NodeKind.Ret && self.ast.size(n) > 0 {
+            val e = self.ast.child(n, 0)
+            if self.ast.kind(e) == NodeKind.IdentExpr {
+                val vn = self.ast.text(e)
+                var i: i64 = 0
+                while i < aliases.size() {
+                    val a = aliases.get(i)
+                    val eq = a.indexOf("=")
+                    if eq > 0 && a.substring(0, eq) == vn {
+                        self.err(n, "returning pointer '" + vn + "', which aliases local '" + a.substring(eq + 1, a.length()) + "'")
+                    }
+                    i = i + 1
+                }
+            }
+        }
+        var i: i64 = 0
+        while i < self.ast.size(n) {
+            self.ownNode(self.ast.child(n, i), locals, aliases, deleted)
+            i = i + 1
+        }
+    }
+
+    fun checkOwnership(root: i64): void {
+        var i: i64 = 0
+        while i < self.ast.size(root) {
+            val n = self.ast.child(root, i)
+            if self.ast.kind(n) == NodeKind.Fun {
+                val body = self.findBody(n)
+                if body >= 0 { self.ownNode(body, List<str>(), List<str>(), List<str>()) }
+            }
+            i = i + 1
+        }
+    }
+
+    fun emitDataHelpers(name: str, cls: i64): void {
+        if !self.isData(cls) { ret }
+        val cn = self.classCName(name)
+        val disp = self.shortName(name)
+        val ctor = self.classCtor(cls)
+        if ctor < 0 { ret }
+        val pn = self.paramNodes(ctor)
+        self.line("sinter_string " + cn + "__to_str(" + cn + "* self) {")
+        self.indent = self.indent + 1
+        self.line("sinter_string out = sinter_string_from_literal(\"" + disp + "(\", " + fromInt(disp.length() + 1) + ");")
+        var i: i64 = 0
+        while i < pn.size() {
+            val f = self.ast.text(pn.get(i))
+            val ft = self.substType(self.ast.auxText(pn.get(i)))
+            if i > 0 { self.line("out = sinter_string_concat(out, sinter_string_from_literal(\", \", 2));") }
+            self.line("out = sinter_string_concat(out, sinter_string_from_literal(\"" + f + "=\", " + fromInt(f.length() + 1) + "));")
+            if ft == "str" { self.line("out = sinter_string_concat(out, self->" + f + ");") }
+            else if ft == "f64" || ft == "f32" { self.line("out = sinter_string_concat(out, sinter_string_from_num(self->" + f + "));") }
+            else { self.line("out = sinter_string_concat(out, sinter_string_from_int((int64_t)self->" + f + "));") }
+            i = i + 1
+        }
+        self.line("out = sinter_string_concat(out, sinter_string_from_literal(\")\", 1));")
+        self.line("return out;")
+        self.indent = self.indent - 1
+        self.line("}")
+        self.line("uint8_t " + cn + "__equals(" + cn + "* self, " + cn + "* other) {")
+        self.indent = self.indent + 1
+        self.line("if (!other) return 0;")
+        var cond = "1"
+        i = 0
+        while i < pn.size() {
+            val f = self.ast.text(pn.get(i))
+            val ft = self.substType(self.ast.auxText(pn.get(i)))
+            if ft == "str" { cond = cond + " && sinter_string_equals(self->" + f + ", other->" + f + ")" }
+            else { cond = cond + " && self->" + f + " == other->" + f }
+            i = i + 1
+        }
+        self.line("return " + cond + ";")
+        self.indent = self.indent - 1
+        self.line("}")
+        self.line("")
+    }
+
+    fun emitVtable(name: str, cls: i64): void {
+        val iface = self.ifaceOf(cls)
+        if iface < 0 { ret }
+        var count: i64 = 0
+        var i: i64 = 0
+        while i < self.ast.size(iface) {
+            if self.ast.kind(self.ast.child(iface, i)) == NodeKind.Fun { count = count + 1 }
+            i = i + 1
+        }
+        self.line("static sinter_vfn " + self.classCName(name) + "_vtable[" + fromInt(count) + "] = {")
+        self.indent = self.indent + 1
+        i = 0
+        while i < self.ast.size(iface) {
+            val m = self.ast.child(iface, i)
+            if self.ast.kind(m) == NodeKind.Fun {
+                val im = self.classMethod(cls, self.ast.text(m))
+                if im >= 0 { self.line("(sinter_vfn)" + self.classCName(name) + "_" + self.methodCName(im) + ",") }
+                else { self.line("(sinter_vfn)0,") }
+            }
+            i = i + 1
+        }
+        self.indent = self.indent - 1
+        self.line("};")
+        self.line("")
+    }
+
+    pub fun generate(root: i64): str {
+        self.checkOwnership(root)
+        self.collect(root)
+        self.bindLambdaReceivers(root)
+        self.collectLambdas(root)
+        self.scanProgram(root)
+        // Feature macros must precede any libc header.  The emitter and user
+        // `embed C header` blocks include <stdio.h>/<string.h> before embedded
+        // platform code, so defining _POSIX_C_SOURCE there is already too late.
+        self.sb.append("#ifndef _POSIX_C_SOURCE\n#define _POSIX_C_SOURCE 200809L\n#endif\n")
+        if self.gen_mode == GEN_DECLS {
+            self.sb.append("#include \"sinter_runtime.h\"\n\n")
+            var e: i64 = 0
+            while e < self.ast.size(root) {
+                val en = self.ast.child(root, e)
+                if self.ast.kind(en) == NodeKind.EmbedC && self.embedIsHeader(en) {
+                    self.sb.append(self.embedBody(en))
+                    self.sb.append("\n")
+                }
+                e = e + 1
+            }
+        } else if self.gen_mode == GEN_MODULE_C {
+            self.sb.append("#include <stdio.h>\n")
+            self.sb.append("#include \"sinter_runtime.h\"\n")
+            self.sb.append("#include \"sinter_" + self.sanitizeMod(self.gen_module) + ".h\"\n\n")
+            var e: i64 = 0
+            while e < self.ast.size(root) {
+                val en = self.ast.child(root, e)
+                if self.ast.kind(en) == NodeKind.EmbedC && self.inModule(en) && !self.embedIsHeader(en) {
+                    self.sb.append(self.embedBody(en))
+                    self.sb.append("\n")
+                }
+                e = e + 1
+            }
+        } else {
+            self.sb.append(runtimeHeader())
+            self.sb.append("\n")
+            self.sb.append(runtimeSource())
+            self.sb.append("\n")
+        }
+        if self.gen_mode != GEN_DECLS {
+            self.sb.append("static void snt_out(sinter_string s, FILE* f) { if (s.len > 0 && s.data) fwrite(s.data, 1, (size_t)s.len, f); }\n")
+            self.sb.append("static void snt_out_s(sinter_string v, FILE* f) { snt_out(v, f); fflush(f); }\n")
+            self.sb.append("static void snt_outln_s(sinter_string v, FILE* f) { snt_out(v, f); fputc('\\n', f); fflush(f); }\n")
+            self.sb.append("static void snt_out_i(int64_t v, FILE* f) { sinter_string t = sinter_string_from_int(v); snt_out(t, f); fflush(f); sinter_string_free(t); }\n")
+            self.sb.append("static void snt_outln_i(int64_t v, FILE* f) { sinter_string t = sinter_string_from_int(v); snt_out(t, f); fputc('\\n', f); fflush(f); sinter_string_free(t); }\n")
+            self.sb.append("static void snt_out_f(double v, FILE* f) { sinter_string t = sinter_string_from_num(v); snt_out(t, f); fflush(f); sinter_string_free(t); }\n")
+            self.sb.append("static void snt_outln_f(double v, FILE* f) { sinter_string t = sinter_string_from_num(v); snt_out(t, f); fputc('\\n', f); fflush(f); sinter_string_free(t); }\n")
+            self.sb.append("static void snt_out_b(uint8_t v, FILE* f) { sinter_string t = sinter_string_from_bool(v); snt_out(t, f); fflush(f); sinter_string_free(t); }\n")
+            self.sb.append("static void snt_outln_b(uint8_t v, FILE* f) { sinter_string t = sinter_string_from_bool(v); snt_out(t, f); fputc('\\n', f); fflush(f); sinter_string_free(t); }\n\n")
+            self.sb.append("static SINTER_TLS sinter_string snt_seq_slots[16384];\n")
+            self.sb.append("static void snt_seq_set(int i, sinter_string v) { snt_seq_slots[i] = v; }\n")
+            self.sb.append("static sinter_string snt_seq_join(int base, int n) { sinter_string out = sinter_string_from_literal(\"\", 0); int i = 0; while (i < n) { out = sinter_string_concat(out, snt_seq_slots[base + i]); sinter_string_free(snt_seq_slots[base + i]); i = i + 1; } return out; }\n\n")
+            self.sb.append("/* borrowed-pointer element dispatch for generic containers */\n")
+            self.sb.append("#define sinter_gen_clone_ptr(v) (v)\n")
+            self.sb.append("#define sinter_gen_drop_ptr(v) ((void)(v))\n")
+            self.sb.append("#define sinter_gen_free_ptr(v) ((void)(v), (void*)0)\n")
+            self.sb.append("#define sinter_gen_blank_ptr() ((void*)0)\n")
+            self.sb.append("#define sinter_gen_cmp_ptr(a,b) (((void*)(a)==(void*)(b)) ? 0 : 1)\n")
+            self.sb.append("#define sinter_gen_hash_ptr(v) ((uint64_t)(size_t)(v))\n")
+            self.sb.append("#define sinter_gen_text_ptr(v) sinter_string_from_literal(\"\", 0)\n")
+            self.sb.append("#define sinter_gen_grow_ptr(p,n) ((void*)realloc((void*)(p),(size_t)((n)>0?(n):1)*sizeof(void*)))\n\n")
+        }
+        var i: i64 = 0
+        if self.gen_mode != GEN_MODULE_C {
+            while i < self.enums.size() {
+                self.emitEnum(self.enums.get(i))
+                i = i + 1
+            }
+            i = 0
+            while i < self.classes.size() {
+                if self.ast.auxText(self.classes.get(i)).length() == 0 {
+                    val cn = self.classCName(self.ast.text(self.classes.get(i)))
+                    self.sb.append("typedef struct " + cn + " " + cn + ";\n")
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                val cn = self.classCName(self.inst_names.get(i))
+                self.sb.append("typedef struct " + cn + " " + cn + ";\n")
+                i = i + 1
+            }
+            self.sb.append("\n")
+            i = 0
+            while i < self.classes.size() {
+                if self.ast.auxText(self.classes.get(i)).length() == 0 { self.emitClassStruct(self.classes.get(i)) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                self.emitInstStruct(self.inst_names.get(i))
+                i = i + 1
+            }
+        }
+        i = 0
+        while i < self.globals.size() {
+            val g = self.globals.get(i)
+            if self.gen_mode == GEN_DECLS { self.emitGlobalExtern(g) }
+            else if self.inModule(g) { self.emitGlobal(g) }
+            i = i + 1
+        }
+        if self.globals.size() > 0 { self.sb.append("\n") }
+        if self.gen_mode != GEN_MODULE_C {
+            i = 0
+            while i < self.fnodes.size() {
+                val fn = self.fnodes.get(i)
+                if self.fnames.get(i) != "main" && !self.isGenericFn(fn) {
+                    val rt = self.resolveType(self.fret.get(i))
+                    if rt.length() > 0 {
+                        val ps = self.paramList(fn)
+                        self.sb.append("" + rt + " " + self.fnCName(fn) + "(" + (ps.length() == 0 ? "void" : cloneText(ps)) + ");\n")
+                    }
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.fn_inst_names.size() {
+                self.emitFnProto(self.fn_inst_nodes.get(i), self.fn_inst_names.get(i), self.fn_inst_args.get(i))
+                i = i + 1
+            }
+        }
+        i = 0
+        while i < self.lambda_nodes.size() {
+            val ln = self.lambda_nodes.get(i)
+            if self.gen_mode != GEN_DECLS && self.inModule(ln) {
+                val lt = self.lambdaType(ln)
+                val ai = lt.indexOf("->")
+                val rt = self.trimSpaces(lt.substring(ai + 2, lt.length()))
+                val ct = self.resolveType(rt)
+                val pn = self.paramNodes(ln)
+                var ps = ""
+                if self.ast.extOf(ln).length() > 0 { ps = self.declOf(self.ast.extOf(ln), "self") }
+                var pi: i64 = 0
+                while pi < pn.size() {
+                    if ps.length() > 0 { ps = ps + ", " }
+                    ps = ps + self.declOf(self.ast.auxText(pn.get(pi)), self.vname(self.ast.text(pn.get(pi))))
+                    pi = pi + 1
+                }
+                if ps.length() == 0 { ps = "void" }
+                self.sb.append("static " + ct + " " + self.lambdaName(ln) + "(" + ps + ");\n")
+            }
+            i = i + 1
+        }
+        if self.gen_mode != GEN_MODULE_C {
+            i = 0
+            while i < self.classes.size() {
+                if self.ast.auxText(self.classes.get(i)).length() == 0 { self.emitClassProto(self.classes.get(i)) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                self.emitInstProto(self.inst_names.get(i))
+                i = i + 1
+            }
+        }
+        if self.gen_mode == GEN_FULL {
+            i = 0
+            while i < self.ast.size(root) {
+                val n = self.ast.child(root, i)
+                if self.ast.kind(n) == NodeKind.EmbedC { self.sb.append(self.embedBody(n)); self.sb.append("\n") }
+                i = i + 1
+            }
+        }
+        if self.gen_mode != GEN_DECLS {
+            i = 0
+            while i < self.classes.size() {
+                val cls = self.classes.get(i)
+                if self.ast.auxText(cls).length() == 0 && self.classInModule(cls) {
+                    self.emitVtable(self.ast.text(cls), cls)
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                val nm = self.inst_names.get(i)
+                if self.instInModule(nm) {
+                    val bc = self.findClass(self.instBase(nm))
+                    if bc >= 0 { self.emitVtable(nm, bc) }
+                }
+                i = i + 1
+            }
+            self.sb.append("\n")
+            i = 0
+            while i < self.classes.size() {
+                val cls = self.classes.get(i)
+                if self.ast.auxText(cls).length() == 0 && self.classInModule(cls) { self.emitClassCtor(cls) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.classes.size() {
+                val cls = self.classes.get(i)
+                if self.ast.auxText(cls).length() == 0 && self.classInModule(cls) { self.emitClassDel(cls) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                if self.instInModule(self.inst_names.get(i)) { self.emitInstCtor(self.inst_names.get(i)) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                if self.instInModule(self.inst_names.get(i)) { self.emitInstDel(self.inst_names.get(i)) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.classes.size() {
+                val cls = self.classes.get(i)
+                if self.ast.auxText(cls).length() == 0 && self.classInModule(cls) {
+                    val ctor = self.classCtor(cls)
+                    var k: i64 = 0
+                    while k < self.ast.size(cls) {
+                        val m = self.ast.child(cls, k)
+                        if self.ast.kind(m) == NodeKind.Fun && m != ctor && !self.isDestructor(m) { self.emitMethod(cls, m) }
+                        k = k + 1
+                    }
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.classes.size() {
+                val cls = self.classes.get(i)
+                if self.ast.auxText(cls).length() == 0 && self.classInModule(cls) {
+                    self.emitDataHelpers(self.ast.text(cls), cls)
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.inst_names.size() {
+                val name = self.inst_names.get(i)
+                if self.instInModule(name) {
+                    val base = self.instBase(name)
+                    val cls = self.findClass(base)
+                    if cls >= 0 {
+                        val ctor = self.classCtor(cls)
+                        var k: i64 = 0
+                        while k < self.ast.size(cls) {
+                            val m = self.ast.child(cls, k)
+                            if self.ast.kind(m) == NodeKind.Fun && m != ctor && !self.isDestructor(m) { self.emitInstMethod(name, m) }
+                            k = k + 1
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.fn_inst_names.size() {
+                if self.fnInstInModule(i) {
+                    self.emitGenericFn(self.fn_inst_nodes.get(i), self.fn_inst_names.get(i), self.fn_inst_args.get(i))
+                }
+                i = i + 1
+            }
+            i = 0
+            while i < self.fnodes.size() {
+                val fn = self.fnodes.get(i)
+                if self.inModule(fn) { self.emitFunction(fn) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.lambda_nodes.size() {
+                val ln = self.lambda_nodes.get(i)
+                if self.inModule(ln) { self.emitLambda(ln) }
+                i = i + 1
+            }
+        }
+        ret self.sb.toString()
+    }
+}

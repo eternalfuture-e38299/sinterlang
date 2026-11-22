@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: path arithmetic
+//
+// Provides **pure string** path operations comparable to common stdlib path APIs
+// such as `File` / `Path`. This module **never
+// touches the filesystem**: it does not resolve symlinks, does not normalize
+// `.` / `..`, and does not check existence. Its one job is to treat paths as
+// strings.
+//
+// Why it is split out: path joining is needed everywhere (template rendering,
+// config parsing, log classification), and `import std.path` should not drag
+// `open` / `stat` / `dirent` into the output.
+//
+// Conventions:
+//
+//   - The only separator is `/` (POSIX). `join` does not add duplicate slashes;
+//     only `normalize` deals with them.
+//   - The empty string means "none": `fileName("/a/b/")` is empty, `parentOf("rel.txt")` is empty.
+//   - No disk checks: `extension("/x/y")` only looks for a dot in the last segment.
+//
+//     import std.path
+//     join("/tmp", "a.txt")        // /tmp/a.txt
+//     extension("a.tar.gz")        // gz
+//     stem("a.tar.gz")             // a.tar
+//     normalize("/a//b/./c/")      // /a/b/c
+module std.path
+
+import std.core
+import std.string
+
+/// Path separator (POSIX has only one, but the name is kept for cross-platform readability)
+pub const SEP: i64 = 47          // '/' (Windows APIs accept forward slashes too)
+
+/// True for both separators; Windows callers may pass `C:\\a\\b`.
+fun isSepChar(ch: i64): bool => ch == 47 || ch == 92
+
+// ============================================================================
+// Joining
+// ============================================================================
+/// Join two path pieces. If either side is empty, return the other; if `a`
+/// already ends with `/`, do not add another one.
+pub fun join(a: str, b: str): str {
+    if (a.length() == 0) { ret b }
+    if (b.length() == 0) { ret a }
+    if (a.endsWith("/")) { ret a + b }
+    ret a + "/" + b
+}
+
+/// Join several pieces in order (`joinAll("/a", "b", "c")` → `/a/b/c`).
+pub fun joinAll(a: str, b: str, c: str): str => join(join(a, b), c)
+
+/// Use this for four or more pieces: `join3("/a", "b", "c", "d")`.
+pub fun join3(a: str, b: str, c: str, d: str): str => join(joinAll(a, b, c), d)
+
+// ============================================================================
+// Predicates
+// ============================================================================
+pub fun isAbsolute(path: str): bool {
+    if (path.length() == 0) { ret false }
+    val first = path.at(0)
+    if (first == 47 || first == 92) { ret true }
+    // Windows drive-absolute: C:/x, C:\\x (also accepted as a prefix on POSIX strings).
+    if (path.length() >= 2 && path.at(1) == 58) { ret true }
+    ret false
+}
+
+pub fun isRelative(path: str): bool {
+    if (isAbsolute(path)) { ret false }
+    ret true
+}
+
+/// Whether the path ends with a separator (the root `/` counts too).
+pub fun hasTrailingSep(path: str): bool {
+    if (path.length() == 0) { ret false }
+    val last = path.at(path.length() - 1)
+    ret last == 47 || last == 92
+}
+
+// ============================================================================
+// Splitting
+// ============================================================================
+/// Last segment of the path (`/a/b/c.txt` → `c.txt`). Returns empty when the
+/// path ends with `/`.
+pub fun fileName(path: str): str {
+    if (path.length() == 0) { ret "" }
+    // The last segment of `/a/b/` is "empty": strip trailing slashes first,
+    // but keep the root's own meaning (`/` has an empty fileName).
+    var end: i64 = path.length()
+    while (end > 1 && isSepChar(path.at(end - 1))) { end = end - 1 }
+    if (end == 1 && isSepChar(path.at(0))) { ret "" }
+    // `/a/b/` has an empty last segment; do not fall back to `b`.
+    if (end < path.length()) { ret "" }
+    var i: i64 = end - 1
+    while (i >= 0 && !isSepChar(path.at(i))) { i = i - 1 }
+    if (i < 0) { ret path.substring(0, end) }
+    ret path.substring(i + 1, end)
+}
+
+/// Drop the last segment (`/a/b/c.txt` → `/a/b`); returns empty when there is no `/`.
+pub fun parentOf(path: str): str {
+    if (path.length() == 0) { ret "" }
+    var end: i64 = path.length()
+    while (end > 1 && isSepChar(path.at(end - 1))) { end = end - 1 }
+    var i: i64 = end - 1
+    while (i >= 0 && !isSepChar(path.at(i))) { i = i - 1 }
+    if (i < 0) { ret "" }
+    if (i == 0) { ret path.substring(0, 1) }
+    // Drive root: `C:/a` -> `C:/`, not `C:`.
+    if (i == 2 && path.at(1) == 58) { ret path.substring(0, 3) }
+    // Continue eating trailing separators in the parent path: `/a//b` → `/a`
+    var j: i64 = i
+    while (j > 1 && isSepChar(path.at(j - 1))) { j = j - 1 }
+    ret path.substring(0, j)
+}
+
+/// Extension without the dot: `c.txt` → `txt`, `Makefile` → empty, `a.tar.gz` → `gz`.
+pub fun extension(path: str): str {
+    val base = fileName(path)
+    val i = base.lastIndexOf(".")
+    if (i <= 0) { ret "" }
+    ret base.substring(i + 1, base.length())
+}
+
+/// Last segment without its extension: `a.tar.gz` → `a.tar`, `Makefile` → `Makefile`.
+pub fun stem(path: str): str {
+    val base = fileName(path)
+    val i = base.lastIndexOf(".")
+    if (i <= 0) { ret base }
+    ret base.substring(0, i)
+}
+
+/// Replace only the extension: `changeExtension("a.txt", "md")` → `a.md`; pass an
+/// empty `newExt` to drop the extension.
+pub fun changeExtension(path: str, newExt: str): str {
+    // Do not write `var name: str = base` and then mutate `name`: `name` and
+    // `base` would point at the same buffer, and both would be freed at scope
+    // exit (double free — segfaults in practice).
+    val parent = parentOf(path)
+    val base = stem(path)
+    if (parent.length() == 0) {
+        if (newExt.length() > 0) { ret base + "." + newExt }
+        ret base
+    }
+    if (newExt.length() > 0) { ret join(parent, base + "." + newExt) }
+    ret join(parent, base)
+}
+
+// ============================================================================
+// Normalization
+// ============================================================================
+/// Collapse duplicate slashes, drop `.` segments, and remove a trailing slash.
+///
+/// `..` segments **are resolved literally** (`a/../b` → `b`), but symlinks are
+/// not expanded — real resolution needs `realpath(3)`, which belongs to
+/// `std.file`.
+pub fun normalize(path: str): str {
+    // The implementation lives in C: scanning segments and resolving `..` with a
+    // stack is most direct with byte pointers, whereas building a `List<str>` on
+    // the Sinter side would pull in the container module (`std.path` must stay light).
+    ret sinter_path_normalize(path)
+}
+
+// ============================================================================
+// Traversal
+// ============================================================================
+/// Number of path segments: `/a/b/c` → 3 (the root `/` counts as 0 segments).
+pub fun segmentCount(path: str): i64 {
+    if (path.length() == 0) { ret 0 }
+    var count: i64 = 0
+    var inSeg: bool = false
+    var i: i64 = 0
+    while (i < path.length()) {
+        if (isSepChar(path.at(i))) {
+            inSeg = false
+        } else if (!inSeg) {
+            inSeg = true
+            count = count + 1
+        }
+        i = i + 1
+    }
+    ret count
+}
+
+/// Segment `i` (0-based); returns empty when out of range. Segment 1 of `/a/b/c` is `b`.
+pub fun segmentAt(path: str, index: i64): str {
+    if (path.length() == 0 || index < 0) { ret "" }
+    var count: i64 = 0
+    var start: i64 = 0
+    var i: i64 = 0
+    val n: i64 = path.length()
+    while (i <= n) {
+        if (i == n || isSepChar(path.at(i))) {
+            if (i > start) {
+                if (count == index) { ret path.substring(start, i) }
+                count = count + 1
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    ret ""
+}
+
+/// Whether some segment is named `name` (does not resolve `.` / `..`).
+pub fun containsSegment(path: str, name: str): bool {
+    var k: i64 = 0
+    val total = segmentCount(path)
+    while (k < total) {
+        if (segmentAt(path, k).equalsText(name)) { ret true }
+        k = k + 1
+    }
+    ret false
+}
+
+// ============================================================================
+// Convenience constructors
+// ============================================================================
+/// Current working directory. Returns empty on failure (errno is available via `std.file.lastError()`).
+pub fun cwd(): str => sinter_path_cwd()
+
+/// Complete a relative path into an absolute one (does not resolve symlinks or check existence).
+pub fun absolute(path: str): str {
+    if (path.length() == 0) { ret cwd() }
+    if (isAbsolute(path)) { ret normalize(path) }
+    ret normalize(join(cwd(), path))
+}
+
+embed C {
+#ifdef _WIN32
+    #include <direct.h>
+    #include <stdlib.h>
+#else
+    #include <unistd.h>
+    #include <errno.h>
+    #include <stdlib.h>
+#endif
+
+    /* Collapse duplicate slashes, drop `.` segments, and resolve `..` literally.
+       `..` that climbs above the root of an absolute path is discarded; leading
+       `..` in a relative path is kept.
+       When everything is empty: absolute → "/", relative → ".". */
+    static int sinter_path_is_sep(char c) { return c == '/' || c == '\\'; }
+
+    static sinter_string sinter_path_normalize(sinter_string path) {
+        const char* p = path.data ? path.data : "";
+        int64_t n = path.len;
+        if (n <= 0) return sinter_string_from_literal("", 0);
+
+        int drive = (n >= 2 && p[1] == ':') ? 1 : 0;
+        int absolute = drive || sinter_path_is_sep(p[0]);
+
+        const char** starts = (const char**) malloc(sizeof(const char*) * (size_t) (n + 1));
+        int64_t* lens = (int64_t*) malloc(sizeof(int64_t) * (size_t) (n + 1));
+        if (!starts || !lens) {
+            free(starts); free(lens);
+            return sinter_string_from_literal("", 0);
+        }
+        int64_t depth = 0;
+        int64_t i = drive ? 2 : 0;
+        while (i < n) {
+            while (i < n && sinter_path_is_sep(p[i])) i++;
+            int64_t start = i;
+            while (i < n && !sinter_path_is_sep(p[i])) i++;
+            int64_t len = i - start;
+            if (len == 0) continue;
+            if (len == 1 && p[start] == '.') continue;
+            if (len == 2 && p[start] == '.' && p[start + 1] == '.') {
+                if (depth > 0 && !(lens[depth - 1] == 2 && starts[depth - 1][0] == '.'
+                                   && starts[depth - 1][1] == '.')) {
+                    depth--;
+                } else if (!absolute) {
+                    starts[depth] = p + start;
+                    lens[depth] = len;
+                    depth++;
+                }
+                continue;
+            }
+            starts[depth] = p + start;
+            lens[depth] = len;
+            depth++;
+        }
+
+        if (depth == 0) {
+            free(starts); free(lens);
+            if (drive) {
+                char d[4];
+                d[0] = p[0]; d[1] = ':'; d[2] = '/'; d[3] = 0;
+                return sinter_string_from_buf(d, 3);
+            }
+            return sinter_string_from_literal(absolute ? "/" : ".", 1);
+        }
+
+        int64_t total = (drive ? 2 : (absolute ? 1 : 0)) + (drive ? 1 : 0);
+        for (int64_t k = 0; k < depth; k++) total += lens[k] + 1;
+        char* out = (char*) malloc((size_t) total + 1);
+        if (!out) {
+            free(starts); free(lens);
+            return sinter_string_from_literal("", 0);
+        }
+        int64_t w = 0;
+        if (drive) {
+            out[w++] = p[0];
+            out[w++] = ':';
+            out[w++] = '/';
+        } else if (absolute) {
+            out[w++] = '/';
+        }
+        for (int64_t k = 0; k < depth; k++) {
+            if (k > 0) out[w++] = '/';
+            for (int64_t j = 0; j < lens[k]; j++) out[w++] = starts[k][j];
+        }
+        out[w] = 0;
+        sinter_string r = sinter_string_from_buf(out, w);
+        free(out);
+        free(starts); free(lens);
+        return r;
+    }
+
+    /* Return the current working directory; returns empty on failure. */
+    static sinter_string sinter_path_cwd(void) {
+#ifdef _WIN32
+        char buf[4096];
+        if (!_getcwd(buf, (int)sizeof(buf))) return sinter_string_from_literal("", 0);
+        int64_t n = 0;
+        while (buf[n]) n++;
+        return sinter_string_from_buf(buf, n);
+#else
+        /* getcwd(NULL, 0) is a glibc extension; grow a buffer instead (macOS/BSD). */
+        int64_t cap = 1024;
+        char* p = (char*) malloc((size_t) cap);
+        if (!p) return sinter_string_from_literal("", 0);
+        while (!getcwd(p, (size_t) cap)) {
+            if (errno != ERANGE || cap > (1 << 20)) { free(p); return sinter_string_from_literal("", 0); }
+            cap *= 2;
+            char* np = (char*) realloc(p, (size_t) cap);
+            if (!np) { free(p); return sinter_string_from_literal("", 0); }
+            p = np;
+        }
+        int64_t n = 0;
+        while (p[n]) n++;
+        sinter_string s = sinter_string_from_buf(p, n);
+        free(p);
+        return s;
+#endif
+    }
+}

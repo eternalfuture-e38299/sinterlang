@@ -1,0 +1,24 @@
+module exception_raii
+import std
+
+class Res(name: str) {
+    var label: str = name
+    ~Res() { println("dtor " + self.label) }
+}
+
+fun boom(): void {
+    val r = Res("inner")
+    val s: str = "owned"
+    var arr: i64[2]
+    arr[0] = 1
+    throw "boom"
+}
+
+fun main(): void {
+    try {
+        boom()
+    } catch (e: str) {
+        println("caught " + e)
+    }
+    println("done")
+}

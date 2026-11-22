@@ -1,0 +1,13 @@
+[package]
+name = "zip"
+version = "1.3.1"
+entry = "zip.sinter"
+description = "Independent Sinter ZIP library: stored/DEFLATE reader and stored ZIP writer, no third-party code"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "zip_lib"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../std" }

@@ -1,0 +1,8 @@
+module named_bad
+import std
+
+fun intro(name: str, age: i64 = 18): str => name
+
+fun main(): void {
+    println(intro(age = 5))
+}

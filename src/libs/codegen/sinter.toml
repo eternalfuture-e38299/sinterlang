@@ -1,0 +1,17 @@
+[package]
+name = "codegen"
+version = "file:../../version.txt"
+entry = "src/codegen.sinter"
+description = "Self-hosted Sinter C code generator"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_codegen"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+syntax = { version = "1.0.0", source = "path:../syntax" }
+
+[build]
+opt = "2"

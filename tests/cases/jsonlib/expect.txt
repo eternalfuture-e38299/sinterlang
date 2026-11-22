@@ -1,0 +1,29 @@
+true
+Sinter
+1
+1.5
+true
+true
+2
+b
+10
+3
+3
+line
+break	"quote" 你好
+café
+{"name":"sinter","year":2026,"items":[1,"two",true]}
+{
+  "name": "sinter",
+  "year": 2026,
+  "items": [
+    1,
+    "two",
+    true
+  ]
+}
+true
+2026
+two
+false
+false

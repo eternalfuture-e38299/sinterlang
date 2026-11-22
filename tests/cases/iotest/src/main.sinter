@@ -1,0 +1,126 @@
+// tests/cases/iotest —— std.io / std.filesystem 的轻量回归
+//
+// 只跑「纯计算 + 临时目录里的文件操作」，不依赖网络、不依赖外部数据。
+// 输出全部是确定性文本，逐行比对 expect.txt。
+//
+// 临时目录用 /tmp/shim_iotest，跑之前由脚本清掉，程序自己 mkdirs。
+module iotest
+
+import std
+import std.string
+import std.io
+import std.filesystem
+
+fun main(): void {
+    // ---- 路径工具（纯字符串，不碰文件系统）----
+    println("== path ==")
+    println("join1=${join("/tmp", "a.txt")}")
+    println("join2=${join("/tmp/", "a.txt")}")
+    println("join3=${join("", "a.txt")}")
+    println("join4=${join("/tmp", "")}")
+    println("abs1=${isAbsolute("/tmp/x")}")
+    println("abs2=${isAbsolute("tmp/x")}")
+    println("name1=${fileName("/a/b/c.txt")}")
+    println("name2=${fileName("c.txt")}")
+    println("name3=${fileName("/a/b/")}")
+    println("parent1=${parentOf("/a/b/c.txt")}")
+    println("parent2=${parentOf("/a")}")
+    println("parent3=${parentOf("rel.txt")}")
+    println("ext1=${extension("c.txt")}")
+    println("ext2=${extension("Makefile")}")
+    println("ext3=${extension("/x/y/a.b.c")}")
+
+    // ---- 目录创建 / 判断 ----
+    val root = "/tmp/shim_iotest"
+    remove(join(root, "hello.txt"))
+    remove(join(root, "sub"))
+    remove(root)
+
+    println("== mkdirs ==")
+    println("mk=${mkdirs(root)}")
+    println("isDir=${isDir(root)}")
+    println("isFile=${isFile(root)}")
+    println("exists=${exists(root)}")
+    println("sub=${mkdirs(join(root, "sub"))}")
+    println("subDir=${isDir(join(root, "sub"))}")
+
+    // ---- 写 / 读 / 追加 ----
+    println("== write_read ==")
+    val f = join(root, "hello.txt")
+    println("w1=${writeText(f, "line1\nline2\n")}")
+    println("exists=${exists(f)}")
+    println("isFile=${isFile(f)}")
+    println("size=${sizeOf(f)}")
+    println("r1=${readText(f).length()}")
+    println("a1=${appendText(f, "line3\n")}")
+    println("size2=${sizeOf(f)}")
+    println("lines=${countLines(readText(f))}")
+    println("mt=${(modifiedAt(f) > 0)}")
+
+    // 逐行读回：验证内容与顺序，而不只是长度
+    val text = readText(f)
+    val total = countLines(text)
+    var i: i64 = 0
+    while (i < total) {
+        println("L${i}=${lineAt(text, i)}")
+        i = i + 1
+    }
+
+    // 覆盖写：长度要变小，证明 O_TRUNC 生效
+    println("over=${writeText(f, "x")}")
+    println("size3=${sizeOf(f)}")
+    println("content=${readText(f)}")
+
+    // ---- 目录遍历 ----
+    println("== listDir ==")
+    writeText(join(root, "b.txt"), "b")
+    writeText(join(root, "a.txt"), "a")
+    println("count=${countEntries(root)}")
+    // 顺序由文件系统决定，这里只断言「集合内容」：排序后比较。
+    // 排序由 `listSorted` 在 C 侧完成（跨模块对 `Array<str>` 调 `sort()`
+    // 会丢接收者，见 std.filesystem 里的说明）。
+    var k: i64 = 0
+    while (k < countEntries(root)) {
+        println("N${k}=${sortedEntryAt(root, k)}")
+        k = k + 1
+    }
+
+    // ---- 错误路径 ----
+    println("== errors ==")
+    val missing = join(root, "nope.txt")
+    println("missExists=${exists(missing)}")
+    val miss = readText(missing)
+    println("missRead=${miss.length()}")
+    println("missErr=${lastError()}")
+    println("missSize=${sizeOf(missing)}")
+
+    // ---- 改名 / 删除 ----
+    println("== rename_remove ==")
+    println("ren=${rename(join(root, "a.txt"), join(root, "c.txt"))}")
+    println("oldGone=${exists(join(root, "a.txt"))}")
+    println("newThere=${exists(join(root, "c.txt"))}")
+    println("rm=${remove(join(root, "c.txt"))}")
+    println("rmGone=${exists(join(root, "c.txt"))}")
+    println("rmb=${remove(join(root, "b.txt"))}")
+    println("rmf=${remove(f)}")
+    println("rmsub=${remove(join(root, "sub"))}")
+    println("left=${countEntries(root)}")
+    println("rmroot=${remove(root)}")
+    println("rootGone=${exists(root)}")
+
+    // ---- std.io 输出 ----
+    // 读标准输入需要有人喂数据，轻量测试里只验证写路径。
+    println("== io_write ==")
+    write("w1")
+    write("-w2")
+    println("")
+    writeLine("line")
+    writeChar(65)
+    writeChar(10)
+    val bytes = byteArrayOf(104, 105)
+    writeLine("bytes-will-be-${bytes.size}")
+    println("bytes=${writeBytes(bytes.data, bytes.size)}")
+    writeLine("")
+    flush()
+    println("== done ==")
+}

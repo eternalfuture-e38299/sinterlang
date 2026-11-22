@@ -1,0 +1,9 @@
+module visibility
+import std
+import lib
+
+fun main(): void {
+    val g = Greeter()
+    println(g.open())
+    println(g.callSecret())
+}

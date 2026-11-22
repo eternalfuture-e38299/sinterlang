@@ -1,0 +1,1514 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Permissive recursive-descent parser.  It understands the whole
+// declaration surface (modules, imports, classes, enums, generics,
+// annotations, embed C) and a practical statement/expression subset;
+// unsupported constructs are recorded as diagnostics and skipped.
+module parser
+
+import std
+import std.list
+import std.text
+import syntax
+import lexer
+
+const F_PUB: i64 = 1
+const F_STATIC: i64 = 2
+const F_VAR: i64 = 4
+const F_OVERRIDE: i64 = 8
+const F_ABSTRACT: i64 = 16
+const F_STRUCT: i64 = 32
+const F_INTERFACE: i64 = 64
+const F_VARARG: i64 = 128
+const F_DATA: i64 = 256
+const F_NORAII: i64 = 512
+const F_CTOR: i64 = 1024
+const F_EXT: i64 = 2048
+const F_EXTERN: i64 = 4096
+const F_PRIV: i64 = 8192
+const F_NAMED: i64 = 16384
+
+pub fun hasFlag(flags: i64, want: i64): bool {
+    if want == 0 { ret false }
+    ret (flags / want) % 2 == 1
+}
+
+pub class Parser {
+    var toks: Tokens
+    var ast: Ast
+    var diags: Diagnostics
+    var pos: i64
+    var paren: i64
+    var blockflags: i64
+    var anns: List<str>
+    var suppresslam: i64
+
+    Parser(tokens: Tokens, tree: Ast, errors: Diagnostics) {
+        self.toks = tokens
+        self.ast = tree
+        self.diags = errors
+        self.pos = 0
+        self.paren = 0
+        self.blockflags = 0
+        self.anns = List<str>()
+        self.suppresslam = 0
+    }
+
+    fun cur(): TokenKind => self.toks.kind(self.pos)
+    fun txt(): str => self.toks.text(self.pos)
+    fun atText(s: str): bool => self.cur() == TokenKind.Punct && self.txt() == s
+    fun atWord(w: str): bool => self.cur() == TokenKind.Ident && self.txt() == w
+    fun atEof(): bool => self.cur() == TokenKind.Eof
+    fun line(): i64 => self.toks.line(self.pos)
+    fun col(): i64 => self.toks.col(self.pos)
+
+    fun peekText(off: i64): str {
+        val i = self.pos + off
+        if i < 0 || i >= self.toks.size() { ret "" }
+        ret self.toks.text(i)
+    }
+
+    fun error(msg: str): void => self.diags.add(self.line(), self.col(), msg)
+
+    fun advance(): void {
+        if self.cur() != TokenKind.Eof { self.pos = self.pos + 1 }
+    }
+
+    fun skipNewlines(): void {
+        while self.cur() == TokenKind.Newline { self.advance() }
+    }
+
+    fun skipSoft(): void {
+        if self.paren > 0 { self.skipNewlines() }
+    }
+
+    fun expectText(s: str): bool {
+        if self.atText(s) { self.advance(); ret true }
+        self.error("expected '" + s + "', found '" + self.txt() + "'")
+        ret false
+    }
+
+    fun skipBalanced(open: str, close: str): void {
+        if !self.atText(open) { ret }
+        var depth: i64 = 0
+        while !self.atEof() {
+            if self.atText(open) { depth = depth + 1 }
+            else if self.atText(close) {
+                depth = depth - 1
+                if depth == 0 { self.advance(); ret }
+            }
+            self.advance()
+        }
+    }
+
+    // ---- type parsing (textual) -------------------------------------------
+    fun parseType(): str {
+        var out = ""
+        while self.atText("*") || self.atText("&") {
+            out = out + self.txt()
+            self.advance()
+        }
+        if self.cur() == TokenKind.Ident && self.peekText(1) == "." && self.peekText(2) == "(" {
+            val recv = self.txt()
+            self.advance()
+            self.advance()
+            self.advance()
+            var inner = cloneText(recv)
+            var first = true
+            while !self.atEof() && !self.atText(")") {
+                if !first { inner = inner + ", " }
+                inner = inner + self.parseType()
+                first = false
+                if self.atText(",") { self.advance() }
+            }
+            if self.atText(")") { self.advance() }
+            var rtp = "void"
+            if self.atText("->") { self.advance(); rtp = self.parseType() }
+            ret "(" + inner + ") -> " + rtp
+        }
+        if self.atText("(") {
+            out = out + "("
+            self.advance()
+            var first = true
+            while !self.atEof() && !self.atText(")") {
+                if !first { out = out + ", " }
+                out = out + self.parseType()
+                first = false
+                if self.atText(",") { self.advance() }
+            }
+            if self.atText(")") { self.advance() }
+            out = out + ")"
+            if self.atText("->") {
+                self.advance()
+                out = out + " -> " + self.parseType()
+            }
+            ret out
+        }
+        if self.cur() == TokenKind.Ident {
+            out = out + self.txt()
+            self.advance()
+            while self.atText(".") && self.peekText(1).length() > 0 {
+                self.advance()
+                if self.cur() == TokenKind.Ident {
+                    out = out + "." + self.txt()
+                    self.advance()
+                }
+            }
+            if self.atText("<") { out = out + self.parseGenericArgs() }
+        } else if self.atText("[") {
+            out = out + self.parseArraySuffix()
+        } else {
+            self.error("expected type")
+            ret out
+        }
+        while self.atText("[") || self.atText("?") || self.atText("&") {
+            if self.atText("?") {
+                self.advance()
+                out = out + "?"
+            } else if self.atText("&") {
+                self.advance()
+                out = out + "&"
+            } else {
+                out = out + self.parseArraySuffix()
+            }
+        }
+        ret out
+    }
+
+    fun parseArraySuffix(): str {
+        var out = "["
+        self.advance()
+        var depth: i64 = 1
+        while !self.atEof() && depth > 0 {
+            if self.atText("[") { depth = depth + 1 }
+            if self.atText("]") { depth = depth - 1 }
+            if depth > 0 { out = out + self.txt() }
+            self.advance()
+        }
+        ret out + "]"
+    }
+
+    fun parseTypeParams(): str {
+        if !self.atText("<") { ret "" }
+        self.advance()
+        var out = ""
+        var depth: i64 = 1
+        while !self.atEof() && depth > 0 {
+            if self.atText("<") { depth = depth + 1; out = out + "<"; self.advance(); continue }
+            if self.atText(">") {
+                depth = depth - 1
+                self.advance()
+                if depth == 0 { break }
+                out = out + ">"
+                continue
+            }
+            if self.atText(">>") { depth = depth - 2; self.advance(); continue }
+            if depth == 1 && self.atText(",") { out = out + ","; self.advance(); continue }
+            if self.atText("*") || self.atText("&") { out = out + self.txt(); self.advance(); continue }
+            if self.cur() == TokenKind.Ident { out = out + self.txt(); self.advance(); continue }
+            self.advance()
+        }
+        ret out
+    }
+
+    fun parseTypeArgs(): str {
+        if !self.atText("<") { ret "" }
+        self.advance()
+        var out = ""
+        var depth: i64 = 1
+        while !self.atEof() && depth > 0 {
+            if self.atText("<") { depth = depth + 1; out = out + "<"; self.advance(); continue }
+            if self.atText(">") {
+                depth = depth - 1
+                self.advance()
+                if depth == 0 { break }
+                out = out + ">"
+                continue
+            }
+            if self.atText(">>") { depth = depth - 2; self.advance(); continue }
+            if depth == 1 && self.atText(",") { out = out + ","; self.advance(); continue }
+            if self.atText("*") || self.atText("&") { out = out + self.txt(); self.advance(); continue }
+            if self.cur() == TokenKind.Ident { out = out + self.txt(); self.advance(); continue }
+            self.advance()
+        }
+        ret out
+    }
+
+    fun parseGenericArgs(): str {
+        var out = "<"
+        self.advance()
+        var depth: i64 = 1
+        var first = true
+        while !self.atEof() && depth > 0 {
+            if self.atText("<") {
+                depth = depth + 1
+                out = out + "<"
+                self.advance()
+                continue
+            }
+            if self.atText(">") {
+                depth = depth - 1
+                out = out + ">"
+                self.advance()
+                continue
+            }
+            if self.atText(">>") {
+                depth = depth - 2
+                out = out + ">>"
+                self.advance()
+                continue
+            }
+            if depth == 1 && self.atText(",") {
+                out = out + ", "
+                first = false
+                self.advance()
+                continue
+            }
+            if self.cur() == TokenKind.Ident {
+                if !first && depth == 1 { out = out + "" }
+                out = out + self.txt()
+                first = false
+                self.advance()
+                continue
+            }
+            if self.atText(".") {
+                out = out + "."
+                self.advance()
+                continue
+            }
+            self.advance()
+        }
+        ret out
+    }
+
+    // ---- declarations ------------------------------------------------------
+    pub fun parseProgram(): i64 {
+        val root = self.ast.add(NodeKind.Program, "", 1, 1)
+        self.parseModuleInto(root)
+        ret root
+    }
+
+    pub fun parseModuleInto(root: i64): void {
+        self.ast.setModule("")
+        self.skipNewlines()
+        if self.atWord("module") {
+            self.advance()
+            val m = self.readPath()
+            self.ast.setModule(m)
+            val n = self.ast.add(NodeKind.Module, m, self.line(), self.col())
+            self.ast.addChild(root, n)
+            self.skipNewlines()
+        }
+        while !self.atEof() {
+            self.skipNewlines()
+            if self.atEof() { break }
+            val before = self.pos
+            self.parseDecl(root, false)
+            if self.pos == before {
+                self.error("unexpected token '" + self.txt() + "'")
+                self.advance()
+            }
+            self.skipNewlines()
+        }
+    }
+
+    fun readPath(): str {
+        var out = ""
+        if self.cur() == TokenKind.Ident { out = self.txt(); self.advance() }
+        while self.atText(".") {
+            self.advance()
+            if self.cur() == TokenKind.Ident {
+                out = out + "." + self.txt()
+                self.advance()
+            }
+        }
+        ret out
+    }
+
+    fun annExpected(name: str, idx: i64): str {
+        var i: i64 = 0
+        while i < self.anns.size() {
+            val rec = self.anns.get(i)
+            val bar = rec.indexOf("|")
+            if bar > 0 && rec.substring(0, bar) == name {
+                val parts = split(rec.substring(bar + 1, rec.length()), "|")
+                if idx < parts.size() {
+                    val p = parts.get(idx)
+                    val c = p.indexOf(":")
+                    if c > 0 { ret p.substring(0, c) + ":" + p.substring(c + 1, p.length()) }
+                }
+            }
+            i = i + 1
+        }
+        ret ""
+    }
+
+    fun checkAnnArg(name: str, idx: i64, kind: TokenKind): void {
+        val ex = self.annExpected(name, idx)
+        if ex.length() == 0 { ret }
+        val c = ex.indexOf(":")
+        val pn = ex.substring(0, c)
+        val ty = ex.substring(c + 1, ex.length())
+        if ty == "str" && kind != TokenKind.String {
+            self.error("annotation argument '" + pn + "' expects str")
+        }
+        if kind != TokenKind.Integer && (ty == "i64" || ty == "i32" || ty == "i8") {
+            self.error("annotation argument '" + pn + "' expects " + ty)
+        }
+    }
+
+    fun annotationFlags(): i64 {
+        var flags: i64 = 0
+        while self.atText("@") {
+            self.advance()
+            var nm = ""
+            if self.cur() == TokenKind.Ident {
+                nm = self.txt()
+                if nm == "no_raii" { flags = flags + F_NORAII }
+                self.advance()
+            }
+            if self.atText("(") {
+                self.advance()
+                var idx: i64 = 0
+                while !self.atEof() && !self.atText(")") {
+                    val k = self.cur()
+                    self.checkAnnArg(nm, idx, k)
+                    var depth: i64 = 0
+                    while !self.atEof() {
+                        if self.atText("(") || self.atText("[") || self.atText("{") { depth = depth + 1 }
+                        else if self.atText(")") || self.atText("]") || self.atText("}") {
+                            if depth == 0 { break }
+                            depth = depth - 1
+                        } else if self.atText(",") && depth == 0 { break }
+                        self.advance()
+                    }
+                    idx = idx + 1
+                    if self.atText(",") { self.advance() } else { break }
+                }
+                if self.atText(")") { self.advance() }
+            }
+            self.skipNewlines()
+        }
+        ret flags
+    }
+
+    fun modifierFlags(): i64 {
+        var flags: i64 = 0
+        while self.cur() == TokenKind.Ident {
+            val w = self.txt()
+            if w == "pub" { flags = flags + F_PUB }
+            else if w == "static" { flags = flags + F_STATIC }
+            else if w == "override" { flags = flags + F_OVERRIDE }
+            else if w == "abstract" { flags = flags + F_ABSTRACT }
+            else if w == "private" || w == "open" || w == "final" || w == "inline" || w == "sealed" { }
+            else if w == "priv" { flags = flags + F_PRIV }
+            else if w == "ext" { flags = flags + F_EXT }
+            else if w == "data" && (self.peekText(1) == "class" || self.peekText(1) == "struct") { flags = flags + F_DATA }
+            else { break }
+            self.advance()
+            self.skipNewlines()
+        }
+        ret flags
+    }
+
+    fun parseDecl(parent: i64, inClass: bool): void {
+        var flags = self.blockflags + self.annotationFlags()
+        flags = flags + self.modifierFlags()
+        if self.atText("{") && (hasFlag(flags, F_PUB) || hasFlag(flags, F_PRIV)) {
+            val saved = self.blockflags
+            self.blockflags = hasFlag(flags, F_PRIV) ? F_PRIV : F_PUB
+            self.advance()
+            while !self.atEof() && !self.atText("}") {
+                self.skipNewlines()
+                if self.atText("}") { break }
+                val before = self.pos
+                self.parseDecl(parent, inClass)
+                if self.pos == before { self.advance() }
+                self.skipNewlines()
+            }
+            if self.atText("}") { self.advance() }
+            self.blockflags = saved
+            ret
+        }
+        if self.atWord("comptime") {
+            self.advance()
+            self.skipNewlines()
+            if self.atText("{") {
+                self.advance()
+                while !self.atEof() && !self.atText("}") {
+                    self.skipNewlines()
+                    if self.atText("}") { break }
+                    val before = self.pos
+                    self.parseDecl(parent, inClass)
+                    if self.pos == before { self.advance() }
+                    self.skipNewlines()
+                }
+                if self.atText("}") { self.advance() }
+            } else if self.atWord("if") {
+                self.advance()
+                if self.atText("(") { self.skipBalanced("(", ")") }
+                self.skipNewlines()
+                if self.atText("{") { self.skipBalanced("{", "}") }
+                self.skipNewlines()
+                if self.atWord("else") {
+                    self.advance()
+                    self.skipNewlines()
+                    if self.atText("{") { self.skipBalanced("{", "}") } else { self.skipLine() }
+                }
+            } else if self.atWord("assert") {
+                self.advance()
+                if self.atText("(") { self.skipBalanced("(", ")") }
+                self.skipLine()
+            } else {
+                self.skipLine()
+            }
+            ret
+        }
+        if self.atWord("import") {
+            self.advance()
+            val n = self.ast.add(NodeKind.Import, self.readPath(), self.line(), self.col())
+            self.ast.addChild(parent, n)
+            self.skipLine()
+            ret
+        }
+        if self.atWord("module") {
+            self.advance()
+            val n = self.ast.add(NodeKind.Module, self.readPath(), self.line(), self.col())
+            self.ast.addChild(parent, n)
+            self.skipLine()
+            ret
+        }
+        if self.atWord("bind") {
+            self.advance()
+            if self.atWord("C") {
+                self.advance()
+                if self.atWord("fun") {
+                    self.advance()
+                    self.ast.addChild(parent, self.parseFun(flags + F_EXTERN))
+                    ret
+                }
+            }
+            self.skipLine()
+            ret
+        }
+        if self.atWord("fun") {
+            self.advance()
+            self.ast.addChild(parent, self.parseFun(flags))
+            ret
+        }
+        if self.atWord("class") || self.atWord("struct") || self.atWord("interface") {
+            if self.atWord("struct") { flags = flags + F_STRUCT }
+            if self.atWord("interface") { flags = flags + F_INTERFACE }
+            self.advance()
+            self.ast.addChild(parent, self.parseClass(flags))
+            ret
+        }
+        if self.atWord("annotation") && (self.peekText(1) == "class" || self.peekText(1) == "struct") {
+            flags = flags + F_DATA
+            self.advance()
+            if self.atWord("struct") { flags = flags + F_STRUCT }
+            self.advance()
+            val cn = self.parseClass(flags)
+            self.ast.addChild(parent, cn)
+            var rec = self.ast.text(cn) + "|"
+            var ci: i64 = 0
+            while ci < self.ast.size(cn) {
+                val ch = self.ast.child(cn, ci)
+                if self.ast.kind(ch) == NodeKind.Fun && self.ast.auxText(ch) == "ctor" {
+                    var pi: i64 = 0
+                    while pi < self.ast.size(ch) {
+                        val pp = self.ast.child(ch, pi)
+                        if self.ast.kind(pp) == NodeKind.Param {
+                            rec = rec + self.ast.text(pp) + ":" + self.ast.auxText(pp) + "|"
+                        }
+                        pi = pi + 1
+                    }
+                }
+                ci = ci + 1
+            }
+            self.anns.add(rec)
+            ret
+        }
+        if self.atWord("enum") {
+            self.advance()
+            self.ast.addChild(parent, self.parseEnum())
+            ret
+        }
+        if self.atWord("const") {
+            self.advance()
+            self.ast.addChild(parent, self.parseField(flags))
+            ret
+        }
+        if self.atWord("val") || self.atWord("var") {
+            if self.atWord("var") { flags = flags + F_VAR }
+            self.advance()
+            self.ast.addChild(parent, self.parseField(flags))
+            ret
+        }
+        if self.atWord("type") || self.atWord("alias") {
+            self.advance()
+            val n = self.ast.add(NodeKind.Unknown, "type", self.line(), self.col())
+            self.ast.addChild(parent, n)
+            self.skipLine()
+            ret
+        }
+        if self.cur() == TokenKind.Embed {
+            val n = self.ast.add(NodeKind.EmbedC, "", self.line(), self.col())
+            self.ast.setAux(n, self.txt())
+            self.ast.addChild(parent, n)
+            self.advance()
+            ret
+        }
+        if self.atText("~") {
+            self.advance()
+            var name = "~"
+            if self.cur() == TokenKind.Ident { name = name + self.txt(); self.advance() }
+            self.ast.addChild(parent, self.parseFunBody(name, flags, true))
+            ret
+        }
+        if inClass && self.cur() == TokenKind.Ident && self.peekText(1) == "(" {
+            val name = self.txt()
+            self.advance()
+            self.ast.addChild(parent, self.parseFunBody(name, flags + F_CTOR, true))
+            ret
+        }
+        self.error("expected declaration, found '" + self.txt() + "'")
+        self.skipLine()
+    }
+
+    fun skipLine(): void {
+        while !self.atEof() {
+            if self.cur() == TokenKind.Newline { self.skipNewlines(); ret }
+            if self.atText(";") { self.advance(); self.skipNewlines(); ret }
+            if self.atText("}") { ret }
+            self.advance()
+        }
+    }
+
+    fun parseFun(flags: i64): i64 {
+        var name = ""
+        var recv = ""
+        if self.cur() == TokenKind.Ident {
+            name = self.txt()
+            self.advance()
+            if hasFlag(flags, F_EXT) && self.atText(".") && self.peekText(1).length() > 0 {
+                recv = cloneText(name)
+                self.advance()
+                if self.cur() == TokenKind.Ident { name = self.txt(); self.advance() }
+            }
+        }
+        val node = self.parseFunBody(name, flags, false)
+        if recv.length() > 0 { self.ast.setExt(node, recv) }
+        ret node
+    }
+
+    fun parseTemplateParams(fn: i64): void {
+        if !self.atText("<") { ret }
+        self.advance()
+        var depth: i64 = 1
+        var skip: i64 = 0
+        while !self.atEof() && depth > 0 {
+            if self.atText("<") { depth = depth + 1; self.advance(); continue }
+            if self.atText(">") { depth = depth - 1; self.advance(); continue }
+            if self.atText(">>") { depth = depth - 2; self.advance(); continue }
+            if self.cur() == TokenKind.Ident {
+                val w = self.txt()
+                if depth == 1 && skip == 0 && w != "must" {
+                    val tp = self.ast.add(NodeKind.TypeParam, w, self.line(), self.col())
+                    self.ast.addChild(fn, tp)
+                }
+                if w == "must" { skip = 2 }
+                if skip > 0 { skip = skip - 1 }
+                self.advance()
+                continue
+            }
+            self.advance()
+        }
+    }
+
+    fun parseParams(node: i64): void {
+        if !self.atText("(") { ret }
+        self.advance()
+        self.paren = self.paren + 1
+        while !self.atEof() && !self.atText(")") {
+            self.skipSoft()
+            if self.atText(")") { break }
+            val before = self.pos
+            while self.atText("@") { self.annotationFlags() }
+            if self.atWord("val") || self.atWord("var") { self.advance() }
+            val p = self.ast.add(NodeKind.Param, "", self.line(), self.col())
+            if self.cur() == TokenKind.Ident {
+                self.ast.setName(p, self.txt())
+                self.advance()
+            }
+            var ptype = ""
+            if self.atText(":") {
+                self.advance()
+                ptype = self.parseType()
+            }
+            self.ast.setAux(p, ptype)
+            self.ast.addChild(node, p)
+            self.skipSoft()
+            if self.atText("...") {
+                self.ast.setFlags(node, self.ast.flag(node) + F_VARARG)
+                self.ast.setFlags(p, F_VARARG)
+                self.advance()
+            }
+            if self.atText("=") {
+                self.advance()
+                val def = self.parseExpr()
+                if def >= 0 { self.ast.addChild(p, def) }
+            }
+            self.skipSoft()
+            if self.atText(",") { self.advance(); continue }
+            if !self.atText(")") {
+                self.error("expected ',' or ')' in parameter list")
+                if self.pos == before { self.advance() }
+            }
+        }
+        if self.atText(")") { self.advance() }
+        self.paren = self.paren - 1
+    }
+
+    fun parseFunBody(name: str, flags: i64, ctor: bool): i64 {
+        val node = self.ast.add(NodeKind.Fun, name, self.line(), self.col())
+        self.ast.setFlags(node, ctor ? flags + F_CTOR : flags)
+        self.parseTemplateParams(node)
+        if self.atText("[") {
+            self.advance()
+            var aname = ""
+            if self.cur() == TokenKind.Ident { aname = self.txt(); self.advance() }
+            if self.atText("<") { self.skipBalanced("<", ">") }
+            while self.atText(".") {
+                self.advance()
+                if self.cur() == TokenKind.Ident {
+                    aname = aname + "_" + self.txt()
+                    self.advance()
+                }
+            }
+            if self.atText("]") { self.advance() }
+            self.ast.setAlias(node, aname)
+        }
+        self.parseParams(node)
+        var retType = "void"
+        if self.atText(":") {
+            self.advance()
+            retType = self.parseType()
+        }
+        self.ast.setAux(node, retType)
+        if self.atText("=") && self.peekText(1) == "default" {
+            self.advance()
+            self.advance()
+            self.skipLine()
+            ret node
+        }
+        if self.atText("=>") {
+            self.advance()
+            self.skipNewlines()
+            val body = self.ast.add(NodeKind.Block, "", self.line(), self.col())
+            val expr = self.parseExpr()
+            val r = self.ast.add(NodeKind.Ret, "", self.line(), self.col())
+            if expr >= 0 { self.ast.addChild(r, expr) }
+            self.ast.addChild(body, r)
+            self.ast.addChild(node, body)
+            self.skipLine()
+            ret node
+        }
+        if self.atText("{") {
+            self.ast.addChild(node, self.parseBlock())
+        } else {
+            val body = self.ast.add(NodeKind.Block, "", self.line(), self.col())
+            self.ast.addChild(node, body)
+            self.skipLine()
+        }
+        ret node
+    }
+
+    fun parseField(flags: i64): i64 {
+        val node = self.ast.add(NodeKind.Field, "", self.line(), self.col())
+        self.ast.setFlags(node, flags)
+        if self.cur() == TokenKind.Ident {
+            self.ast.setName(node, self.txt())
+            self.advance()
+        }
+        if self.atText(":") {
+            self.advance()
+            self.ast.setAux(node, self.parseType())
+        }
+        if self.atText("=") {
+            self.advance()
+            val v = self.parseExpr()
+            if v >= 0 { self.ast.addChild(node, v) }
+        }
+        self.skipLine()
+        ret node
+    }
+
+    fun parseClass(flags: i64): i64 {
+        val node = self.ast.add(NodeKind.Class, "", self.line(), self.col())
+        self.ast.setFlags(node, flags)
+        if self.cur() == TokenKind.Ident {
+            self.ast.setName(node, self.txt())
+            self.advance()
+        }
+        if self.atText("<") { self.ast.setAux(node, self.parseTypeParams()) }
+        if self.atText("(") {
+            val ctor = self.ast.add(NodeKind.Fun, self.ast.text(node), self.line(), self.col())
+            self.ast.setAux(ctor, "ctor")
+            self.ast.setFlags(ctor, flags + F_CTOR)
+            self.parseParams(ctor)
+            self.ast.addChild(node, ctor)
+        }
+        if self.atText(":") || self.atWord("extends") || self.atWord("implements") {
+            self.advance()
+            var bases = ""
+            while !self.atEof() && !self.atText("{") && self.cur() != TokenKind.Newline && !self.atText("=") {
+                if self.cur() == TokenKind.Ident {
+                    if bases.length() > 0 { bases = bases + "," }
+                    bases = bases + self.readPath()
+                    if self.atText("<") { bases = bases + self.parseGenericArgs() }
+                    if self.atText("(") { self.skipBalanced("(", ")") }
+                } else {
+                    self.advance()
+                }
+            }
+            self.ast.setExt(node, bases)
+        }
+        if self.atText("=") && self.peekText(1) == "default" {
+            self.advance()
+            self.advance()
+            self.skipLine()
+            ret node
+        }
+        self.skipNewlines()
+        if !self.atText("{") {
+            if hasFlag(flags, F_DATA) || hasFlag(flags, F_STRUCT) { ret node }
+                        self.error("expected '{' after class declaration")
+            self.skipLine()
+            ret node
+        }
+        self.advance()
+        while !self.atEof() && !self.atText("}") {
+            self.skipNewlines()
+            if self.atText("}") { break }
+            val before = self.pos
+            self.parseDecl(node, true)
+            if self.pos == before { self.advance() }
+            self.skipNewlines()
+        }
+        if self.atText("}") { self.advance() }
+        ret node
+    }
+
+    fun parseEnum(): i64 {
+        val node = self.ast.add(NodeKind.Enum, "", self.line(), self.col())
+        if self.cur() == TokenKind.Ident {
+            self.ast.setName(node, self.txt())
+            self.advance()
+        }
+        if self.atText("<") { self.skipBalanced("<", ">") }
+        if !self.atText("{") {
+            self.error("expected '{' after enum declaration")
+            self.skipLine()
+            ret node
+        }
+        self.advance()
+        while !self.atEof() && !self.atText("}") {
+            self.skipNewlines()
+            if self.cur() == TokenKind.Ident {
+                val v = self.ast.add(NodeKind.Field, self.txt(), self.line(), self.col())
+                self.ast.addChild(node, v)
+                self.advance()
+            } else if self.atText(",") {
+                self.advance()
+            } else if self.atText("}") {
+                break
+            } else {
+                self.advance()
+            }
+        }
+        if self.atText("}") { self.advance() }
+        ret node
+    }
+
+    // ---- statements --------------------------------------------------------
+    fun parseBlock(): i64 {
+        val node = self.ast.add(NodeKind.Block, "", self.line(), self.col())
+        if !self.atText("{") {
+            self.error("expected '{'")
+            ret node
+        }
+        self.advance()
+        while !self.atEof() && !self.atText("}") {
+            self.skipNewlines()
+            if self.atText("}") { break }
+            val before = self.pos
+            val stmt = self.parseStatement()
+            if stmt >= 0 { self.ast.addChild(node, stmt) }
+            self.endStatement()
+            if self.pos == before { self.advance() }
+        }
+        if self.atText("}") { self.advance() }
+        ret node
+    }
+
+    fun endStatement(): void {
+        self.skipSoft()
+        if self.atText(";") { self.advance(); self.skipNewlines(); ret }
+        if self.cur() == TokenKind.Newline { self.skipNewlines(); ret }
+        if self.atText("}") || self.atEof() { ret }
+        self.error("expected newline or ';' after statement")
+        self.skipLine()
+    }
+
+    fun parseStatement(): i64 {
+        if self.atText("{") { ret self.parseBlock() }
+        if self.atWord("val") || self.atWord("var") { ret self.parseLet() }
+        if self.atWord("if") { ret self.parseIf() }
+        if self.atWord("while") { ret self.parseWhile() }
+        if self.atWord("for") { ret self.parseFor() }
+        if self.atWord("do") { ret self.parseDoWhile() }
+        if self.atWord("ret") || self.atWord("return") { ret self.parseRet() }
+        if self.atWord("break") {
+            val n = self.ast.add(NodeKind.Break, "", self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.atWord("continue") {
+            val n = self.ast.add(NodeKind.Continue, "", self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.atWord("throw") {
+            val n = self.ast.add(NodeKind.Throw, "", self.line(), self.col())
+            self.advance()
+            val e = self.parseExpr()
+            if e >= 0 { self.ast.addChild(n, e) }
+            ret n
+        }
+        if self.atWord("del") {
+            val n = self.ast.add(NodeKind.Del, "", self.line(), self.col())
+            self.advance()
+            val e = self.parseExpr()
+            if e >= 0 { self.ast.addChild(n, e) }
+            ret n
+        }
+        if self.atWord("try") { ret self.parseTry() }
+        if self.atWord("when") { ret self.parseWhen() }
+        if self.cur() == TokenKind.Embed {
+            val n = self.ast.add(NodeKind.EmbedC, "", self.line(), self.col())
+            self.ast.setAux(n, self.txt())
+            self.advance()
+            ret n
+        }
+        val node = self.ast.add(NodeKind.ExprStmt, "", self.line(), self.col())
+        val e = self.parseExpr()
+        if e >= 0 { self.ast.addChild(node, e) }
+        ret node
+    }
+
+    fun parseLet(): i64 {
+        val flags = self.atWord("var") ? F_VAR : 0
+        self.advance()
+        val node = self.ast.add(NodeKind.Var, "", self.line(), self.col())
+        self.ast.setFlags(node, flags)
+        if self.cur() == TokenKind.Ident {
+            self.ast.setName(node, self.txt())
+            self.advance()
+        }
+        if self.atText(":") {
+            self.advance()
+            self.ast.setAux(node, self.parseType())
+        }
+        if self.atText("=") {
+            self.advance()
+            val e = self.parseExpr()
+            if e >= 0 { self.ast.addChild(node, e) }
+        }
+        ret node
+    }
+
+    fun parseIf(): i64 {
+        val node = self.ast.add(NodeKind.If, "", self.line(), self.col())
+        self.advance()
+        val cond = self.parseCondition()
+        if cond >= 0 { self.ast.addChild(node, cond) }
+        self.skipNewlines()
+        val thenBlock = self.parseStatement()
+        if thenBlock >= 0 { self.ast.addChild(node, thenBlock) }
+        val save = self.pos
+        self.skipNewlines()
+        if self.atWord("else") {
+            self.advance()
+            self.skipNewlines()
+            val elseBlock = self.parseStatement()
+            if elseBlock >= 0 { self.ast.addChild(node, elseBlock) }
+        } else {
+            self.pos = save
+        }
+        ret node
+    }
+
+    fun parseWhile(): i64 {
+        val node = self.ast.add(NodeKind.While, "", self.line(), self.col())
+        self.advance()
+        val cond = self.parseCondition()
+        if cond >= 0 { self.ast.addChild(node, cond) }
+        self.skipNewlines()
+        val body = self.parseStatement()
+        if body >= 0 { self.ast.addChild(node, body) }
+        ret node
+    }
+
+    fun parseCondition(): i64 {
+        self.skipNewlines()
+        var parens = false
+        if self.atText("(") { parens = true; self.advance(); self.paren = self.paren + 1 }
+        self.suppresslam = self.suppresslam + 1
+        val e = self.parseExpr()
+        self.suppresslam = self.suppresslam - 1
+        if parens {
+            self.paren = self.paren - 1
+            if self.atText(")") { self.advance() }
+        }
+        ret e
+    }
+
+    fun parseDoWhile(): i64 {
+        val node = self.ast.add(NodeKind.DoWhile, "", self.line(), self.col())
+        self.advance()
+        self.skipNewlines()
+        val body = self.parseStatement()
+        if body >= 0 { self.ast.addChild(node, body) }
+        self.skipNewlines()
+        if self.atWord("while") { self.advance() }
+        val cond = self.parseCondition()
+        if cond >= 0 { self.ast.addChild(node, cond) }
+        if self.atText(";") { self.advance() }
+        ret node
+    }
+
+    fun parseFor(): i64 {
+        val node = self.ast.add(NodeKind.For, "", self.line(), self.col())
+        self.advance()
+        if self.atText("(") {
+            self.advance()
+            self.paren = self.paren + 1
+            self.skipNewlines()
+            var name = ""
+            if self.cur() == TokenKind.Ident { name = self.txt(); self.advance() }
+            if self.atWord("in") {
+                self.advance()
+                self.ast.setName(node, name)
+                val e = self.parseExpr()
+                if e >= 0 { self.ast.addChild(node, e) }
+            } else {
+                while !self.atEof() && !self.atText(")") { self.advance() }
+            }
+            if self.atText(")") { self.advance() }
+            self.paren = self.paren - 1
+        } else {
+            while !self.atEof() && !self.atText("{") && self.cur() != TokenKind.Newline { self.advance() }
+        }
+        self.skipNewlines()
+        if self.atText("{") {
+            self.ast.addChild(node, self.parseBlock())
+        } else {
+            val b = self.parseStatement()
+            if b >= 0 { self.ast.addChild(node, b) }
+        }
+        ret node
+    }
+
+    fun parseRet(): i64 {
+        val node = self.ast.add(NodeKind.Ret, "", self.line(), self.col())
+        self.advance()
+        if self.cur() == TokenKind.Newline || self.atText(";") || self.atText("}") || self.atEof() {
+            ret node
+        }
+        val e = self.parseExpr()
+        if e >= 0 { self.ast.addChild(node, e) }
+        ret node
+    }
+
+    fun parseTry(): i64 {
+        val node = self.ast.add(NodeKind.Try, "", self.line(), self.col())
+        self.advance()
+        val body = self.parseStatement()
+        if body >= 0 { self.ast.setAux(body, "try"); self.ast.addChild(node, body) }
+        val save = self.pos
+        var saw = false
+        self.skipNewlines()
+        if self.atWord("catch") {
+            saw = true
+            self.advance()
+            var errName = "e"
+            if self.atText("(") {
+                self.advance()
+                if self.cur() == TokenKind.Ident { errName = self.txt(); self.advance() }
+                while !self.atEof() && !self.atText(")") { self.advance() }
+                if self.atText(")") { self.advance() }
+            }
+            self.ast.setName(node, errName)
+            if self.atText("{") {
+                val b = self.parseBlock()
+                self.ast.setAux(b, "catch")
+                self.ast.addChild(node, b)
+            }
+        }
+        val fsave = self.pos
+        self.skipNewlines()
+        if self.atWord("finally") {
+            saw = true
+            self.advance()
+            if self.atText("{") {
+                val b = self.parseBlock()
+                self.ast.setAux(b, "finally")
+                self.ast.addChild(node, b)
+            }
+        } else {
+            self.pos = fsave
+        }
+        if !saw { self.pos = save }
+        ret node
+    }
+
+    fun parseWhen(): i64 {
+        val node = self.ast.add(NodeKind.When, "when", self.line(), self.col())
+        self.advance()
+        self.skipNewlines()
+        if self.atText("(") {
+            self.advance()
+            self.paren = self.paren + 1
+            val subject = self.parseExpr()
+            if subject >= 0 { self.ast.addChild(node, subject) }
+            self.paren = self.paren - 1
+            if self.atText(")") { self.advance() }
+        } else {
+            val subject = self.parseExpr()
+            if subject >= 0 { self.ast.addChild(node, subject) }
+        }
+        self.skipNewlines()
+        if !self.atText("{") { self.error("expected '{' after when"); ret node }
+        self.advance()
+        while !self.atEof() && !self.atText("}") {
+            self.skipNewlines()
+            if self.atText("}") { break }
+            val br = self.ast.add(NodeKind.WhenBranch, "case", self.line(), self.col())
+            var count: i64 = 0
+            if self.atWord("else") {
+                self.advance()
+                self.ast.setName(br, "else")
+            } else {
+                while true {
+                    if self.atWord("in") {
+                        self.advance()
+                        val r = self.parseExpr()
+                        if r >= 0 { self.ast.addChild(br, r) }
+                        count = count + 1
+                    } else if self.atWord("is") {
+                        self.advance()
+                        val ty = self.parseType()
+                        val u = self.ast.add(NodeKind.Unknown, ty, self.line(), self.col())
+                        self.ast.addChild(br, u)
+                        count = count + 1
+                    } else {
+                        val e = self.parseExpr()
+                        if e >= 0 { self.ast.addChild(br, e) }
+                        count = count + 1
+                    }
+                    if self.atText(",") { self.advance(); self.skipNewlines(); continue }
+                    break
+                }
+            }
+            self.ast.setFlags(br, count)
+            if !self.atText("=>") { self.error("expected '=>' in when branch"); self.skipLine(); continue }
+            self.advance()
+            self.skipNewlines()
+            if self.atText("{") {
+                self.ast.addChild(br, self.parseBlock())
+            } else {
+                val e = self.parseExpr()
+                if e >= 0 { self.ast.addChild(br, e) }
+            }
+            self.ast.addChild(node, br)
+            self.skipNewlines()
+            if self.atText(",") { self.advance() }
+        }
+        if self.atText("}") { self.advance() }
+        ret node
+    }
+
+    // ---- expressions -------------------------------------------------------
+    fun parseExpr(): i64 => self.parseAssign()
+
+    fun isAssignOp(op: str): bool {
+        ret op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" || op == "&=" || op == "|=" || op == "^="
+    }
+
+    fun parseAssign(): i64 {
+        val left = self.parseTernary()
+        self.skipSoft()
+        if self.cur() == TokenKind.Punct && self.isAssignOp(self.txt()) {
+            val op = self.txt()
+            self.advance()
+            self.skipSoft()
+            val right = self.parseAssign()
+            val n = self.ast.add(NodeKind.Assign, op, self.line(), self.col())
+            self.ast.addChild(n, left)
+            if right >= 0 { self.ast.addChild(n, right) }
+            ret n
+        }
+        ret left
+    }
+
+    fun parseTernary(): i64 {
+        val cond = self.parseBinary(1)
+        self.skipSoft()
+        if self.atText("?") {
+            self.advance()
+            self.skipSoft()
+            val a = self.parseExpr()
+            self.skipSoft()
+            if self.atText(":") { self.advance() }
+            self.skipSoft()
+            val b = self.parseExpr()
+            val n = self.ast.add(NodeKind.Ternary, "", self.line(), self.col())
+            self.ast.addChild(n, cond)
+            if a >= 0 { self.ast.addChild(n, a) }
+            if b >= 0 { self.ast.addChild(n, b) }
+            ret n
+        }
+        ret cond
+    }
+
+    fun binaryPrec(op: str): i64 {
+        if op == "||" { ret 1 }
+        if op == "&&" { ret 2 }
+        if op == "|" { ret 3 }
+        if op == "^" { ret 4 }
+        if op == "&" { ret 5 }
+        if op == "==" || op == "!=" { ret 6 }
+        if op == "<" || op == ">" || op == "<=" || op == ">=" || op == "is" || op == "in" || op == "as" { ret 7 }
+        if op == "<<" || op == ">>" { ret 8 }
+        if op == "+" || op == "-" { ret 9 }
+        if op == "*" || op == "/" || op == "%" { ret 10 }
+        if op == ".." { ret 11 }
+        ret 0
+    }
+
+    fun parseBinary(minPrec: i64): i64 {
+        var left = self.parseUnary()
+        while true {
+            self.skipSoft()
+            if self.cur() != TokenKind.Punct && self.cur() != TokenKind.Ident { break }
+            val op = self.txt()
+            val p = self.binaryPrec(op)
+            if p < minPrec { break }
+            self.advance()
+            if op == "as" {
+                val castType = self.parseType()
+                val n = self.ast.add(NodeKind.Cast, castType, self.line(), self.col())
+                self.ast.addChild(n, left)
+                left = n
+                continue
+            }
+            self.skipSoft()
+            val right = self.parseBinary(p + 1)
+            val kind = op == ".." ? NodeKind.Range : NodeKind.Binary
+            val n = self.ast.add(kind, op, self.line(), self.col())
+            self.ast.addChild(n, left)
+            if right >= 0 { self.ast.addChild(n, right) }
+            left = n
+        }
+        ret left
+    }
+
+    fun parseUnary(): i64 {
+        self.skipSoft()
+        if self.cur() == TokenKind.Punct {
+            val op = self.txt()
+            if op == "-" || op == "!" || op == "~" || op == "*" || op == "&" || op == "++" || op == "--" {
+                self.advance()
+                val operand = self.parseUnary()
+                val n = self.ast.add(NodeKind.Unary, op, self.line(), self.col())
+                if operand >= 0 { self.ast.addChild(n, operand) }
+                ret n
+            }
+        }
+        ret self.parsePostfix()
+    }
+
+    fun looksLikeGenericCall(): bool {
+        if !self.atText("<") { ret false }
+        var i = self.pos
+        var depth: i64 = 0
+        while i < self.toks.size() {
+            val t = self.toks.text(i)
+            if t == "<" { depth = depth + 1 }
+            else if t == ">" { depth = depth - 1 }
+            else if t == ">>" { depth = depth - 2 }
+            else if t == "(" && depth == 0 {
+                // not a generic list
+                ret false
+            }
+            if depth <= 0 { break }
+            i = i + 1
+        }
+        if i >= self.toks.size() { ret false }
+        val next = self.toks.text(i + 1)
+        ret next == "(" || next == "." || next == "::"
+    }
+
+    fun parsePostfix(): i64 {
+        var expr = self.parsePrimary()
+        var targs = ""
+        while true {
+            self.skipSoft()
+            if self.atText("<") && self.looksLikeGenericCall() {
+                targs = self.parseTypeArgs()
+                continue
+            }
+            if self.atText("(") {
+                self.advance()
+                self.paren = self.paren + 1
+                val n = self.ast.add(NodeKind.Call, targs, self.line(), self.col())
+                targs = ""
+                self.ast.addChild(n, expr)
+                while !self.atEof() && !self.atText(")") {
+                    self.skipSoft()
+                    if self.atText(")") { break }
+                    var named = ""
+                    if self.cur() == TokenKind.Ident && self.peekText(1) == "=" {
+                        named = self.txt()
+                        self.advance()
+                        self.advance()
+                    }
+                    var a: i64 = -1
+                    if self.atText("{") {
+                        a = self.ast.add(NodeKind.Lambda, "", self.line(), self.col())
+                        self.ast.setAux(a, "void")
+                        self.ast.addChild(a, self.parseBlock())
+                    } else {
+                        a = self.parseExpr()
+                    }
+                    if a >= 0 {
+                        if named.length() > 0 { self.ast.setAux(a, named); self.ast.setFlags(a, F_NAMED) }
+                        self.ast.addChild(n, a)
+                    }
+                    self.skipSoft()
+                    if self.atText(",") { self.advance(); continue }
+                    if !self.atText(")") { self.error("expected ',' or ')' in call") }
+                }
+                if self.atText(")") { self.advance() }
+                self.paren = self.paren - 1
+                expr = n
+                continue
+            }
+            if self.atText(".") || self.atText("?.") {
+                self.advance()
+                val name = self.txt()
+                if self.cur() == TokenKind.Ident { self.advance() }
+                val n = self.ast.add(NodeKind.Member, name, self.line(), self.col())
+                self.ast.addChild(n, expr)
+                expr = n
+                continue
+            }
+            if self.atText("[") {
+                self.advance()
+                self.paren = self.paren + 1
+                val idx = self.parseExpr()
+                if self.atText("]") { self.advance() }
+                self.paren = self.paren - 1
+                val n = self.ast.add(NodeKind.Index, "", self.line(), self.col())
+                self.ast.addChild(n, expr)
+                if idx >= 0 { self.ast.addChild(n, idx) }
+                expr = n
+                continue
+            }
+            if self.atText("++") || self.atText("--") {
+                val op = self.txt()
+                self.advance()
+                val n = self.ast.add(NodeKind.Unary, op, self.line(), self.col())
+                self.ast.addChild(n, expr)
+                expr = n
+                continue
+            }
+            if self.atText("!!") {
+                self.advance()
+                val n = self.ast.add(NodeKind.Unary, "!!", self.line(), self.col())
+                self.ast.addChild(n, expr)
+                expr = n
+                continue
+            }
+            if self.suppresslam == 0 && self.atText("{") && (self.ast.kind(expr) == NodeKind.IdentExpr || self.ast.kind(expr) == NodeKind.Member) {
+                val lam = self.ast.add(NodeKind.Lambda, "", self.line(), self.col())
+                self.ast.setAux(lam, "void")
+                self.ast.addChild(lam, self.parseBlock())
+                val n = self.ast.add(NodeKind.Call, "", self.line(), self.col())
+                self.ast.addChild(n, expr)
+                self.ast.addChild(n, lam)
+                expr = n
+                continue
+            }
+            break
+        }
+        ret expr
+    }
+
+    fun parseInnerExpr(src: str): i64 {
+        val toks = Tokens()
+        Lexer(src).tokenize(toks, self.diags)
+        ret Parser(toks, self.ast, self.diags).parseExpr()
+    }
+
+    fun templateNode(raw: str, line: i64, col: i64): i64 {
+        val n = self.ast.add(NodeKind.StringTemplate, "", line, col)
+        var start: i64 = 0
+        var i: i64 = 0
+        while i < raw.length() {
+            if raw.at(i) == 36 && i + 1 < raw.length() && raw.at(i + 1) == 123 {
+                if i > start {
+                    val lit = self.ast.add(NodeKind.StringLit, raw.substring(start, i), line, col)
+                    self.ast.addChild(n, lit)
+                }
+                var j: i64 = i + 2
+                var depth: i64 = 1
+                while j < raw.length() && depth > 0 {
+                    if raw.at(j) == 123 { depth = depth + 1 }
+                    else if raw.at(j) == 125 { depth = depth - 1 }
+                    j = j + 1
+                }
+                val inner = raw.substring(i + 2, j - 1)
+                self.ast.addChild(n, self.parseInnerExpr(inner))
+                i = j
+                start = j
+            } else {
+                i = i + 1
+            }
+        }
+        if start < raw.length() {
+            val lit = self.ast.add(NodeKind.StringLit, raw.substring(start, raw.length()), line, col)
+            self.ast.addChild(n, lit)
+        }
+        ret n
+    }
+
+    fun parseLambda(): i64 {
+        val node = self.ast.add(NodeKind.Lambda, "", self.line(), self.col())
+        if self.atText("(") { self.parseParams(node) }
+        var rt = "void"
+        if self.atText(":") { self.advance(); rt = self.parseType() }
+        self.ast.setAux(node, rt)
+        if self.atText("=>") {
+            self.advance()
+            val e = self.parseExpr()
+            if e >= 0 { self.ast.addChild(node, e) }
+        } else if self.atText("{") {
+            self.ast.addChild(node, self.parseBlock())
+        }
+        ret node
+    }
+
+    fun parsePrimary(): i64 {
+        self.skipSoft()
+        if self.cur() == TokenKind.Integer {
+            val n = self.ast.add(NodeKind.IntLit, self.txt(), self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.cur() == TokenKind.Float {
+            val n = self.ast.add(NodeKind.FloatLit, self.txt(), self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.cur() == TokenKind.String {
+            val raw = self.txt()
+            val ln = self.line()
+            val cl = self.col()
+            self.advance()
+            var has: bool = false
+            var k: i64 = 0
+            while k + 1 < raw.length() {
+                if raw.at(k) == 36 && raw.at(k + 1) == 123 { has = true; break }
+                k = k + 1
+            }
+            if has { ret self.templateNode(raw, ln, cl) }
+            ret self.ast.add(NodeKind.StringLit, raw, ln, cl)
+        }
+        if self.cur() == TokenKind.Char {
+            val n = self.ast.add(NodeKind.CharLit, self.txt(), self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.cur() == TokenKind.Embed {
+            self.advance()
+            ret self.ast.add(NodeKind.Unknown, "embed", self.line(), self.col())
+        }
+        if self.cur() == TokenKind.Ident {
+            val w = self.txt()
+            if w == "true" || w == "false" {
+                val n = self.ast.add(NodeKind.BoolLit, w, self.line(), self.col())
+                self.advance()
+                ret n
+            }
+            if w == "null" {
+                val n = self.ast.add(NodeKind.NullLit, "null", self.line(), self.col())
+                self.advance()
+                ret n
+            }
+            if w == "self" || w == "this" {
+                val n = self.ast.add(NodeKind.ThisExpr, w, self.line(), self.col())
+                self.advance()
+                ret n
+            }
+            if w == "fun" {
+                self.advance()
+                ret self.parseLambda()
+            }
+            if w == "if" { ret self.parseIf() }
+            if w == "when" { ret self.parseWhen() }
+            val n = self.ast.add(NodeKind.IdentExpr, w, self.line(), self.col())
+            self.advance()
+            ret n
+        }
+        if self.atText("(") {
+            self.advance()
+            self.paren = self.paren + 1
+            val e = self.parseExpr()
+            if self.atText(")") { self.advance() }
+            self.paren = self.paren - 1
+            val n = self.ast.add(NodeKind.Group, "", self.line(), self.col())
+            if e >= 0 { self.ast.addChild(n, e) }
+            ret n
+        }
+        if self.atText("[") {
+            self.advance()
+            self.paren = self.paren + 1
+            val n = self.ast.add(NodeKind.ArrayLit, "", self.line(), self.col())
+            while !self.atEof() && !self.atText("]") {
+                self.skipSoft()
+                if self.atText("]") { break }
+                val e = self.parseExpr()
+                if e >= 0 { self.ast.addChild(n, e) }
+                self.skipSoft()
+                if self.atText(",") { self.advance(); continue }
+                if !self.atText("]") { self.error("expected ',' or ']' in array literal") }
+            }
+            if self.atText("]") { self.advance() }
+            self.paren = self.paren - 1
+            ret n
+        }
+        if self.atText("{") {
+            val b = self.parseBlock()
+            val n = self.ast.add(NodeKind.BlockExpr, "", self.line(), self.col())
+            self.ast.addChild(n, b)
+            ret n
+        }
+        self.error("expected expression, found '" + self.txt() + "'")
+        val n = self.ast.add(NodeKind.Unknown, self.txt(), self.line(), self.col())
+        if !self.atEof() { self.advance() }
+        ret n
+    }
+}

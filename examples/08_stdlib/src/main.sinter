@@ -1,0 +1,62 @@
+// 08 —— 标准库与包 / Standard library and packages
+module stdlib
+import std
+import std.string
+import std.arrays
+import std.box
+import std.list
+import std.map
+import std.hashmap
+import std.option
+import std.text
+
+// std 是 prelude；其余模块必须显式 import。
+// 一个类型一个模块：std.box / std.list / std.map / std.hashmap / std.arrays。
+// 独立包（zip/json/toml/net/algo）在 packages/ 下，用 sinter add 安装。
+
+fun main(): void {
+    println("--- std: prelude ---")
+    println(sqrt(16.0))
+    println(pow(2.0, 10.0))
+    println(minOf(3, 9))
+    println(maxOf(3, 9))
+    println(abs(-7))
+    println(coerceIn(99, 10, 20))
+
+    println("--- std.string ---")
+    val s = "  Sinter Language  "
+    println(s.trim().uppercase())
+    println(s.length())
+    println("42".toInt())
+    println("2.5".toFloat())
+
+    println("--- std.arrays ---")
+    val a = intArrayOf(3, 1, 2)
+    a.sort()
+    println(a.toString())
+    println(a.sum())
+    println(a.contains(2))
+
+    println("--- 容器（单态化泛型） ---")
+    val b = Box<i64>(7)
+    println(b.get())
+
+    val xs = List<str>()
+    xs.add("ada")
+    xs.add("grace")
+    println("${xs.size()}/${xs.get(0)}/${xs.last()}")
+
+    val m = Map<str, i64>()
+    m.put("ada", 100)
+    println(m.get("ada"))
+
+    val h = HashMap<str, i64>()
+    h.put("grace", 99)
+    println(h.get("grace"))
+
+    println("--- std.option / std.text ---")
+    println(someInt(5).getOr(-1))
+    val sb = StringBuilder()
+    sb.append("n=").appendInt(42).appendLine("!")
+    println(sb.toString())
+}

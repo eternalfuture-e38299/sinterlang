@@ -1,0 +1,3 @@
+dtor inner
+caught boom
+done

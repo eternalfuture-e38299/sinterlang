@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Semantic pre-pass for the self-hosted compiler: qualify every module-level
+// declaration with its module name and rewrite references so multiple modules
+// can be merged into one C translation unit.
+module sem
+
+import std
+import std.list
+import syntax
+
+const F_EXTERN: i64 = 4096
+
+pub class SemanticModel {
+    var diagnostics: i64
+
+    SemanticModel() {
+        self.diagnostics = 0
+    }
+}
+
+class Qualifier {
+    var ast: Ast
+    var root: i64
+    var entry: str
+    var decl_mods: List<str>
+    var decl_names: List<str>
+    var decl_quals: List<str>
+
+    Qualifier(tree: Ast, program: i64, entry_mod: str) {
+        self.ast = tree
+        self.root = program
+        self.entry = entry_mod
+        self.decl_mods = List<str>()
+        self.decl_names = List<str>()
+        self.decl_quals = List<str>()
+    }
+
+    fun isDecl(n: i64): bool {
+        val k = self.ast.kind(n)
+        ret k == NodeKind.Fun || k == NodeKind.Class || k == NodeKind.Enum || k == NodeKind.Field
+    }
+
+    fun isExtern(n: i64): bool => (self.ast.flag(n) / F_EXTERN) % 2 == 1
+
+    fun sanitize(m: str): str {
+        var out = ""
+        var i: i64 = 0
+        while i < m.length() {
+            if m.at(i) == 46 { out = out + "_" } else { out = out + m.substring(i, i + 1) }
+            i = i + 1
+        }
+        ret out
+    }
+
+    fun collect(): void {
+        var i: i64 = 0
+        while i < self.ast.size(self.root) {
+            val n = self.ast.child(self.root, i)
+            if self.isDecl(n) {
+                val m = self.ast.moduleOf(n)
+                val name = self.ast.text(n)
+                var q = cloneText(name)
+                if m.length() > 0 && !self.isExtern(n) {
+                    if name == "main" && m == self.entry { q = "main" } else { q = self.sanitize(m) + "_" + name }
+                }
+                self.decl_mods.add(m)
+                self.decl_names.add(name)
+                self.decl_quals.add(q)
+            }
+            i = i + 1
+        }
+    }
+
+    fun lookup(mod: str, name: str): str {
+        var i: i64 = 0
+        while i < self.decl_names.size() {
+            if self.decl_names.get(i) == name && self.decl_mods.get(i) == mod { ret self.decl_quals.get(i) }
+            i = i + 1
+        }
+        i = 0
+        while i < self.decl_names.size() {
+            if self.decl_names.get(i) == name { ret self.decl_quals.get(i) }
+            i = i + 1
+        }
+        ret ""
+    }
+
+    fun qualifyType(t: str, mod: str): str {
+        var out = ""
+        var i: i64 = 0
+        while i < t.length() {
+            val c = t.at(i)
+            if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95) {
+                val start = i
+                while i < t.length() {
+                    val d = t.at(i)
+                    if !((d >= 65 && d <= 90) || (d >= 97 && d <= 122) || (d >= 48 && d <= 57) || d == 95) { break }
+                    i = i + 1
+                }
+                val word = t.substring(start, i)
+                val q = self.lookup(mod, word)
+                if q.length() > 0 { out = out + q } else { out = out + word }
+            } else {
+                out = out + t.substring(i, i + 1)
+                i = i + 1
+            }
+        }
+        ret out
+    }
+
+    fun rewriteDecls(): void {
+        var i: i64 = 0
+        var d: i64 = 0
+        while i < self.ast.size(self.root) {
+            val n = self.ast.child(self.root, i)
+            if self.isDecl(n) {
+                val raw = self.decl_names.get(d)
+                val qual = self.decl_quals.get(d)
+                if !self.isExtern(n) { self.ast.setName(n, qual) }
+                if self.ast.kind(n) == NodeKind.Fun && self.ast.extOf(n).length() > 0 {
+                    self.ast.setExt(n, self.qualifyType(self.ast.extOf(n), self.ast.moduleOf(n)))
+                }
+                if self.ast.kind(n) == NodeKind.Class && raw != qual {
+                    var c: i64 = 0
+                    while c < self.ast.size(n) {
+                        val m = self.ast.child(n, c)
+                        if self.ast.kind(m) == NodeKind.Fun && self.ast.text(m) == raw { self.ast.setName(m, qual) }
+                        c = c + 1
+                    }
+                }
+                d = d + 1
+            }
+            i = i + 1
+        }
+    }
+
+    fun qualifyNode(n: i64, locals: List<str>): void {
+        val k = self.ast.kind(n)
+        val mod = self.ast.moduleOf(n)
+        if k == NodeKind.TypeParam { ret }
+        if k == NodeKind.IdentExpr {
+            val name = self.ast.text(n)
+            if locals.indexOf(name) < 0 {
+                val q = self.lookup(mod, name)
+                if q.length() > 0 { self.ast.setName(n, q) }
+            }
+            ret
+        }
+        if k == NodeKind.ThisExpr { ret }
+        if k == NodeKind.Cast {
+            self.ast.setName(n, self.qualifyType(self.ast.text(n), mod))
+            if self.ast.size(n) > 0 { self.qualifyNode(self.ast.child(n, 0), locals) }
+            ret
+        }
+        if k == NodeKind.Call {
+            val ta = self.ast.text(n)
+            if ta.length() > 0 { self.ast.setName(n, self.qualifyType(ta, mod)) }
+        }
+        if k == NodeKind.Var || k == NodeKind.Param || k == NodeKind.Field {
+            val t = self.ast.auxText(n)
+            if t.length() > 0 { self.ast.setAux(n, self.qualifyType(t, mod)) }
+            if k == NodeKind.Var {
+                var i: i64 = 0
+                while i < self.ast.size(n) {
+                    self.qualifyNode(self.ast.child(n, i), locals)
+                    i = i + 1
+                }
+                locals.add(self.ast.text(n))
+                ret
+            }
+        }
+        if k == NodeKind.Fun {
+            val rt = self.ast.auxText(n)
+            if rt.length() > 0 { self.ast.setAux(n, self.qualifyType(rt, mod)) }
+            val mark = locals.size()
+            var i: i64 = 0
+            while i < self.ast.size(n) {
+                val p = self.ast.child(n, i)
+                if self.ast.kind(p) == NodeKind.Param { locals.add(self.ast.text(p)) }
+                i = i + 1
+            }
+            i = 0
+            while i < self.ast.size(n) {
+                self.qualifyNode(self.ast.child(n, i), locals)
+                i = i + 1
+            }
+            while locals.size() > mark { locals.removeLast() }
+            ret
+        }
+        if k == NodeKind.Block {
+            val mark = locals.size()
+            var i: i64 = 0
+            while i < self.ast.size(n) {
+                self.qualifyNode(self.ast.child(n, i), locals)
+                i = i + 1
+            }
+            while locals.size() > mark { locals.removeLast() }
+            ret
+        }
+        var i: i64 = 0
+        while i < self.ast.size(n) {
+            self.qualifyNode(self.ast.child(n, i), locals)
+            i = i + 1
+        }
+    }
+
+    fun run(): void {
+        self.collect()
+        self.rewriteDecls()
+        val locals = List<str>()
+        var i: i64 = 0
+        while i < self.ast.size(self.root) {
+            val n = self.ast.child(self.root, i)
+            if self.isDecl(n) { self.qualifyNode(n, locals) }
+            i = i + 1
+        }
+    }
+}
+
+pub fun qualifyModules(ast: Ast, root: i64, entry: str): void {
+    val q = Qualifier(ast, root, entry)
+    q.run()
+}

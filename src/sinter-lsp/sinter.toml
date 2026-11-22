@@ -1,0 +1,17 @@
+[package]
+name = "sinter-lsp"
+version = "file:../version.txt"
+entry = "src/main.sinter"
+description = "Self-hosted Sinter language server (JSON-RPC over stdio)"
+authors = ["sinter"]
+license = "MIT"
+artifact = "exe"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../packages/std" }
+json = { version = "1.0.0", source = "path:../../packages/json" }
+syntax = { version = "1.0.0", source = "path:../libs/syntax" }
+sver = { version = "1.0.0", source = "path:../libs/sver" }
+
+[build]
+opt = "2"

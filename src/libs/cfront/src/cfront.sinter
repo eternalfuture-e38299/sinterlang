@@ -1,0 +1,355 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted C frontend: token pool, diagnostics and C99 lexer.
+// The parser lives in `cparse.sinter`; the formatter in `cformat.sinter`.
+module cfront
+
+import std
+import std.list
+import std.string
+
+pub enum CTokKind {
+    Eof,
+    Ident,
+    Keyword,
+    IntLit,
+    FloatLit,
+    StringLit,
+    CharLit,
+    Punct,
+    Preproc,
+    Comment,
+    Unknown
+}
+
+/// Flat token pool.  Comments and preprocessor lines are kept as tokens so the
+/// formatter can round-trip them; the parser skips them.
+pub class CTokens {
+    var kinds: List<i64>
+    var texts: List<str>
+    var lines: List<i64>
+    var cols: List<i64>
+    var leadnls: List<i64>
+    var starts: List<i64>
+    var ends: List<i64>
+
+    CTokens() {
+        self.kinds = List<i64>()
+        self.texts = List<str>()
+        self.lines = List<i64>()
+        self.cols = List<i64>()
+        self.leadnls = List<i64>()
+        self.starts = List<i64>()
+        self.ends = List<i64>()
+    }
+
+    pub fun add(kind: CTokKind, text: str, line: i64, col: i64, leadnl: bool, start: i64, end: i64): void {
+        self.kinds.add(kind as i64)
+        self.texts.add(text)
+        self.lines.add(line)
+        self.cols.add(col)
+        if leadnl { self.leadnls.add(1) } else { self.leadnls.add(0) }
+        self.starts.add(start)
+        self.ends.add(end)
+    }
+
+    pub fun size(): i64 => self.kinds.size()
+    pub fun kind(i: i64): CTokKind => self.kinds.get(i) as CTokKind
+    pub fun text(i: i64): str => self.texts.get(i)
+    pub fun line(i: i64): i64 => self.lines.get(i)
+    pub fun col(i: i64): i64 => self.cols.get(i)
+    pub fun lead(i: i64): bool => self.leadnls.get(i) != 0
+    pub fun start(i: i64): i64 => self.starts.get(i)
+    pub fun end(i: i64): i64 => self.ends.get(i)
+}
+
+/// Parse result shared by both `cparse` and `cparse2`.
+pub class CUnit {
+    var func_names: List<str>
+    var func_rets: List<str>
+    var func_params: List<i64>
+    var func_variadic: List<i64>
+    var func_defs: List<i64>
+    var func_lines: List<i64>
+
+    var rec_kinds: List<str>
+    var rec_names: List<str>
+    var rec_fields: List<i64>
+    var rec_variants: List<i64>
+    var rec_lines: List<i64>
+
+    var td_names: List<str>
+    var td_types: List<str>
+
+    var includes: List<str>
+
+    var diag_lines: List<i64>
+    var diag_cols: List<i64>
+    var diag_msgs: List<str>
+
+    CUnit() {
+        self.func_names = List<str>()
+        self.func_rets = List<str>()
+        self.func_params = List<i64>()
+        self.func_variadic = List<i64>()
+        self.func_defs = List<i64>()
+        self.func_lines = List<i64>()
+        self.rec_kinds = List<str>()
+        self.rec_names = List<str>()
+        self.rec_fields = List<i64>()
+        self.rec_variants = List<i64>()
+        self.rec_lines = List<i64>()
+        self.td_names = List<str>()
+        self.td_types = List<str>()
+        self.includes = List<str>()
+        self.diag_lines = List<i64>()
+        self.diag_cols = List<i64>()
+        self.diag_msgs = List<str>()
+    }
+
+    pub fun addFunc(name: str, retType: str, params: i64, variadic: bool, definition: bool, line: i64): void {
+        self.func_names.add(name)
+        self.func_rets.add(retType)
+        self.func_params.add(params)
+        if variadic { self.func_variadic.add(1) } else { self.func_variadic.add(0) }
+        if definition { self.func_defs.add(1) } else { self.func_defs.add(0) }
+        self.func_lines.add(line)
+    }
+
+    pub fun addRecord(kind: str, name: str, fields: i64, variants: i64, line: i64): void {
+        self.rec_kinds.add(kind)
+        self.rec_names.add(name)
+        self.rec_fields.add(fields)
+        self.rec_variants.add(variants)
+        self.rec_lines.add(line)
+    }
+
+    pub fun addTypedef(name: str, t: str): void {
+        self.td_names.add(name)
+        self.td_types.add(t)
+    }
+
+    pub fun addInclude(name: str): void {
+        if name.length() > 0 && self.includes.indexOf(name) < 0 { self.includes.add(name) }
+    }
+
+    pub fun error(line: i64, col: i64, msg: str): void {
+        self.diag_lines.add(line)
+        self.diag_cols.add(col)
+        self.diag_msgs.add(msg)
+    }
+
+    pub fun diagCount(): i64 => self.diag_msgs.size()
+    pub fun funcCount(): i64 => self.func_names.size()
+    pub fun recordCount(): i64 => self.rec_names.size()
+    pub fun typedefCount(): i64 => self.td_names.size()
+}
+
+fun isDigit(c: i64): bool => c >= 48 && c <= 57
+fun isHex(c: i64): bool => isDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+fun isAlpha(c: i64): bool => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+fun isAlnum(c: i64): bool => isAlpha(c) || isDigit(c)
+
+pub fun isCKeyword(w: str): bool {
+    if w == "auto" || w == "break" || w == "case" || w == "char" || w == "const" { ret true }
+    if w == "continue" || w == "default" || w == "do" || w == "double" || w == "else" { ret true }
+    if w == "enum" || w == "extern" || w == "float" || w == "for" || w == "goto" { ret true }
+    if w == "if" || w == "inline" || w == "int" || w == "long" || w == "register" { ret true }
+    if w == "restrict" || w == "return" || w == "short" || w == "signed" || w == "sizeof" { ret true }
+    if w == "static" || w == "struct" || w == "switch" || w == "typedef" || w == "union" { ret true }
+    if w == "unsigned" || w == "void" || w == "volatile" || w == "while" { ret true }
+    if w == "_Bool" || w == "_Complex" || w == "_Imaginary" { ret true }
+    ret false
+}
+
+/// Longest-match punctuation length at `pos`, or 0.
+fun punctLen(src: str, pos: i64): i64 {
+    val n = src.length()
+    if pos + 3 <= n {
+        val t = src.substring(pos, pos + 3)
+        if t == "..." || t == "<<=" || t == ">>=" { ret 3 }
+    }
+    if pos + 2 <= n {
+        val t = src.substring(pos, pos + 2)
+        if t == "->" || t == "++" || t == "--" || t == "<<" || t == ">>" { ret 2 }
+        if t == "<=" || t == ">=" || t == "==" || t == "!=" { ret 2 }
+        if t == "&&" || t == "||" || t == "+=" || t == "-=" { ret 2 }
+        if t == "*=" || t == "/=" || t == "%=" || t == "&=" { ret 2 }
+        if t == "|=" || t == "^=" { ret 2 }
+    }
+    if pos + 1 <= n {
+        val t = src.substring(pos, pos + 1)
+        if t == "{" || t == "}" || t == "(" || t == ")" { ret 1 }
+        if t == "[" || t == "]" || t == ";" || t == "," { ret 1 }
+        if t == "." || t == "&" || t == "*" || t == "+" { ret 1 }
+        if t == "-" || t == "~" || t == "!" || t == "/" { ret 1 }
+        if t == "%" || t == "<" || t == ">" || t == "^" { ret 1 }
+        if t == "|" || t == "?" || t == ":" || t == "=" { ret 1 }
+        if t == "#" { ret 1 }
+    }
+    ret 0
+}
+
+pub class CLexer {
+    var src: str
+    var pos: i64
+    var len: i64
+    var line: i64
+    var col: i64
+    var toks: CTokens
+    var pending_nl: bool
+
+    CLexer(input: str) {
+        self.src = input
+        self.pos = 0
+        self.len = src.length()
+        self.line = 1
+        self.col = 1
+        self.toks = CTokens()
+        self.pending_nl = false
+    }
+
+    fun advance(): void {
+        if self.pos >= self.len { ret }
+        if self.src.at(self.pos) == 10 {
+            self.line = self.line + 1
+            self.col = 1
+        } else {
+            self.col = self.col + 1
+        }
+        self.pos = self.pos + 1
+    }
+
+    fun add(kind: CTokKind, start: i64, l: i64, c: i64): void {
+        self.toks.add(kind, self.src.substring(start, self.pos), l, c, self.pending_nl, start, self.pos)
+        self.pending_nl = false
+    }
+
+    pub fun tokenize(): CTokens {
+        while self.pos < self.len {
+            val ch = self.src.at(self.pos)
+
+            if ch == 10 || ch == 32 || ch == 9 || ch == 13 || ch == 12 || ch == 11 {
+                if ch == 10 { self.pending_nl = true }
+                self.advance()
+                continue
+            }
+
+            if ch == 35 {
+                val start = self.pos
+                val l = self.line
+                val c = self.col
+                while self.pos < self.len {
+                    if self.src.at(self.pos) == 92 && self.pos + 1 < self.len && self.src.at(self.pos + 1) == 10 {
+                        self.advance()
+                        self.advance()
+                        continue
+                    }
+                    if self.src.at(self.pos) == 10 { break }
+                    self.advance()
+                }
+                self.add(CTokKind.Preproc, start, l, c)
+                continue
+            }
+
+            if ch == 47 && self.pos + 1 < self.len && self.src.at(self.pos + 1) == 47 {
+                val start = self.pos
+                val l = self.line
+                val c = self.col
+                while self.pos < self.len && self.src.at(self.pos) != 10 { self.advance() }
+                self.add(CTokKind.Comment, start, l, c)
+                continue
+            }
+            if ch == 47 && self.pos + 1 < self.len && self.src.at(self.pos + 1) == 42 {
+                val start = self.pos
+                val l = self.line
+                val c = self.col
+                var blockNL = false
+                self.advance()
+                self.advance()
+                while self.pos + 1 < self.len && !(self.src.at(self.pos) == 42 && self.src.at(self.pos + 1) == 47) {
+                    if self.src.at(self.pos) == 10 { blockNL = true }
+                    self.advance()
+                }
+                if self.pos + 1 < self.len { self.advance(); self.advance() }
+                self.add(CTokKind.Comment, start, l, c)
+                self.pending_nl = blockNL
+                continue
+            }
+
+            val start = self.pos
+            val l = self.line
+            val c = self.col
+
+            if isAlpha(ch) {
+                while self.pos < self.len && isAlnum(self.src.at(self.pos)) { self.advance() }
+                val text = self.src.substring(start, self.pos)
+                if isCKeyword(text) { self.add(CTokKind.Keyword, start, l, c) }
+                else { self.add(CTokKind.Ident, start, l, c) }
+                continue
+            }
+
+            if isDigit(ch) || (ch == 46 && self.pos + 1 < self.len && isDigit(self.src.at(self.pos + 1))) {
+                var isFloat = false
+                if ch == 48 && self.pos + 1 < self.len && (self.src.at(self.pos + 1) == 120 || self.src.at(self.pos + 1) == 88) {
+                    self.advance()
+                    self.advance()
+                    while self.pos < self.len && isHex(self.src.at(self.pos)) { self.advance() }
+                } else {
+                    while self.pos < self.len && (isDigit(self.src.at(self.pos)) || self.src.at(self.pos) == 46) {
+                        if self.src.at(self.pos) == 46 { isFloat = true }
+                        self.advance()
+                    }
+                    if self.pos < self.len && (self.src.at(self.pos) == 101 || self.src.at(self.pos) == 69) {
+                        isFloat = true
+                        self.advance()
+                        if self.pos < self.len && (self.src.at(self.pos) == 43 || self.src.at(self.pos) == 45) { self.advance() }
+                        while self.pos < self.len && isDigit(self.src.at(self.pos)) { self.advance() }
+                    }
+                }
+                while self.pos < self.len {
+                    val sc = self.src.at(self.pos)
+                    if sc == 102 || sc == 70 || sc == 108 || sc == 76 || sc == 117 || sc == 85 { self.advance() }
+                    else { break }
+                }
+                if isFloat { self.add(CTokKind.FloatLit, start, l, c) }
+                else { self.add(CTokKind.IntLit, start, l, c) }
+                continue
+            }
+
+            if ch == 34 || ch == 39 {
+                val quote = ch
+                self.advance()
+                while self.pos < self.len {
+                    if self.src.at(self.pos) == 92 && self.pos + 1 < self.len {
+                        self.advance()
+                        self.advance()
+                        continue
+                    }
+                    if self.src.at(self.pos) == quote { self.advance(); break }
+                    if self.src.at(self.pos) == 10 { break }
+                    self.advance()
+                }
+                if quote == 34 { self.add(CTokKind.StringLit, start, l, c) }
+                else { self.add(CTokKind.CharLit, start, l, c) }
+                continue
+            }
+
+            val pl = punctLen(self.src, self.pos)
+            if pl > 0 {
+                var k: i64 = 0
+                while k < pl { self.advance(); k = k + 1 }
+                self.add(CTokKind.Punct, start, l, c)
+                continue
+            }
+
+            self.advance()
+            self.add(CTokKind.Unknown, start, l, c)
+        }
+        self.toks.add(CTokKind.Eof, "", self.line, self.col, self.pending_nl, self.pos, self.pos)
+        ret self.toks
+    }
+}
+
+pub fun lexC(src: str): CTokens => CLexer(src).tokenize()

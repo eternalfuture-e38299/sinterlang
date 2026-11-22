@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: shared "element action" mnemonics for generic containers
+//
+// This layer is not an API for direct human use, but a **compile-time dispatch table**.
+//
+// Containers are written once as generic definitions (`List<T>` / `Map<K, V>` /
+// `HashMap<K, V>` / `Box<T>`), and the compiler monomorphizes them before semantic
+// analysis: `List<str>` → `List_str`, `Map<str, i64>` → `Map_str_i64`. The
+// monomorphized class bodies still contain bare calls that "dispatch on T":
+//
+//     sinter_gen_clone(v)          // str uses sinter_string_clone, i64 is assigned directly
+//     sinter_gen_grow(data, cap)   // realloc according to the element type
+//     sinter_gen_hash(key)         // str uses FNV-1a 64
+//     sinter_gen_cmp(a, b)         // str uses lexicographic order
+//     sinter_gen_blank()           // str → empty string, i64 → 0
+//     sinter_gen_text(v)           // str → the string itself (cloned), i64 → decimal
+//
+// During code generation, the type arguments at the end of the instance name (the
+// `_str` in `List_str`) reduce the bare calls to concrete function names
+// (`sinter_gen_clone_str`), so the runtime has no switch and no function pointer
+// table. The whitelist of reduction family names lives in
+// `src/backend/codegen_types.cpp`:
+//
+//     sinter_gen_clone  free  drop  grow  hash  cmp  blank  text  cmp
+//
+// This module provides the **C implementations of the `sinter_gen_*` suffix
+// families**, plus three plain helpers that are not reduction families and only
+// do "text concatenation / literals":
+//
+//     sinter_gen_join_text(a, b)   concatenate two texts, taking ownership of both
+//     sinter_gen_eq_text()         "="
+//     sinter_gen_sb_*              text builder (used by container toString)
+//
+// Why not write one copy per container module: the five containers (box / pair /
+// list / map / hashmap) each declaring these `static` functions in their own
+// `embed C` would collide as redefinitions inside the **same C translation
+// unit**. Centralizing them here lets containers just import this module (an
+// import only brings symbols, it does not duplicate definitions: a same-named
+// static inline on the C side is kept once per TU).
+//
+// Relation to `std.string`: `sinter_gen_hash_str` and `str.hashCode()` use the
+// same algorithm (FNV-1a 64), so "a hash the user computes" and "container
+// placement" always agree.
+module std.generic
+import std.core
+
+embed C header {
+    #include <stdio.h>
+    #include <string.h>
+
+
+    /* This block appears in both the module's .c and .h: defining it once is
+       enough, otherwise the .c that "includes its own header, then expands the
+       body" would collide as a redefinition. */
+    #ifndef SINTER_GEN_SHARED_DEFS
+    #define SINTER_GEN_SHARED_DEFS
+    typedef __SIZE_TYPE__ std_gen_size_t;
+
+    /* ================================================================
+       Clone: containers always deep-copy when taking ownership of an argument
+       ================================================================ */
+    static inline int64_t sinter_gen_clone_i64(int64_t v) { return v; }
+    static inline double sinter_gen_clone_f64(double v) { return v; }
+    static inline uint8_t sinter_gen_clone_bool(uint8_t v) { return v; }
+    static inline uint8_t sinter_gen_clone_u8(uint8_t v) { return v; }
+    static inline sinter_string sinter_gen_clone_str(sinter_string v) {
+        return sinter_string_clone(v);
+    }
+
+    /* ================================================================
+       Release: free returns the type's empty value, drop only releases
+       ================================================================ */
+    static inline int64_t sinter_gen_free_i64(int64_t v) { (void)v; return 0; }
+    static inline double sinter_gen_free_f64(double v) { (void)v; return 0.0; }
+    static inline uint8_t sinter_gen_free_bool(uint8_t v) { (void)v; return (uint8_t)0; }
+    static inline uint8_t sinter_gen_free_u8(uint8_t v) { (void)v; return (uint8_t)0; }
+    static inline sinter_string sinter_gen_free_str(sinter_string v) {
+        sinter_string_free(v);
+        return sinter_string_from_buf("", 0);
+    }
+
+    static inline void sinter_gen_drop_i64(int64_t v) { (void)v; }
+    static inline void sinter_gen_drop_f64(double v) { (void)v; }
+    static inline void sinter_gen_drop_bool(uint8_t v) { (void)v; }
+    static inline void sinter_gen_drop_u8(uint8_t v) { (void)v; }
+    static inline void sinter_gen_drop_str(sinter_string v) { sinter_string_free(v); }
+
+    /* ================================================================
+       Buffer growth
+       ================================================================ */
+    static inline int64_t* sinter_gen_grow_i64(int64_t* p, int64_t cap) {
+        if (cap <= 0) return 0;
+        return (int64_t*)realloc(p, (std_gen_size_t)cap * sizeof(int64_t));
+    }
+    static inline double* sinter_gen_grow_f64(double* p, int64_t cap) {
+        if (cap <= 0) return 0;
+        return (double*)realloc(p, (std_gen_size_t)cap * sizeof(double));
+    }
+    static inline uint8_t* sinter_gen_grow_u8(uint8_t* p, int64_t cap) {
+        if (cap <= 0) return 0;
+        return (uint8_t*)realloc(p, (std_gen_size_t)cap * sizeof(uint8_t));
+    }
+    static inline sinter_string* sinter_gen_grow_str(sinter_string* p, int64_t cap) {
+        if (cap <= 0) return 0;
+        return (sinter_string*)realloc(p, (std_gen_size_t)cap * sizeof(sinter_string));
+    }
+
+    /* ================================================================
+       Hashing: same source as std.string's str.hashCode()
+       ================================================================ */
+    /* FNV-1a 64. `std.string`'s sinter_str_hash matches these numbers exactly;
+       any change on either side must be mirrored (container placement depends on it). */
+    static inline uint64_t sinter_gen_hash_str(sinter_string s) {
+        uint64_t h = 1469598103934665603ULL;   /* FNV offset basis */
+        if (!s.data) return h;
+        for (int64_t i = 0; i < s.len; ++i) {
+            h ^= (uint64_t)(unsigned char)s.data[i];
+            h *= 1099511628211ULL;             /* FNV prime */
+        }
+        return h;
+    }
+
+    /* Integers: splitmix64 mixing step, so consecutive small integers do not
+       map straight to consecutive buckets. */
+    static inline uint64_t sinter_gen_hash_i64(int64_t v) {
+        uint64_t x = (uint64_t)v;
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        return x;
+    }
+    static inline uint64_t sinter_gen_hash_u8(uint8_t v) {
+        return sinter_gen_hash_i64((int64_t)v);
+    }
+    static inline uint64_t sinter_gen_hash_bool(uint8_t v) {
+        return sinter_gen_hash_i64((int64_t)v);
+    }
+    static inline uint64_t sinter_gen_hash_f64(double v) {
+        /* Float bits go into the integer hash: -0.0 and 0.0 normalize to the same key */
+        uint64_t bits = 0;
+        if (v != v) bits = 0x7ff8000000000000ULL;      /* all NaNs share a bucket */
+        else if (v == 0.0) bits = 0;
+        else memcpy(&bits, &v, sizeof(bits));
+        return sinter_gen_hash_i64((int64_t)bits);
+    }
+
+    /* ================================================================
+       Ordered key comparison
+       ================================================================ */
+    static inline int64_t sinter_gen_cmp_i64(int64_t a, int64_t b) {
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+    static inline int64_t sinter_gen_cmp_u8(uint8_t a, uint8_t b) {
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+    static inline int64_t sinter_gen_cmp_f64(double a, double b) {
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+    static inline int64_t sinter_gen_cmp_bool(uint8_t a, uint8_t b) {
+        return a < b ? -1 : (a > b ? 1 : 0);
+    }
+    static inline int64_t sinter_gen_cmp_str(sinter_string a, sinter_string b) {
+        return (int64_t)sinter_string_compare(a, b);
+    }
+
+    /* ================================================================
+       Packing probe results: low 32 bits are the slot, high 32 bits are the hit flag
+       (Sinter does not support `&x` out-parameters, so two values are returned at once)
+       ================================================================ */
+    static inline int64_t sinter_gen_pack(int64_t slot, int64_t hit) {
+        return (int64_t)((uint64_t)(uint32_t)slot | ((uint64_t)(hit ? 1u : 0u) << 32));
+    }
+    static inline int64_t sinter_gen_slot(int64_t packed) {
+        return (int64_t)(uint32_t)((uint64_t)packed & 0xffffffffull);
+    }
+    static inline int64_t sinter_gen_hit(int64_t packed) {
+        return (int64_t)(((uint64_t)packed >> 32) & 1ull);
+    }
+
+    /* Map a hash value to a slot in [0, mask]; the probe chain's next slot (wraps around). */
+    static inline int64_t sinter_gen_slot_of(uint64_t h, int64_t mask) {
+        return (int64_t)(h & (uint64_t)mask);
+    }
+    static inline int64_t sinter_gen_next_slot(int64_t at, int64_t mask) {
+        return (at + 1) & mask;
+    }
+
+    /* ================================================================
+       Empty values: numbers are 0, str is the empty string (dispatch on T picks which)
+       ================================================================ */
+    static inline int64_t sinter_gen_blank_i64(void) { return 0; }
+    static inline double sinter_gen_blank_f64(void) { return 0.0; }
+    static inline uint8_t sinter_gen_blank_bool(void) { return (uint8_t)0; }
+    static inline uint8_t sinter_gen_blank_u8(void) { return (uint8_t)0; }
+    static inline sinter_string sinter_gen_blank_str(void) {
+        return sinter_string_from_buf("", 0);
+    }
+
+    /* ================================================================
+       Text form: the clearest display of string specialization
+       `Box<str>.describe()` gets the string itself, `Box<i64>.describe()` gets a
+       decimal number — the same generic method reduces to different functions at
+       compile time.
+       ================================================================ */
+    static inline sinter_string sinter_gen_text_str(sinter_string v) {
+        return sinter_string_clone(v);   /* clone: caller frees it, internal pointer must not escape */
+    }
+    static inline sinter_string sinter_gen_text_i64(int64_t v) {
+        return sinter_string_from_int(v);
+    }
+    static inline sinter_string sinter_gen_text_u8(uint8_t v) {
+        return sinter_string_from_int((int64_t)v);
+    }
+    static inline sinter_string sinter_gen_text_bool(uint8_t v) {
+        return sinter_string_from_literal(v ? "true" : "false", v ? 4 : 5);
+    }
+    static inline sinter_string sinter_gen_text_f64(double v) {
+        return sinter_string_from_num(v);
+    }
+
+    /* Concatenate two texts. **Borrowing** semantics: neither argument is freed,
+       a new string is returned. The name **must not** be `sinter_gen_text_join`:
+       that would be caught by the `sinter_gen_text` dispatch-family prefix and
+       reduced to the nonexistent `sinter_gen_text_join_str`.
+
+       Why not `concat_own`: in the nested call `f(g(a), b)`, no variable in the
+       inner call holds its result, so taking ownership here would leak
+       immediately; and the outer argument is a compiler-hoisted temporary that is
+       freed again at the end of the statement — if the inner call already freed
+       it, that is a double free (segfaults in practice). Borrowing avoids both
+       pitfalls: the temporary declared at the call site is cleaned up by RAII. */
+    static inline sinter_string sinter_gen_join_text(sinter_string a, sinter_string b) {
+        return sinter_string_concat(a, b);
+    }
+
+    /* Separator / equals sign (used by `Pair.toText()` and container toString) */
+    static inline sinter_string sinter_gen_eq_text(void) {
+        return sinter_string_from_literal("=", 1);
+    }
+
+    /* ================================================================
+       Text builder (used by container toString)
+       ================================================================
+       Why not accumulate in local variables on the Sinter side:
+       `out = sinter_gen_join_text(out, x)` goes through sinter_string_concat_own,
+       which frees both sides; the following assignment then goes through
+       sinter_string_assign, which frees the target first. The same buffer gets
+       freed twice and the runtime segfaults. So accumulation happens in C, and the
+       Sinter side only holds an opaque handle. */
+    typedef struct {
+        char* p;
+        int64_t n;
+        int64_t cap;
+    } sinter_gen_sb;
+
+    static inline uint8_t* sinter_gen_sb_new(void) {
+        sinter_gen_sb* b = (sinter_gen_sb*)malloc(sizeof(sinter_gen_sb));
+        if (!b) return NULL;
+        b->p = NULL;
+        b->n = 0;
+        b->cap = 0;
+        return (uint8_t*)b;
+    }
+
+    static void sinter_gen_sb_put(sinter_gen_sb* b, const char* s, int64_t n) {
+        if (!b || n <= 0) return;
+        if (b->n + n + 1 > b->cap) {
+            int64_t nc = b->cap ? b->cap : 32;
+            while (nc < b->n + n + 1) nc *= 2;
+            char* np = (char*)realloc(b->p, (std_gen_size_t)nc);
+            if (!np) return;
+            b->p = np;
+            b->cap = nc;
+        }
+        memcpy(b->p + b->n, s, (std_gen_size_t)n);
+        b->n += n;
+        b->p[b->n] = 0;
+    }
+
+    static void sinter_gen_sb_append_text(uint8_t* h, sinter_string v) {
+        if (v.data && v.len > 0)
+            sinter_gen_sb_put((sinter_gen_sb*)h, v.data, v.len);
+    }
+
+
+    /* which: 0 '[' / 1 ']' / 2 '{' / 3 '}' / 4 ", " / 5 "=" */
+    static void sinter_gen_sb_mark(uint8_t* h, int64_t which) {
+        sinter_gen_sb* b = (sinter_gen_sb*)h;
+        if (which == 0) sinter_gen_sb_put(b, "[", 1);
+        else if (which == 1) sinter_gen_sb_put(b, "]", 1);
+        else if (which == 2) sinter_gen_sb_put(b, "{", 1);
+        else if (which == 3) sinter_gen_sb_put(b, "}", 1);
+        else if (which == 4) sinter_gen_sb_put(b, ", ", 2);
+        else sinter_gen_sb_put(b, "=", 1);
+    }
+
+    static inline sinter_string sinter_gen_sb_finish(uint8_t* h) {
+        sinter_gen_sb* b = (sinter_gen_sb*)h;
+        sinter_string out = sinter_string_from_buf(b && b->p ? b->p : "", b ? b->n : 0);
+        if (b) {
+            free(b->p);
+            free(b);
+        }
+        return out;
+    }
+
+    /* Element text append: the function name falls in the `sinter_gen_text` dispatch
+       family and reduces on T to `sinter_gen_text_sb_item_str` / `_i64` / `_f64` /
+       `_u8` / `_bool`. */
+    static void sinter_gen_text_sb_item_str(uint8_t* h, const sinter_string* data, int64_t i) {
+        sinter_gen_sb* b = (sinter_gen_sb*)h;
+        const sinter_string v = data[i];
+        if (v.data && v.len > 0) sinter_gen_sb_put(b, v.data, v.len);
+    }
+    static void sinter_gen_text_sb_item_i64(uint8_t* h, const int64_t* data, int64_t i) {
+        char t[32];
+        const int n = snprintf(t, sizeof(t), "%lld", (long long)data[i]);
+        if (n > 0) sinter_gen_sb_put((sinter_gen_sb*)h, t, (int64_t)n);
+    }
+    static void sinter_gen_text_sb_item_u8(uint8_t* h, const uint8_t* data, int64_t i) {
+        char t[32];
+        const int n = snprintf(t, sizeof(t), "%lld", (long long)data[i]);
+        if (n > 0) sinter_gen_sb_put((sinter_gen_sb*)h, t, (int64_t)n);
+    }
+    static void sinter_gen_text_sb_item_bool(uint8_t* h, const uint8_t* data, int64_t i) {
+        if (data[i]) sinter_gen_sb_put((sinter_gen_sb*)h, "true", 4);
+        else sinter_gen_sb_put((sinter_gen_sb*)h, "false", 5);
+    }
+    static void sinter_gen_text_sb_item_f64(uint8_t* h, const double* data, int64_t i) {
+        char t[64];
+        const int n = snprintf(t, sizeof(t), "%g", data[i]);
+        if (n > 0) sinter_gen_sb_put((sinter_gen_sb*)h, t, (int64_t)n);
+    }
+    #endif /* SINTER_GEN_SHARED_DEFS */
+}

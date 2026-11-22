@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: sets (Set)
+//
+// HashSet semantics built on std.hashmap: unique elements, O(1) average lookup.
+// Generic containers currently only accept built-in types / str arguments, so two concrete types are provided: StrSet and IntSet.
+module std.set
+
+import std
+import std.hashmap
+
+pub class StrSet {
+    var inner: HashMap<str, i64>
+
+    StrSet() { self.inner = HashMap<str, i64>() }
+
+    pub fun add(v: str): void => self.inner.put(v, 1)
+    pub fun contains(v: str): bool => self.inner.containsKey(v)
+    pub fun remove(v: str): void => self.inner.remove(v)
+    pub fun size(): i64 => self.inner.size()
+    pub fun isEmpty(): bool => self.size() == 0
+    pub fun clear(): void => self.inner.clear()
+    pub override fun toString(): str => self.inner.toString()
+}
+
+pub class IntSet {
+    var inner: HashMap<i64, i64>
+
+    IntSet() { self.inner = HashMap<i64, i64>() }
+
+    pub fun add(v: i64): void => self.inner.put(v, 1)
+    pub fun contains(v: i64): bool => self.inner.containsKey(v)
+    pub fun remove(v: i64): void => self.inner.remove(v)
+    pub fun size(): i64 => self.inner.size()
+    pub fun isEmpty(): bool => self.size() == 0
+    pub fun clear(): void => self.inner.clear()
+    pub override fun toString(): str => self.inner.toString()
+}

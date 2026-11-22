@@ -1,0 +1,15 @@
+[package]
+name = "sfmt"
+version = "file:../../version.txt"
+entry = "src/sfmt.sinter"
+description = "Self-hosted Sinter source formatter"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_sfmt"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+[build]
+opt = "2"

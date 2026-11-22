@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+module std
+
+import std.file
+import std.filesystem
+import std.hashmap
+import std.string
+import std.core
+import std.path
+import std.stream
+import std.list
+import std.map
+
+embed C {
+    #include <stdio.h>
+    #include <stdlib.h>
+    #ifdef _WIN32
+    #include <io.h>
+    #define write _write
+    #else
+    #include <unistd.h>
+    #endif
+    typedef __SIZE_TYPE__ std_size_t;
+    typedef __PTRDIFF_TYPE__ std_ssize_t;
+
+    static inline void sinter_out_str(sinter_string s, int fd) {
+        if (s.data && s.len > 0) write(fd, s.data, (std_size_t)s.len);
+    }
+
+    /* Runtime error: fail-fast by default. Message and source location are written straight to stderr, then abort(). */
+    static inline void sinter_panic(sinter_string msg) {
+        fputs("panic: ", stderr);
+        if (msg.data && msg.len > 0) fwrite(msg.data, 1, (size_t)msg.len, stderr);
+        fputc('\n', stderr);
+        sinter_backtrace();
+        fflush(stderr);
+        abort();
+    }
+
+    static inline void sinter_assert(int64_t cond, sinter_string msg) {
+        if (!cond) sinter_panic(msg);
+    }
+
+    static inline void sinter_out_char(char ch, int fd) { write(fd, &ch, 1); }
+
+    static inline void sinter_out_int(int64_t v, int fd) {
+        sinter_string t = sinter_string_from_int(v);
+        sinter_out_str(t, fd);
+        sinter_string_free(t);
+    }
+
+    static inline void sinter_out_float(double v, int fd) {
+        sinter_string t = sinter_string_from_num(v);
+        sinter_out_str(t, fd);
+        sinter_string_free(t);
+    }
+
+    static inline void sinter_out_bool(uint8_t v, int fd) {
+        sinter_out_str(sinter_string_from_literal(v ? "true" : "false", v ? 4 : 5), fd);
+    }
+
+    static inline void sinter_print(const char* s) {
+        if (!s) return;
+        int64_t n = 0;
+        while (s[n]) n++;
+        write(1, s, (std_size_t)n);
+    }
+
+    static inline void sinter_println(const char* s) {
+        sinter_print(s);
+        sinter_out_char('\n', 1);
+    }
+
+    static inline void sinter_println_int(int64_t v) {
+        sinter_out_int(v, 1);
+        sinter_out_char('\n', 1);
+    }
+
+    static inline void sinter_println_float(double v) {
+        sinter_out_float(v, 1);
+        sinter_out_char('\n', 1);
+    }
+
+    static inline void sinter_println_bool(uint8_t v) {
+        sinter_out_bool(v, 1);
+        sinter_out_char('\n', 1);
+    }
+
+    static inline void sinter_print_str(sinter_string s) { sinter_out_str(s, 1); }
+
+    static inline void sinter_println_str(sinter_string s) {
+        sinter_out_str(s, 1);
+        sinter_out_char('\n', 1);
+    }
+
+    static inline void sinter_eprintln_str(sinter_string s) {
+        sinter_out_str(s, 2);
+        sinter_out_char('\n', 2);
+    }
+
+    static inline void sinter_print_cstr(const char* s) { sinter_print(s); }
+    static inline void sinter_println_cstr(const char* s) { sinter_println(s); }
+
+    static inline int64_t sinter_int_min(int64_t a, int64_t b) { return a < b ? a : b; }
+    static inline int64_t sinter_int_max(int64_t a, int64_t b) { return a > b ? a : b; }
+    static inline int64_t sinter_int_abs(int64_t x) { return x < 0 ? -x : x; }
+    static inline int64_t sinter_int_clamp(int64_t x, int64_t lo, int64_t hi) {
+        return x < lo ? lo : (x > hi ? hi : x);
+    }
+
+    double round(double);
+    static inline double sinter_sqrt(double x) { return sqrt(x); }
+    static inline double sinter_pow(double x, double y) { return pow(x, y); }
+    static inline double sinter_floor(double x) { return floor(x); }
+    static inline double sinter_ceil(double x) { return ceil(x); }
+    static inline double sinter_round(double x) { return round(x); }
+}
+
+pub {
+        pub fun println[std_println_int](v: i64): void { sinter_println_int(v) }
+        pub fun println[std_println_float](v: f64): void { sinter_println_float(v) }
+        pub fun println[std_println_bool](v: bool): void { sinter_println_bool(v) }
+        pub fun println[std_println_cstr](s: cstr): void { sinter_println_cstr(s) }
+        pub fun println[std_println_any](v: Any): void { sinter_println_str(v.toString()) }
+        pub fun println[std_println_str](s: str): void { sinter_println_str(s) }
+        pub fun eprintln[std_eprintln_str](s: str): void { sinter_eprintln_str(s) }
+
+        // Compat with the old API: early 1.0 used printlnInt / printlnFloat / printlnBool / printlnAny.
+        // New code should use the println overloads; the old names remain so existing projects need no changes.
+        pub fun printlnInt[std_println_int_compat](v: i64): void => println(v)
+        pub fun printlnFloat[std_println_float_compat](v: f64): void => println(v)
+        pub fun printlnBool[std_println_bool_compat](v: bool): void => println(v)
+        pub fun printlnAny[std_println_any_compat](v: Any): void => println(v.toString())
+
+        /// Runtime error: prints `panic: message` then aborts.
+        pub fun panic(message: str): void => sinter_panic(message)
+        /// Panics when the condition fails; no-op when it passes.
+        pub fun assert(cond: bool, message: str): void => sinter_assert(cond ? 1 : 0, message)
+
+        pub fun print[std_print_cstr](s: cstr): void { sinter_print_cstr(s) }
+        pub fun print[std_print_str](s: str): void { sinter_print_str(s) }
+
+        pub fun sqrt(x: f64): f64 => sinter_sqrt(x)
+        pub fun pow(x: f64, y: f64): f64 => sinter_pow(x, y)
+        pub fun floor(x: f64): f64 => sinter_floor(x)
+        pub fun ceil(x: f64): f64 => sinter_ceil(x)
+        pub fun round(x: f64): f64 => sinter_round(x)
+        pub fun PI(): f64 => 3.14159265358979323846
+
+        pub fun minOf(a: i64, b: i64): i64 => sinter_int_min(a, b)
+        pub fun maxOf(a: i64, b: i64): i64 => sinter_int_max(a, b)
+        pub fun abs(x: i64): i64 => sinter_int_abs(x)
+        pub fun coerceIn(x: i64, lo: i64, hi: i64): i64 => sinter_int_clamp(x, lo, hi)
+}

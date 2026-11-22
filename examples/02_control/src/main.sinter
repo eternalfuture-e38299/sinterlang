@@ -1,0 +1,69 @@
+// 02 —— 控制流 / Control flow
+module control
+import std
+
+enum Color { Red, Green, Blue }
+
+fun colorName(c: Color): str {
+    var name = "blue"
+    when (c) {
+        Color.Red => { name = "red" }
+        Color.Green => { name = "green" }
+        else => { name = "blue" }
+    }
+    ret name
+}
+
+fun main(): void {
+    val n = 7
+    if (n % 2 == 0) {
+        println("even")
+    } else if (n > 5) {
+        println("odd and big")
+    } else {
+        println("odd and small")
+    }
+
+    var label = "non-positive"
+    if (n > 0) { label = "positive" }
+    println(label)
+
+    var i = 0
+    var total = 0
+    while (i < 5) {
+        total = total + i
+        i = i + 1
+    }
+    println(total)
+
+    var k = 0
+    while (true) {
+        k = k + 1
+        if (k > 100) { break }
+        if (k % 7 != 0) { continue }
+        println(k)
+        break
+    }
+
+    // 区间是闭区间；要表达「小于 n」就写到 n - 1。
+    var sum1 = 0
+    for (x in 0..5) { sum1 = sum1 + x }
+    println(sum1)
+
+    var sum2 = 0
+    for (x in 0..4) { sum2 = sum2 + x }
+    println(sum2)
+
+    for (v in 0..3) {
+        var tag = "many"
+        when (v) {
+            0 => { tag = "zero" }
+            1 => { tag = "one" }
+            else => { tag = "many" }
+        }
+        println("${v} -> ${tag}")
+    }
+
+    println(colorName(Color.Red))
+    println(colorName(Color.Green))
+}

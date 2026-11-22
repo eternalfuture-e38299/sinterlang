@@ -1,0 +1,13 @@
+[package]
+name = "cstd"
+version = "0.1.0"
+entry = "src/main.sinter"
+
+# 目标 C 标准：严格 C17（不带 GNU 扩展）。
+# 这个用例把 [build] cstd 这条配置路径钉在回归里：
+# assert_gen.txt 会断言生成的 CMakeLists.txt 里确实写的是 17 + extensions OFF。
+[build]
+cstd = "c17"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }

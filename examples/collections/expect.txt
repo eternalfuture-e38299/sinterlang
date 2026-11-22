@@ -1,0 +1,52 @@
+== box ==
+get=boxed
+set=rebound
+int=7
+blank_box_len=0
+describe_str=rebound
+describe_num=7
+== pair ==
+p=count/42
+q=1/one
+p2=43
+to_text=count=43
+swap=43/count
+== list_str ==
+len=3 first=alpha last=gamma
+idx=2 has_beta=1
+pop=gamma len=2
+at0=omega len=3
+set1=ALPHA
+cleared=0
+== list_i64 ==
+sum=12 idx4=1
+== array_i64 ==
+raw=[3, 1, 2]
+sorted=[1, 2, 3] sum=6 has2=1
+rev=[3, 2, 1] idx1=2
+copy_filled=[9, 9, 9] src=[3, 2, 1]
+== array_str ==
+raw=[pear, apple, fig]
+sorted=[apple, fig, pear] idx=1
+filled=[z, z]
+== map_str ==
+len=4 alpha=1 miss=-1
+k0=alpha k3=delta all={alpha=1, bravo=2, charlie=3, delta=4}
+del=2 len=3 has=0
+== hashmap_str ==
+len=3 two=2 miss=-1
+update=22
+del=1 len=2 has=0
+== hash ==
+eq=1
+ne=0
+slot_in_range=1 slot=13
+own_bucket=1
+== consts ==
+i64max=9223372036854775807 i32max=2147483647 bits=64
+u32max=4294967295
+== intarray ==
+sorted=[3, 5, 9] sum=17 type=Array
+== bytarray ==
+sorted=[4, 7, 9] sum=20 has4=1
+== done ==

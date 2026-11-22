@@ -1,0 +1,11 @@
+module result
+import std
+import std.result
+
+fun main(): void {
+    println(okInt(5).expect("bad"))
+    println(errInt("nope").getOr(-1))
+    println(okStr("hi").expect("bad"))
+    println(errStr("boom").errorOr("fallback"))
+    assert(1 == 1, "ok")
+}

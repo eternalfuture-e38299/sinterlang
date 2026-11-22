@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: `List<T>` — dynamic array
+//
+// Three strongly-typed fields internally (data pointer / element count / capacity),
+// no `*void` black box: `List<str>` is `sinter_string* data`, `List<i64>` is
+// `int64_t* data`; growth size, element copy and release are all specialized on T
+// (see `std.generic`).
+//
+//     import std.list
+//
+//     val xs = List<str>()
+//     xs.add("a"); xs.add("b")
+//     println(xs.toString())    // [a, b]
+//     println(xs.get(1))        // b
+module std.list
+import std.core
+import std.generic
+
+/// Dynamic array. The container is itself an object:
+/// it extends `Any`, `toString()` prints `[a, b]` and `typeLabel()` prints `List`.
+pub class List<T> : Any {
+    var data: *T
+    var cnt: i64
+    var cap: i64
+
+    List() {
+        self.data = null
+        self.cnt = 0
+        self.cap = 0
+    }
+
+    ~List() {
+        self.clear()
+        free(self.data)
+        self.data = null
+        self.cnt = 0
+        self.cap = 0
+    }
+
+    pub fun typeLabel(): str => "List"
+
+    /// Modern-style `[a, b, c]`. Element text is dispatched on T (`sinter_gen_text`),
+    /// so `List<i64>` prints numbers and `List<str>` prints the raw strings.
+    pub fun toString(): str {
+        val sb: *u8 = sinter_gen_sb_new()
+        sinter_gen_sb_mark(sb, 0)
+        var i: i64 = 0
+        while (i < self.cnt) {
+            if (i > 0) { sinter_gen_sb_mark(sb, 4) }
+            val t: str = sinter_gen_text(self.data[i])
+            sinter_gen_sb_append_text(sb, t)
+            i = i + 1
+        }
+        sinter_gen_sb_mark(sb, 1)
+        return sinter_gen_sb_finish(sb)
+    }
+
+    pub fun size(): i64 => self.cnt
+    pub fun capacity(): i64 => self.cap
+    pub fun isEmpty(): bool => self.cnt == 0
+
+    /// Grow to hold at least need elements. The element type comes from T, and growth is dispatched on T.
+    pub fun reserve(need: i64): void {
+        if (need <= self.cap) { return }
+        var next: i64 = self.cap
+        if (next < 8) { next = 8 }
+        while (next < need) { next = next * 2 }
+        val grown: *T = sinter_gen_grow(self.data, next)
+        if (grown == null) { return }
+        self.data = grown
+        self.cap = next
+    }
+
+    /// Append (deep copy of the element: str is cloned, numeric types are assigned directly)
+    pub fun add(v: T): void {
+        self.reserve(self.cnt + 1)
+        if (self.cnt >= self.cap) { return }
+        self.data[self.cnt] = sinter_gen_clone(v)
+        self.cnt = self.cnt + 1
+    }
+
+    /// Get by index (out of range returns the blank value of that type)
+    pub fun get(i: i64): T {
+        if (i < 0 || i >= self.cnt) { return self.blank() }
+        return sinter_gen_clone(self.data[i])
+    }
+
+    pub fun getOr(i: i64, fallback: T): T {
+        if (i < 0 || i >= self.cnt) { return fallback }
+        return sinter_gen_clone(self.data[i])
+    }
+
+    /// Element at the index (equivalent to `get`: returns a clone, the caller owns it).
+    /// Deliberately **not** a zero-copy reference — Sinter frees statement-level
+    /// temporary strings at the end of the statement, so returning an internal
+    /// pointer would free the container's own buffer as soon as the caller uses it.
+    pub fun at(i: i64): T => self.get(i)
+
+    pub fun set(i: i64, v: T): void {
+        if (i < 0 || i >= self.cnt) { return }
+        self.data[i] = sinter_gen_clone(v)
+    }
+
+    /// Index of the first occurrence; -1 if not found. Comparison is dispatched on T (str uses string comparison).
+    pub fun indexOf(v: T): i64 {
+        var i: i64 = 0
+        while (i < self.cnt) {
+            if (sinter_gen_cmp(self.data[i], v) == 0) { return i }
+            i = i + 1
+        }
+        return -1
+    }
+
+    pub fun contains(v: T): bool => self.indexOf(v) >= 0
+
+    pub fun removeLast(): T {
+        if (self.cnt <= 0) { return self.blank() }
+        self.cnt = self.cnt - 1
+        val v: T = sinter_gen_clone(self.data[self.cnt])
+        sinter_gen_drop(self.data[self.cnt])
+        self.data[self.cnt] = sinter_gen_blank()
+        return v
+    }
+
+    pub fun first(): T => self.get(0)
+
+    pub fun last(): T {
+        if (self.cnt <= 0) { return self.blank() }
+        return sinter_gen_clone(self.data[self.cnt - 1])
+    }
+
+    pub fun addAt(at: i64, v: T): void {
+        var pos: i64 = at
+        if (pos < 0) { pos = 0 }
+        if (pos > self.cnt) { pos = self.cnt }
+        self.reserve(self.cnt + 1)
+        if (self.cnt >= self.cap) { return }
+        var k: i64 = self.cnt
+        while (k > pos) {
+            self.data[k] = self.data[k - 1]
+            k = k - 1
+        }
+        self.data[pos] = sinter_gen_clone(v)
+        self.cnt = self.cnt + 1
+    }
+
+    pub fun removeAt(i: i64): T {
+        if (i < 0 || i >= self.cnt) { return self.blank() }
+        val old: T = sinter_gen_clone(self.data[i])
+        var k: i64 = i
+        while (k + 1 < self.cnt) {
+            self.data[k] = self.data[k + 1]
+            k = k + 1
+        }
+        self.cnt = self.cnt - 1
+        sinter_gen_drop(self.data[self.cnt])
+        self.data[self.cnt] = sinter_gen_blank()
+        return old
+    }
+
+    /// Clear (return each element's ownership, keep the buffer)
+    pub fun clear(): void {
+        var i: i64 = 0
+        while (i < self.cnt) {
+            sinter_gen_drop(self.data[i])
+            i = i + 1
+        }
+        self.cnt = 0
+    }
+
+    /// The "blank value" for this type
+    pub fun blank(): T => sinter_gen_blank()
+
+    /// Hand the element out directly (transfers ownership, caller must free it)
+    pub fun takeAt(i: i64): T {
+        if (i < 0 || i >= self.cnt) { return self.blank() }
+        return self.data[i]
+    }
+}

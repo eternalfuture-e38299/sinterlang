@@ -1,0 +1,11 @@
+// Runtime bridge used to keep the long-lived LSP process stable on top of
+// the current cleanup-stack implementation.
+module rt
+
+embed C {
+extern int sinter_cleanup_depth(void);
+extern void sinter_cleanup_reset(void);
+}
+
+pub fun cleanupDepth(): i64 => sinter_cleanup_depth()
+pub fun resetCleanup(): void => sinter_cleanup_reset()

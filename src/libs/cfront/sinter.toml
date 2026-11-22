@@ -1,0 +1,15 @@
+[package]
+name = "cfront"
+version = "file:../../version.txt"
+entry = "src/cfront.sinter"
+description = "Self-hosted C99 lexer, parser and C formatter"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_cfront"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+[build]
+opt = "2"

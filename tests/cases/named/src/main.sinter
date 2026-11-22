@@ -1,0 +1,16 @@
+module named
+import std
+
+fun intro(name: str, age: i64 = 18, city: str = "unknown"): str => name + "/" + city
+
+class P(val a: i64, val b: i64 = 2, val c: i64 = 3) {
+    fun show(x: i64 = 10, y: str = "d"): str => y
+}
+
+fun main(): void {
+    println(intro("grace", city = "nyc"))
+    println(intro(name = "bob"))
+    val p = P(1, c = 9)
+    println(p.a + p.b + p.c)
+    println(p.show(y = "z"))
+}

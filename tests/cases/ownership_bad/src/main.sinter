@@ -1,0 +1,14 @@
+module ownership_bad
+import std
+
+fun bad(): *i64 {
+    var x: i64 = 1
+    val p: *i64 = &x
+    ret p
+}
+
+fun main(): void {
+    var y: i64 = 2
+    del y
+    del y
+}

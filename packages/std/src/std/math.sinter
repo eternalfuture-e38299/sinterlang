@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: math utilities
+//
+// The prelude already has sqrt/pow/floor/ceil/round/PI and minOf/maxOf; this fills in pure functions
+// common in modern systems languages but missing from the prelude. All are heap-allocation free.
+module std.math
+
+import std
+
+pub fun absInt(x: i64): i64 => x < 0 ? -x : x
+pub fun absFloat(x: f64): f64 => x < 0.0 ? -x : x
+pub fun signInt(x: i64): i64 => x < 0 ? -1 : (x > 0 ? 1 : 0)
+
+pub fun minInt2(a: i64, b: i64): i64 => a < b ? a : b
+pub fun maxInt2(a: i64, b: i64): i64 => a > b ? a : b
+pub fun clampInt(v: i64, lo: i64, hi: i64): i64 => v < lo ? lo : (v > hi ? hi : v)
+
+pub fun gcd(a: i64, b: i64): i64 {
+    var x = absInt(a)
+    var y = absInt(b)
+    while y != 0 {
+        val t = x % y
+        x = y
+        y = t
+    }
+    ret x
+}
+
+pub fun lcm(a: i64, b: i64): i64 {
+    if a == 0 || b == 0 { ret 0 }
+    ret absInt(a / gcd(a, b) * b)
+}
+
+pub fun isPrime(n: i64): bool {
+    if n < 2 { ret false }
+    if n % 2 == 0 { ret n == 2 }
+    var d: i64 = 3
+    while d * d <= n {
+        if n % d == 0 { ret false }
+        d = d + 2
+    }
+    ret true
+}
+
+pub fun factorial(n: i64): i64 {
+    if n < 0 { ret 0 }
+    var r: i64 = 1
+    var i: i64 = 2
+    while i <= n {
+        r = r * i
+        i = i + 1
+    }
+    ret r
+}
+
+pub fun fibonacci(n: i64): i64 {
+    if n < 0 { ret 0 }
+    var a: i64 = 0
+    var b: i64 = 1
+    var i: i64 = 0
+    while i < n {
+        val t = a + b
+        a = b
+        b = t
+        i = i + 1
+    }
+    ret a
+}
+
+pub fun lerp(a: f64, b: f64, t: f64): f64 => a + (b - a) * t
+pub fun toRadians(deg: f64): f64 => deg * 3.14159265358979323846 / 180.0
+pub fun toDegrees(rad: f64): f64 => rad * 180.0 / 3.14159265358979323846
+pub fun square(x: i64): i64 => x * x
+pub fun cube(x: i64): i64 => x * x * x

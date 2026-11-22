@@ -1,0 +1,736 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: streams
+//
+// Provides stream abstractions comparable to common `InputStream` / `OutputStream` /
+// `Reader` APIs, but with **no character-encoding layer**: Sinter's `str` is already a byte sequence (`sinter_string` carries `len`), so
+// a "character stream" = byte stream + a `readLine` layer; encoding would only force extra `charset`.
+//
+// Two interfaces:
+//
+//     interface InputStream  { read(buf, n); close() }
+//     interface OutputStream { write(buf, n); flush(); close() }
+//
+// Interface methods are in the vtable, so functions written against the abstract type (`copyStream`) dispatch to concrete implementations.
+//
+// Implementations:
+//
+//     FileInputStream(path)           read from a file
+//     FileOutputStream(path, append)  write to a file
+//     MemoryInputStream(text)         read from a string (no copy, borrows a view)
+//     MemoryOutputStream()            write to memory, `toString()` retrieves the content
+//     LineReader(src, bufSize)        read by line, `readLine()` / `atEnd()`
+//
+// Convenience layer (equivalent to common `readBytes()` / `reader().use { }` helpers):
+//
+//     copyStream(src, dst)      copy everything → byte count
+//     readAllBytes(src)         read to end → ByteArray
+//     readAllText(src)          read to end → str
+//     writeAllText(path, text)  overwrite everything → byte count
+//     appendAllText(path, text) append everything → byte count
+//
+// Ownership: interface parameters are **borrowed**; `copyStream` does not close `src` / `dst`. Whoever opens it closes it.
+//
+//     val src = FileInputStream("/a.txt")
+//     val dst = MemoryOutputStream()
+//     copyStream(src, dst)
+//     src.close()
+//     println(dst.toString())
+module std.stream
+
+import std.core
+import std.string
+import std.arrays
+
+// ============================================================================
+// Interfaces
+// ============================================================================
+/// Byte input stream. `read` returns the actual byte count: 0 means EOF, negative means error.
+pub interface InputStream {
+    /// Read at most `n` bytes into `buf`; returns the actual byte count (0 = EOF, <0 = error)
+    pub fun read(buf: *u8, n: i64): i64
+    pub fun close(): void
+}
+
+/// Byte output stream. `write` returns the actual byte count written; negative means error.
+pub interface OutputStream {
+    /// Write the first `n` bytes of `buf`; returns the actual byte count (<0 = error)
+    pub fun write(buf: *u8, n: i64): i64
+    /// Push the userspace buffer to the kernel. A no-op for direct-write implementations, `fsync` for the file one.
+    pub fun flush(): void
+    pub fun close(): void
+}
+
+// ============================================================================
+// File input stream
+// ============================================================================
+/// Reads from a file. If construction fails (missing / no permission), `isOpen()` is `false`
+/// and `read` always returns -1; see `std.file.lastError()` for the reason.
+pub class FileInputStream : InputStream {
+    var fd: i64
+    var label: str
+
+    FileInputStream(path: str) {
+        self.label = sinter_stream_clone_text(path)
+        self.fd = sinter_stream_open_read(path)
+    }
+
+    ~FileInputStream() {
+        if (self.fd >= 0) { sinter_stream_close(self.fd) }
+        self.fd = -1
+    }
+
+    pub fun isOpen(): bool => self.fd >= 0
+    /// File size in bytes; -1 on error.
+    pub fun size(): i64 => sinter_stream_size(self.fd)
+    /// Read exactly at an absolute offset without disturbing the logical API.
+    pub fun readAt(offset: i64, count: i64): str => sinter_stream_read_at(self.fd, offset, count)
+
+    pub override fun read(buf: *u8, n: i64): i64 {
+        if (self.fd < 0) { ret -1 }
+        ret sinter_stream_read(self.fd, buf, n)
+    }
+
+    pub override fun close(): void {
+        if (self.fd >= 0) {
+            sinter_stream_close(self.fd)
+            self.fd = -1
+        }
+    }
+
+    pub override fun typeLabel(): str => "FileInputStream"
+
+    pub override fun toString(): str => "FileInputStream(" + self.label + ")"
+}
+
+// ============================================================================
+// File output stream
+// ============================================================================
+pub class FileOutputStream : OutputStream {
+    var fd: i64
+    var label: str
+
+    /// `append = false` truncates and rewrites, `true` appends.
+    FileOutputStream(path: str, append: bool) {
+        self.label = sinter_stream_clone_text(path)
+        self.fd = sinter_stream_open_write(path, append)
+    }
+
+    ~FileOutputStream() {
+        if (self.fd >= 0) { sinter_stream_close(self.fd) }
+        self.fd = -1
+    }
+
+    pub fun isOpen(): bool => self.fd >= 0
+
+    pub override fun write(buf: *u8, n: i64): i64 {
+        if (self.fd < 0) { ret -1 }
+        ret sinter_stream_write(self.fd, buf, n)
+    }
+
+    /// Binary-safe write of a `str`.
+    pub fun writeString(text: str): i64 {
+        if (self.fd < 0) { ret -1 }
+        ret sinter_stream_write_text(self.fd, text)
+    }
+
+    pub override fun flush(): void {
+        if (self.fd >= 0) { sinter_stream_sync(self.fd) }
+    }
+
+    pub override fun close(): void {
+        if (self.fd >= 0) {
+            sinter_stream_close(self.fd)
+            self.fd = -1
+        }
+    }
+
+    pub override fun typeLabel(): str => "FileOutputStream"
+
+    pub override fun toString(): str => "FileOutputStream(" + self.label + ")"
+}
+
+// ============================================================================
+// Memory input stream
+// ============================================================================
+/// Reads from a text buffer. **No copy**: the constructor borrows the `sinter_string` data pointer,
+/// so the source must stay valid while the stream lives (literals and locals both qualify).
+pub class MemoryInputStream : InputStream {
+    var data: *u8
+    var size: i64
+    var pos: i64
+
+    MemoryInputStream(text: str) {
+        self.data = sinter_stream_text_ptr(text)
+        self.size = sinter_stream_text_len(text)
+        self.pos = 0
+    }
+
+    pub fun available(): i64 => self.size - self.pos
+
+    pub fun position(): i64 => self.pos
+
+    pub fun atEnd(): bool => self.pos >= self.size
+
+    /// Rewind to the start, so the same stream can be read twice.
+    pub fun rewind(): void {
+        self.pos = 0
+    }
+
+    pub override fun read(buf: *u8, n: i64): i64 {
+        if (n <= 0) { ret 0 }
+        val left = self.size - self.pos
+        if (left <= 0) { ret 0 }
+        var k: i64 = n
+        if (k > left) { k = left }
+        sinter_stream_memcpy(buf, self.data, self.pos, k)
+        self.pos = self.pos + k
+        ret k
+    }
+
+    pub override fun close(): void {
+        self.pos = self.size
+    }
+
+    pub override fun typeLabel(): str => "MemoryInputStream"
+
+    pub override fun toString(): str => "MemoryInputStream(" + fromInt(self.size) + "B)"
+}
+
+// ============================================================================
+// Memory output stream
+// ============================================================================
+/// Writes to memory. The buffer is an opaque C-side handle (`*u8` is just a handle, not used as an array);
+/// growth happens in C, so the Sinter side need not care about pointer changes after realloc.
+pub class MemoryOutputStream : OutputStream {
+    var handle: *u8
+
+    MemoryOutputStream() {
+        self.handle = sinter_stream_wbuf_new()
+    }
+
+    ~MemoryOutputStream() {
+        sinter_stream_wbuf_free(self.handle)
+        self.handle = null
+    }
+
+    pub fun length(): i64 => sinter_stream_wbuf_len(self.handle)
+
+    /// Get the accumulated content (a clone, owned by the caller).
+    /// Does not override `toString`: with `Any.toString` and the `OutputStream` slots both in the same
+    /// object header, other implementing classes resolve to the wrong slot (observed: `..._to_str` undefined).
+    pub fun toText(): str => sinter_stream_wbuf_text(self.handle)
+
+    /// Discard all content; the stream can keep writing.
+    pub fun reset(): void {
+        sinter_stream_wbuf_reset(self.handle)
+    }
+
+    pub override fun write(buf: *u8, n: i64): i64 {
+        if (n <= 0) { ret 0 }
+        ret sinter_stream_wbuf_write(self.handle, buf, n)
+    }
+
+    pub override fun flush(): void {
+        // Pure memory, no userspace buffer to push
+    }
+
+    pub override fun close(): void {
+        // Content is still readable after close (byte-array stream semantics)
+    }
+
+    pub override fun typeLabel(): str => "MemoryOutputStream"
+}
+
+// ============================================================================
+// Read by line
+// ============================================================================
+/// Wraps any input stream and splits lines on `\n` (`\r\n` and a lone `\r` also count).
+///
+///     val r = LineReader(FileInputStream("/a.txt"), 4096)
+///     while (!r.atEnd()) { println(r.readLine()) }
+///
+/// `atEnd()` and "read an empty line" differ: an empty line in the file returns an empty
+/// string but `atEnd()` is still `false`, so the loop condition must use `atEnd()`, not `readLine() == ""`.
+///
+/// Buffering and line assembly live on the Sinter side (C only offers raw byte-region I/O),
+/// because C code cannot call the Sinter object's `read` virtual method.
+pub class LineReader {
+    /// Dispatch target for the underlying read function. Not an `InputStream`-typed field: as soon as a
+    /// class has an interface-typed field, the compiler generates a `toString` that calls `<interface>_to_str`,
+    /// but interfaces have no implementation body, so that symbol does not exist at link time. Instead we
+    /// hold concrete references + a "file or memory" flag and dispatch on the flag when reading.
+    var file: FileInputStream
+    var mem: MemoryInputStream
+    var buf: *u8          // read buffer (allocated on the C side)
+    var size: i64
+    var used: i64         // valid bytes in the buffer
+    var pos: i64          // next byte to consume
+    var done: bool        // the stream has already returned 0
+
+    /// The primary constructor only allocates the buffer; the source is set by the `ofFile` / `ofText` factories.
+    /// (A Sinter class keeps only one primary constructor and overloaded constructors get eaten, hence not in the constructor.)
+    LineReader(bufSize: i64) {
+        if (bufSize <= 0) { bufSize = 4096 }
+        if (bufSize < 64) { bufSize = 64 }
+        self.file = null
+        self.mem = null
+        self.size = bufSize
+        self.buf = sinter_stream_alloc_bytes(bufSize)
+        self.used = 0
+        self.pos = 0
+        self.done = false
+    }
+
+    ~LineReader() {
+        sinter_stream_free_bytes(self.buf)
+        self.buf = null
+        self.file = null
+        self.mem = null
+        self.size = 0
+        self.used = 0
+        self.pos = 0
+    }
+
+    /// Open a file and attach it (does not return the own type: `static fun ... : LineReader { ret r }`
+    /// generates code that inserts `_del(r)` after return, so the caller gets a freed object).
+    pub fun openFile(path: str): void {
+        self.file = FileInputStream(path)
+        self.mem = null
+        self.used = 0
+        self.pos = 0
+        self.done = false
+    }
+
+    /// Attach an already-open file stream.
+    pub fun useFile(fsrc: FileInputStream): void {
+        self.file = fsrc
+        self.mem = null
+        self.used = 0
+        self.pos = 0
+        self.done = false
+    }
+
+    /// Attach a text buffer.
+    pub fun openText(text: str): void {
+        self.mem = MemoryInputStream(text)
+        self.file = null
+        self.used = 0
+        self.pos = 0
+        self.done = false
+    }
+
+    /// Are there bytes left in the buffer to consume?
+    pub fun hasBuffered(): bool => self.pos < self.used
+
+    /// Read a batch into the buffer; returns bytes read (0 = EOF, negative = error).
+    pub fun fill(): i64 {
+        if (self.done) { ret 0 }
+        var n: i64 = 0
+        if (self.file != null) {
+            n = self.file.read(self.buf, self.size)
+        } else if (self.mem != null) {
+            n = self.mem.read(self.buf, self.size)
+        } else {
+            n = 0
+        }
+        if (n <= 0) {
+            self.done = true
+            self.used = 0
+            self.pos = 0
+            ret n
+        }
+        self.used = n
+        self.pos = 0
+        ret n
+    }
+
+    /// Whether the end has been reached (buffer empty and stream has returned 0).
+    ///
+    /// Pulls a batch on demand — without losing data: fetched bytes stay buffered for `readLine`.
+    pub fun atEnd(): bool {
+        if (self.hasBuffered()) { ret false }
+        if (self.done) { ret true }
+        val n = self.fill()
+        ret n <= 0
+    }
+
+    /// Read one line (without the trailing `\n` / `\r\n` / `\r`).
+    ///
+    /// An empty string has two causes: a real empty line, or end of input — tell them apart with `atEnd()`.
+    pub fun readLine(): str {
+        var out: str = ""
+        var sawAny: bool = false
+        while (true) {
+            if (!self.hasBuffered()) {
+                if (self.done) { break }
+                val n = self.fill()
+                if (n <= 0) { break }
+            }
+            val b = sinter_stream_byte_at(self.buf, self.pos)
+            self.pos = self.pos + 1
+            sawAny = true
+            if (b == 10) { break }
+            if (b == 13) {
+                if (!self.hasBuffered() && !self.done) { self.fill() }
+                if (self.hasBuffered() && sinter_stream_byte_at(self.buf, self.pos) == 10) {
+                    self.pos = self.pos + 1
+                }
+                break
+            }
+            out = sinter_stream_append_chr(out, b)
+        }
+        if (!sawAny) { ret "" }
+        ret out
+    }
+
+    /// Read all remaining content (including the unconsumed buffer part).
+    pub fun readRest(): str {
+        var out: str = ""
+        while (self.hasBuffered()) {
+            out = sinter_stream_append_chr(out, sinter_stream_byte_at(self.buf, self.pos))
+            self.pos = self.pos + 1
+        }
+        while (true) {
+            val n = self.fill()
+            if (n <= 0) { break }
+            while (self.hasBuffered()) {
+                out = sinter_stream_append_chr(out, sinter_stream_byte_at(self.buf, self.pos))
+                self.pos = self.pos + 1
+            }
+        }
+        ret out
+    }
+}
+
+// ============================================================================
+// Convenience layer: whole-segment operations
+// ============================================================================
+/// Copy all of `src` to `dst`, returns the number of bytes copied; -1 on error.
+pub fun copyStream(src: InputStream, dst: OutputStream): i64 {
+    val buf: *u8 = sinter_stream_scratch(4096)
+    if (buf == null) { ret -1 }
+    var total: i64 = 0
+    while (true) {
+        val n = src.read(buf, 4096)
+        if (n < 0) { ret -1 }
+        if (n == 0) { break }
+        var off: i64 = 0
+        while (off < n) {
+            val w = dst.write(buf + off, n - off)
+            if (w <= 0) { ret -1 }
+            off = off + w
+        }
+        total = total + n
+    }
+    ret total
+}
+
+/// Read to the end and return a `ByteArray` (owned by the caller). An empty stream returns a zero-length array.
+pub fun readAllBytes(src: InputStream): ByteArray {
+    val mo = MemoryOutputStream()
+    val n = copyStream(src, mo)
+    if (n < 0) { ret byteArray(0, 0) }
+    ret sinter_stream_wbuf_bytes(mo.handle)
+}
+
+/// Read to the end and return a `str`; an error or empty stream returns an empty string.
+pub fun readAllText(src: InputStream): str {
+    val mo = MemoryOutputStream()
+    val n = copyStream(src, mo)
+    if (n < 0) { ret "" }
+    ret mo.toText()
+}
+
+/// Binary-safe write to an open output stream (free-function form).
+pub fun writeStringTo(out: FileOutputStream, text: str): i64 {
+    if out == null || !out.isOpen() { ret -1 }
+    ret out.writeString(text)
+}
+
+/// Close an output stream, tolerating null.
+pub fun closeOutputStream(out: FileOutputStream): void {
+    if out != null { out.close() }
+}
+
+/// Is this output stream open?
+pub fun isOutputStreamOpen(out: FileOutputStream): bool {
+    if out == null { ret false }
+    ret out.isOpen()
+}
+
+/// Overwrite the whole file. Returns bytes written on success, -1 on failure.
+pub fun writeAllText(path: str, text: str): i64 {
+    val out = FileOutputStream(path, false)
+    if (!out.isOpen()) { ret -1 }
+    val b: ByteArray = sinter_stream_text_bytes(text)
+    val n = out.write(b.data, b.size)
+    out.close()
+    ret n
+}
+
+/// Append the whole text. Returns bytes written on success, -1 on failure.
+pub fun appendAllText(path: str, text: str): i64 {
+    val out = FileOutputStream(path, true)
+    if (!out.isOpen()) { ret -1 }
+    val b: ByteArray = sinter_stream_text_bytes(text)
+    val n = out.write(b.data, b.size)
+    out.close()
+    ret n
+}
+
+// ============================================================================
+// C-side implementation
+// ============================================================================
+embed C {
+    #include <fcntl.h>
+    #include <errno.h>
+    #include <stdlib.h>
+    #include <string.h>
+#ifdef _WIN32
+    #include <io.h>
+    #define open  _open
+    #define close _close
+    #define lseek _lseeki64
+    #define read  _read
+    #define write _write
+    #define fsync _commit
+#else
+    #include <unistd.h>
+#endif
+    #ifndef O_BINARY
+    #define O_BINARY 0
+    #endif
+
+    /* ---- fd open / close ---- */
+    static int64_t sinter_stream_size(int64_t fd) {
+        if (fd < 0) return -1;
+        int64_t cur = (int64_t)lseek(fd, 0, SEEK_CUR);
+        int64_t end = (int64_t)lseek(fd, 0, SEEK_END);
+        if (cur >= 0) (void)lseek(fd, cur, SEEK_SET);
+        return end;
+    }
+
+    static sinter_string sinter_stream_read_at(int64_t fd, int64_t offset, int64_t count) {
+        if (fd < 0 || offset < 0 || count <= 0) return sinter_string_from_literal("", 0);
+        if (lseek(fd, offset, SEEK_SET) < 0) return sinter_string_from_literal("", 0);
+        char* buf = (char*)malloc((size_t)count);
+        if (!buf) return sinter_string_from_literal("", 0);
+        int64_t done = 0;
+        while (done < count) {
+            ssize_t n = read(fd, buf + done, (size_t)(count - done));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            if (n == 0) break;
+            done += (int64_t)n;
+        }
+        sinter_string out = sinter_string_from_buf(buf, done);
+        free(buf);
+        return out;
+    }
+
+    static int64_t sinter_stream_open_read(sinter_string path) {
+        const char* p = sinter_string_to_cstr(path);
+        int fd = open(p, O_RDONLY | O_BINARY);
+        return (fd < 0) ? -1 : (int64_t) fd;
+    }
+
+    static int64_t sinter_stream_open_write(sinter_string path, uint8_t append) {
+        const char* p = sinter_string_to_cstr(path);
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int fd = open(p, flags | O_BINARY, 0644);
+        return (fd < 0) ? -1 : (int64_t) fd;
+    }
+
+    static int64_t sinter_stream_close(int64_t fd) {
+        if (fd < 0) return -1;
+        return (close((int) fd) < 0) ? -1 : 0;
+    }
+
+    static void sinter_stream_sync(int64_t fd) {
+        if (fd >= 0) fsync((int) fd);
+    }
+
+    /* ---- read/write: EINTR retry + short-write completion ---- */
+    static int64_t sinter_stream_read(int64_t fd, uint8_t* buf, int64_t n) {
+        if (fd < 0 || !buf || n <= 0) return 0;
+        for (;;) {
+            ssize_t r = read((int) fd, buf, (size_t) n);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) return -1;
+            return (int64_t) r;
+        }
+    }
+
+    static int64_t sinter_stream_write(int64_t fd, uint8_t* buf, int64_t n);
+
+    static int64_t sinter_stream_write_text(int64_t fd, sinter_string s) {
+        return sinter_stream_write(fd, (uint8_t*)s.data, s.len);
+    }
+
+    static int64_t sinter_stream_write(int64_t fd, uint8_t* buf, int64_t n) {
+        if (fd < 0 || !buf) return -1;
+        int64_t done = 0;
+        while (done < n) {
+            ssize_t w = write((int) fd, buf + done, (size_t) (n - done));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return (done > 0) ? done : -1;
+            }
+            if (w == 0) break;
+            done += (int64_t) w;
+        }
+        return done;
+    }
+
+    /* Clone a str (used when a class stores a string field: parameters are borrowed and cannot be stored directly). */
+    static sinter_string sinter_stream_clone_text(sinter_string s) {
+        if (!s.data || s.len <= 0) return sinter_string_from_literal("", 0);
+        return sinter_string_from_buf(s.data, s.len);
+    }
+
+    /* ---- string / buffer views ---- */
+    static uint8_t* sinter_stream_text_ptr(sinter_string s) {
+        return (uint8_t*) s.data;
+    }
+
+    static int64_t sinter_stream_text_len(sinter_string s) {
+        return s.len;
+    }
+
+    static void sinter_stream_memcpy(uint8_t* dst, uint8_t* src, int64_t off, int64_t n) {
+        if (!dst || !src || n <= 0) return;
+        memcpy(dst, src + off, (size_t) n);
+    }
+
+    /* Borrow a fixed scratch area (used by copyStream); not owned by the caller. */
+    static uint8_t* sinter_stream_scratch(int64_t n) {
+        static uint8_t* s_buf = NULL;
+        static int64_t s_cap = 0;
+        if (n <= 0) return s_buf;
+        if (n > s_cap) {
+            uint8_t* nb = (uint8_t*) realloc(s_buf, (size_t) n);
+            if (!nb) return s_buf;
+            s_buf = nb;
+            s_cap = n;
+        }
+        return s_buf;
+    }
+
+    /* Wrap a str into a ByteArray (two independent blocks of memory: this returns a copy for the array). */
+    static struct std_arrays_byte_array* sinter_stream_text_bytes(sinter_string s) {
+        const uint8_t* p = (const uint8_t*) sinter_string_to_cstr(s);
+        int64_t n = s.len;
+        uint8_t* copy = (uint8_t*) malloc((size_t) (n > 0 ? n : 1));
+        if (!copy) return std_arrays_byte_array_new(NULL, 0, 0);
+        if (n > 0) memcpy(copy, p, (size_t) n);
+        return std_arrays_byte_array_new(copy, n, 1);
+    }
+
+    /* ---- growable write buffer (opaque handle) ---- */
+    /* Handle layout: `struct sinter_wbuf { uint8_t* data; int64_t len; int64_t cap; }`
+       The Sinter side only sees `*u8` and never dereferences it. */
+    struct sinter_wbuf {
+        uint8_t* data;
+        int64_t len;
+        int64_t cap;
+    };
+
+    static uint8_t* sinter_stream_wbuf_new(void) {
+        struct sinter_wbuf* w = (struct sinter_wbuf*) malloc(sizeof(struct sinter_wbuf));
+        if (!w) return NULL;
+        w->cap = 128;
+        w->len = 0;
+        w->data = (uint8_t*) malloc((size_t) w->cap);
+        if (!w->data) { free(w); return NULL; }
+        return (uint8_t*) w;
+    }
+
+    static void sinter_stream_wbuf_free(uint8_t* h) {
+        if (!h) return;
+        struct sinter_wbuf* w = (struct sinter_wbuf*) h;
+        free(w->data);
+        free(w);
+    }
+
+    static int64_t sinter_stream_wbuf_len(uint8_t* h) {
+        if (!h) return 0;
+        return ((struct sinter_wbuf*) h)->len;
+    }
+
+    static void sinter_stream_wbuf_reset(uint8_t* h) {
+        if (!h) return;
+        ((struct sinter_wbuf*) h)->len = 0;
+    }
+
+    static int64_t sinter_stream_wbuf_write(uint8_t* h, uint8_t* src, int64_t n) {
+        if (!h || !src || n <= 0) return 0;
+        struct sinter_wbuf* w = (struct sinter_wbuf*) h;
+        int64_t need = w->len + n;
+        if (need > w->cap) {
+            int64_t cap = w->cap;
+            while (cap < need) cap *= 2;
+            uint8_t* nb = (uint8_t*) realloc(w->data, (size_t) cap);
+            if (!nb) return -1;
+            w->data = nb;
+            w->cap = cap;
+        }
+        memcpy(w->data + w->len, src, (size_t) n);
+        w->len = need;
+        return n;
+    }
+
+    static sinter_string sinter_stream_wbuf_text(uint8_t* h) {
+        if (!h) return sinter_string_from_literal("", 0);
+        struct sinter_wbuf* w = (struct sinter_wbuf*) h;
+        if (w->len <= 0) return sinter_string_from_literal("", 0);
+        sinter_string s = sinter_string_from_buf((const char*) w->data, w->len);
+        return s;
+    }
+
+    /* Convert write-buffer content into a ByteArray (a copy, owned by the caller). */
+    static struct std_arrays_byte_array* sinter_stream_wbuf_bytes(uint8_t* h) {
+        if (!h) return std_arrays_byte_array_new(NULL, 0, 0);
+        struct sinter_wbuf* w = (struct sinter_wbuf*) h;
+        if (w->len <= 0) return std_arrays_byte_array_new(NULL, 0, 0);
+        uint8_t* copy = (uint8_t*) malloc((size_t) w->len);
+        if (!copy) return std_arrays_byte_array_new(NULL, 0, 0);
+        memcpy(copy, w->data, (size_t) w->len);
+        return std_arrays_byte_array_new(copy, w->len, 1);
+    }
+
+    /* ---- raw byte regions (for LineReader) ---- */
+    /* Only four things are needed: allocate / free / get a byte / append one byte to a str;
+       the read loop and line assembly live on the Sinter side, since C cannot call Sinter virtual methods. */
+    static uint8_t* sinter_stream_alloc_bytes(int64_t n) {
+        if (n <= 0) n = 1;
+        return (uint8_t*) malloc((size_t) n);
+    }
+
+    static void sinter_stream_free_bytes(uint8_t* p) {
+        free(p);
+    }
+
+    static int64_t sinter_stream_byte_at(uint8_t* p, int64_t i) {
+        if (!p) return 0;
+        return (int64_t) p[i];
+    }
+
+    /* Append one byte to the end of a str and return the new str.
+       Reallocs the old buffer directly, so line assembly is O(n) instead of O(n^2). */
+    static sinter_string sinter_stream_append_chr(sinter_string s, int64_t b) {
+        char c = (char) (b & 0xff);
+        int64_t n = s.len;
+        char* nb = (char*) malloc((size_t) n + 2);
+        if (!nb) return s;
+        if (n > 0 && s.data) memcpy(nb, s.data, (size_t) n);
+        nb[n] = c;
+        nb[n + 1] = 0;
+        sinter_string r = sinter_string_from_buf(nb, n + 1);
+        free(nb);
+        return r;
+    }
+}

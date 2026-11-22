@@ -1,0 +1,24 @@
+==0|SINTER_ROOT
+==0|CMAKE_ROOT
+>=1|add_executable(linklib "${CMAKE_CURRENT_LIST_DIR}/gen/
+>=1|add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../libs/greet ${CMAKE_CURRENT_BINARY_DIR}/deps/link_0)
+>=1|target_include_directories(linklib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../libs/greet/include)
+>=1|target_include_directories(linklib PUBLIC ${CMAKE_CURRENT_LIST_DIR}/libs/greet/include)
+>=1|target_link_libraries(linklib PUBLIC greet)
+>=1|target_compile_definitions(linklib PRIVATE LINKLIB_WINDOWS=0)
+>=1|target_compile_definitions(linklib PRIVATE LINKLIB_LINUX=1)
+>=1|target_link_options(linklib PRIVATE -static-libgcc)
+>=1|target_link_options(linklib PRIVATE -Wl,--gc-sections)
+>=1|if(NOT WIN32)
+>=1|if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+>=1|if(MINGW OR (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "GNU"))
+>=1|if(NOT TARGET cond)
+>=1|add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../libs/cond ${CMAKE_CURRENT_BINARY_DIR}/deps/cond)
+>=1|target_link_libraries(linklib PUBLIC cond)
+>=1|if(WIN32)
+>=1|target_link_libraries(linklib PRIVATE ws2_32)
+>=1|if(CMAKE_BUILD_TYPE STREQUAL "Release")
+>=1|COMMAND ${CMAKE_STRIP} --strip-all $<TARGET_FILE:linklib>
+>=1|elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+>=1|COMMAND ${CMAKE_STRIP} -S $<TARGET_FILE:linklib>
+==0|/home/

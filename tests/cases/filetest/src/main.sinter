@@ -1,0 +1,200 @@
+// tests/cases/filetest —— std.path / std.file / std.stream 的回归
+//
+// 覆盖三块：
+//   1. std.path  —— 纯字符串路径运算（含 normalize / stem / segments）
+//   2. std.file  —— File 类（现代语言风格）与同名自由函数
+//   3. std.stream —— 文件流 / 内存流 / LineReader / copyStream
+//
+// 全部在 /tmp/shim_filetest 下操作，跑之前由脚本清掉。
+module filetest
+
+import std
+import std.string
+import std.path
+import std.file
+import std.stream
+
+fun main(): void {
+    // ========================================================================
+    // 1. std.path
+    // ========================================================================
+    println("== path-basic ==")
+    println("join1=${join("/tmp", "a.txt")}")
+    println("join2=${join("/tmp/", "a.txt")}")
+    println("join3=${join("", "a.txt")}")
+    println("joinAll=${joinAll("/a", "b", "c")}")
+    println("join3=${join3("/a", "b", "c", "d")}")
+    println("abs1=${isAbsolute("/x")}")
+    println("abs2=${isRelative("x")}")
+    println("trail1=${hasTrailingSep("/a/")}")
+    println("trail2=${hasTrailingSep("/a")}")
+
+    println("== path-split ==")
+    println("name1=${fileName("/a/b/c.txt")}")
+    println("name2=${fileName("/a/b/")}")
+    println("name3=${fileName("/")}")
+    println("parent1=${parentOf("/a/b/c.txt")}")
+    println("parent2=${parentOf("/a")}")
+    println("parent3=${parentOf("rel.txt")}")
+    println("ext1=${extension("a.tar.gz")}")
+    println("ext2=${extension("Makefile")}")
+    println("stem1=${stem("a.tar.gz")}")
+    println("stem2=${stem("Makefile")}")
+    println("chg1=${changeExtension("a.txt", "md")}")
+    println("chg2=${changeExtension("/d/a.txt", "md")}")
+    println("chg3=${changeExtension("a.txt", "")}")
+
+    println("== path-normalize ==")
+    println("n1=${normalize("/a//b/./c/")}")
+    println("n2=${normalize("a/../b")}")
+    println("n3=${normalize("/../a")}")
+    println("n4=${normalize("../a")}")
+    println("n5=${normalize("/a/b/..")}")
+    println("n6=${normalize(".")}")
+    println("n7=${normalize("/")}")
+
+    println("== path-segments ==")
+    println("cnt1=${segmentCount("/a/b/c")}")
+    println("cnt2=${segmentCount("/")}")
+    println("seg0=${segmentAt("/a/b/c", 0)}")
+    println("seg2=${segmentAt("/a/b/c", 2)}")
+    println("seg9=${segmentAt("/a/b/c", 9)}")
+    println("hasB=${containsSegment("/a/b/c", "b")}")
+    println("hasZ=${containsSegment("/a/b/c", "z")}")
+
+    // ========================================================================
+    // 2. std.file —— File 类
+    // ========================================================================
+    val root = "/tmp/shim_filetest"
+    remove(join(root, "a.txt"))
+    remove(join(root, "sub"))
+    remove(root)
+
+    println("== file-create ==")
+    val dir = File(root)
+    println("mkdirs=${dir.mkdirs()}")
+    println("isDir=${dir.isDirectory()}")
+    println("isFile=${dir.isFile()}")
+    println("exists=${dir.exists()}")
+
+    val f = File(join(root, "a.txt"))
+    println("w=${f.writeText("hello\nworld\n")}")
+    println("exists=${f.exists()}")
+    println("len=${f.length()}")
+    println("name=${f.name()}")
+    println("parent=${f.parent()}")
+    println("ext=${f.extension()}")
+    println("stem=${f.nameWithoutExtension()}")
+    println("abs=${f.isAbsolute()}")
+    println("mt=${f.lastModified() > 0}")
+
+    println("== file-read ==")
+    println("text-len=${f.readText().length()}")
+    println("lines=${countLines(f.readText())}")
+    println("l0=${lineAt(f.readText(), 0)}")
+    println("l1=${lineAt(f.readText(), 1)}")
+    println("l2=${lineAt(f.readText(), 2)}")
+
+    println("== file-append ==")
+    println("app=${f.appendText("third\n")}")
+    println("len2=${f.length()}")
+    println("lines2=${countLines(f.readText())}")
+    println("l2b=${lineAt(f.readText(), 2)}")
+
+    println("== file-derived ==")
+    val g = f.withExtension("md")
+    println("gName=${g.name()}")
+    println("gPath=${g.path()}")
+    val h = f.child("child.txt")
+    println("hPath=${h.path()}")
+    val r = File("/a/b/c.txt")
+    println("rName=${r.name()}")
+    println("rParent=${r.parent()}")
+    println("rExt=${r.extension()}")
+    println("rCanon=${r.canonicalPath()}")
+
+    println("== file-dir ==")
+    writeText(join(root, "b.log"), "b")
+    println("count=${dir.listCount()}")
+    println("sorted=${dir.listSortedText()}")
+    println("s0=${dir.entryAt(0)}")
+    println("s1=${dir.entryAt(1)}")
+    println("s2=${dir.entryAt(2)}")
+    println("files=${countLines(dir.filesText())}")
+
+    println("== file-errors ==")
+    val miss = File(join(root, "nope.txt"))
+    println("missExists=${miss.exists()}")
+    println("missLen=${miss.length()}")
+    println("missText=${miss.readText().length()}")
+    println("missErr=${lastError()}")
+
+    // ========================================================================
+    // 3. std.stream
+    // ========================================================================
+    println("== stream-mem ==")
+    val mo = MemoryOutputStream()
+    val src = MemoryInputStream("abcdef")
+    val holder = byteArray(16, 0)
+    val scratch: *u8 = holder.data
+    println("read1=${src.read(scratch, 3)}")
+    println("wrote1=${mo.write(scratch, 3)}")
+    println("read2=${src.read(scratch, 10)}")
+    println("wrote2=${mo.write(scratch, 3)}")
+    println("read3=${src.read(scratch, 10)}")
+    println("moLen=${mo.length()}")
+    println("moText=${mo.toText()}")
+
+    println("== stream-rewind ==")
+    src.rewind()
+    println("pos=${src.position()}")
+    println("avail=${src.available()}")
+    println("atEnd=${src.atEnd()}")
+
+    println("== stream-copy ==")
+    src.rewind()
+    val mo2 = MemoryOutputStream()
+    println("copied=${copyStream(src, mo2)}")
+    println("mo2=${mo2.toText()}")
+
+    println("== stream-file ==")
+    val fpath = join(root, "stream.txt")
+    println("writeAll=${writeAllText(fpath, "l1\nl2\nl3\n")}")
+    println("size=${sizeOf(fpath)}")
+    println("appendAll=${appendAllText(fpath, "l4\n")}")
+    println("size2=${sizeOf(fpath)}")
+
+    val fin = FileInputStream(fpath)
+    println("isOpen=${fin.isOpen()}")
+    println("readAllLen=${readAllText(fin).length()}")
+    fin.close()
+    println("closed=${fin.isOpen()}")
+
+    println("== stream-lines ==")
+    val lr = LineReader(4096)
+    lr.openFile(fpath)
+    var idx: i64 = 0
+    while (!lr.atEnd()) {
+        println("R${idx}=${lr.readLine()}")
+        idx = idx + 1
+    }
+    println("count=${idx}")
+
+    println("== stream-lines-mem ==")
+    val lr2 = LineReader(0)
+    lr2.openText("x\ny\nz")
+    var idx2: i64 = 0
+    while (!lr2.atEnd()) {
+        println("M${idx2}=${lr2.readLine()}")
+        idx2 = idx2 + 1
+    }
+    println("count2=${idx2}")
+
+    // 清理
+    remove(fpath)
+    remove(join(root, "b.log"))
+    remove(join(root, "a.txt"))
+    remove(join(root, "child.txt"))
+    println("rmroot=${remove(root)}")
+    println("== done ==")
+}

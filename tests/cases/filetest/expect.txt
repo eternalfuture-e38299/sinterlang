@@ -1,0 +1,123 @@
+== path-basic ==
+join1=/tmp/a.txt
+join2=/tmp/a.txt
+join3=a.txt
+joinAll=/a/b/c
+join3=/a/b/c/d
+abs1=1
+abs2=1
+trail1=1
+trail2=0
+== path-split ==
+name1=c.txt
+name2=
+name3=
+parent1=/a/b
+parent2=/
+parent3=
+ext1=gz
+ext2=
+stem1=a.tar
+stem2=Makefile
+chg1=a.md
+chg2=/d/a.md
+chg3=a
+== path-normalize ==
+n1=/a/b/c
+n2=b
+n3=/a
+n4=../a
+n5=/a
+n6=.
+n7=/
+== path-segments ==
+cnt1=3
+cnt2=0
+seg0=a
+seg2=c
+seg9=
+hasB=1
+hasZ=0
+== file-create ==
+mkdirs=1
+isDir=1
+isFile=0
+exists=1
+w=1
+exists=1
+len=12
+name=a.txt
+parent=/tmp/shim_filetest
+ext=txt
+stem=a
+abs=1
+mt=1
+== file-read ==
+text-len=12
+lines=2
+l0=hello
+l1=world
+l2=
+== file-append ==
+app=1
+len2=18
+lines2=3
+l2b=third
+== file-derived ==
+gName=a.md
+gPath=/tmp/shim_filetest/a.md
+hPath=/tmp/shim_filetest/a.txt/child.txt
+rName=c.txt
+rParent=/a/b
+rExt=txt
+rCanon=/a/b/c.txt
+== file-dir ==
+count=2
+sorted=a.txt
+b.log
+
+s0=a.txt
+s1=b.log
+s2=
+files=2
+== file-errors ==
+missExists=0
+missLen=-1
+missText=0
+missErr=2
+== stream-mem ==
+read1=3
+wrote1=3
+read2=3
+wrote2=3
+read3=0
+moLen=6
+moText=abcdef
+== stream-rewind ==
+pos=0
+avail=6
+atEnd=0
+== stream-copy ==
+copied=6
+mo2=abcdef
+== stream-file ==
+writeAll=9
+size=9
+appendAll=3
+size2=12
+isOpen=1
+readAllLen=12
+closed=0
+== stream-lines ==
+R0=l1
+R1=l2
+R2=l3
+R3=l4
+count=4
+== stream-lines-mem ==
+M0=x
+M1=y
+M2=z
+count2=3
+rmroot=1
+== done ==

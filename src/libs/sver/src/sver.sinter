@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Single build-time version source for the self-hosted tools.
+// The value comes from the repository's VERSION file: sinter passes it as
+// -DSINTER_VERSION_STRING when it compiles generated C.
+module sver
+
+import std
+
+bind C fun sver_text_c(): cstr
+
+embed C {
+#ifndef SINTER_VERSION_STRING
+#error "SINTER_VERSION_STRING must come from the repository VERSION file"
+#endif
+
+const char* sver_text_c(void) { return SINTER_VERSION_STRING; }
+}
+
+pub fun text(): str => fromCStr(sver_text_c())

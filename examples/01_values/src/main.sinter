@@ -1,0 +1,52 @@
+// 01 —— 值与类型 / Values and types
+module values
+import std
+import std.string
+
+fun main(): void {
+    // val 不可变，var 可变（当前 C 后端不强制 const 语义）。
+    val answer = 42
+    var counter = 0
+    counter = counter + 1
+    println(counter)
+
+    // 低层整数直接映射到 C 标量。
+    val a: i8 = 127
+    val b: i16 = -1000
+    val c: i32 = 2000000
+    val d: i64 = 9000000000
+    val e: u8 = 255
+    println(a + b + c)
+    println(d)
+    println(e)
+
+    // 浮点、布尔、字符与字符串。
+    val pi: f64 = 3.14159
+    val half: f32 = 0.5
+    println(pi)
+    println(half)
+    println(true && !false)
+
+    val ch: char = 'A'
+    val greeting: str = "hello"
+    println(greeting)
+    println("char = ${ch}")
+    println(greeting.length())
+
+    // 字符串插值和拼接。
+    val name = "sinter"
+    println("${name} v1")
+    println("ab" + "cd")
+
+    // 算术、比较与三元表达式。
+    println(7 / 2)
+    println(7 % 2)
+    println(7.0 / 2.0)
+    val parity = answer % 2 == 0 ? "even" : "odd"
+    println(parity)
+
+    // 多进制字面量。
+    println(0x1234)
+    println(0b1010)
+    println(0o17)
+}

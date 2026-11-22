@@ -1,0 +1,13 @@
+[package]
+name = "net"
+version = "1.2.3"
+entry = "src/std/net.sinter"
+description = "Sinter networking library (POSIX + Winsock2): blocking TCP/UDP sockets, DNS via getaddrinfo"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "std_net"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../std" }

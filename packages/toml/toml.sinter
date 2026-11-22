@@ -1,0 +1,1444 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// Sinter TOML library: parser and serializer, implemented in Sinter.
+//
+// Supported TOML: tables, arrays of tables, dotted/quoted keys, basic and
+// literal strings (single-line and multi-line), integers (decimal/hex/octal/
+// binary), floats, booleans, the four RFC 3339 date kinds, arrays, inline
+// tables and comments.
+//
+// Values live in a flat node pool, like `json`: each node has a kind, text
+// payload, a singly linked list of children, and trivia (leading comment/
+// blank lines and a same-line trailing comment).  Date nodes additionally
+// carry structured fields in `datevals`.
+//
+//     import toml
+//
+//     val doc = Toml()
+//     if doc.parse(readText("config.toml")) {
+//         println(doc.getString(doc.root(), "name", ""))
+//         println(doc.serialize())   // comments survive the round trip
+//     }
+//
+//     val out = Toml()
+//     val root = out.root()
+//     out.putString(root, "name", "sinter")
+//     out.put(root, "built", out.localDate(2026, 11, 22))
+//     println(out.serialize())
+module toml
+
+import std
+import std.text
+import std.string
+import std.list
+import std.arrays
+
+const TOML_TABLE: i64 = 0
+const TOML_ARRAY: i64 = 1
+const TOML_STRING: i64 = 2
+const TOML_INT: i64 = 3
+const TOML_FLOAT: i64 = 4
+const TOML_BOOL: i64 = 5
+const TOML_DATE: i64 = 6
+
+// Date kinds stored at datevals[node*9 + 0].
+const DATE_OFFSET_DATETIME: i64 = 0
+const DATE_LOCAL_DATETIME: i64 = 1
+const DATE_LOCAL_DATE: i64 = 2
+const DATE_LOCAL_TIME: i64 = 3
+
+fun isDigit(c: i64): bool => c >= 48 && c <= 57
+
+fun hexVal(c: i64): i64 {
+    if c >= 48 && c <= 57 { ret c - 48 }
+    if c >= 65 && c <= 70 { ret c - 55 }
+    if c >= 97 && c <= 102 { ret c - 87 }
+    ret -1
+}
+
+fun isBare(c: i64): bool {
+    if c >= 48 && c <= 57 { ret true }
+    if c >= 65 && c <= 90 { ret true }
+    if c >= 97 && c <= 122 { ret true }
+    ret c == 95 || c == 45
+}
+
+fun appendUtf8(sb: StringBuilder, cp: i64): void {
+    if cp <= 127 {
+        sb.appendByte((cp % 256) as u8)
+    } else if cp <= 2047 {
+        sb.appendByte((192 + cp / 64) as u8)
+        sb.appendByte((128 + cp % 64) as u8)
+    } else if cp <= 65535 {
+        sb.appendByte((224 + cp / 4096) as u8)
+        sb.appendByte((128 + (cp / 64) % 64) as u8)
+        sb.appendByte((128 + cp % 64) as u8)
+    } else {
+        sb.appendByte((240 + cp / 262144) as u8)
+        sb.appendByte((128 + (cp / 4096) % 64) as u8)
+        sb.appendByte((128 + (cp / 64) % 64) as u8)
+        sb.appendByte((128 + cp % 64) as u8)
+    }
+}
+
+fun appendHex4(sb: StringBuilder, v: i64): void {
+    val digits = "0123456789abcdef"
+    sb.appendByte((digits.at((v / 4096) % 16)) as u8)
+    sb.appendByte((digits.at((v / 256) % 16)) as u8)
+    sb.appendByte((digits.at((v / 16) % 16)) as u8)
+    sb.appendByte((digits.at(v % 16)) as u8)
+}
+
+fun trimUnderscores(s: str): str {
+    val sb = StringBuilder()
+    var i: i64 = 0
+    while i < s.length() {
+        if s.at(i) != 95 { sb.appendByte((s.at(i) % 256) as u8) }
+        i = i + 1
+    }
+    ret sb.toString()
+}
+
+fun parseTomlInt(raw: str): i64 {
+    val s = trimUnderscores(raw)
+    var i: i64 = 0
+    var neg = false
+    if i < s.length() && (s.at(i) == 45 || s.at(i) == 43) {
+        neg = s.at(i) == 45
+        i = i + 1
+    }
+    var base: i64 = 10
+    if i + 1 < s.length() && s.at(i) == 48 {
+        val c = s.at(i + 1)
+        if c == 120 || c == 88 { base = 16; i = i + 2 }
+        else if c == 111 || c == 79 { base = 8; i = i + 2 }
+        else if c == 98 || c == 66 { base = 2; i = i + 2 }
+    }
+    var v: i64 = 0
+    while i < s.length() {
+        var d = hexVal(s.at(i))
+        if d < 0 || d >= base { d = 0 }
+        v = v * base + d
+        i = i + 1
+    }
+    if neg { ret -v }
+    ret v
+}
+
+// ---- date helpers ----------------------------------------------------------
+
+fun daysInMonth(y: i64, m: i64): i64 {
+    if m == 2 {
+        if ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) { ret 29 }
+        ret 28
+    }
+    if m == 4 || m == 6 || m == 9 || m == 11 { ret 30 }
+    ret 31
+}
+
+fun validDate(y: i64, mo: i64, d: i64): bool {
+    if y < 0 || y > 9999 { ret false }
+    if mo < 1 || mo > 12 { ret false }
+    if d < 1 || d > daysInMonth(y, mo) { ret false }
+    ret true
+}
+
+fun validTime(h: i64, mi: i64, s: i64, ns: i64): bool {
+    if h < 0 || h > 23 { ret false }
+    if mi < 0 || mi > 59 { ret false }
+    if s < 0 || s > 60 { ret false }
+    if ns < 0 || ns > 999999999 { ret false }
+    ret true
+}
+
+fun validOffset(off: i64): bool {
+    if off < 0 { off = -off }
+    ret off <= 23 * 60 + 59
+}
+
+fun digitsAt(s: str, start: i64, count: i64): i64 {
+    if start < 0 || start + count > s.length() { ret -1 }
+    var v: i64 = 0
+    var i: i64 = 0
+    while i < count {
+        val c = s.at(start + i)
+        if c < 48 || c > 57 { ret -1 }
+        v = v * 10 + (c - 48)
+        i = i + 1
+    }
+    ret v
+}
+
+fun dateLike(raw: str): bool {
+    val n = raw.length()
+    if n >= 3 && isDigit(raw.at(0)) && isDigit(raw.at(1)) && raw.at(2) == 58 { ret true }
+    if n >= 5 && isDigit(raw.at(0)) && isDigit(raw.at(1)) && isDigit(raw.at(2)) && isDigit(raw.at(3)) && raw.at(4) == 45 {
+        ret true
+    }
+    ret false
+}
+
+fun parseTimePart(raw: str, start: i64, withDate: bool, out: *i64): bool {
+    val n = raw.length()
+    if start + 8 > n { ret false }
+    if raw.at(start + 2) != 58 || raw.at(start + 5) != 58 { ret false }
+    val h = digitsAt(raw, start, 2)
+    val mi = digitsAt(raw, start + 3, 2)
+    val s = digitsAt(raw, start + 6, 2)
+    if h < 0 || mi < 0 || s < 0 { ret false }
+    if !validTime(h, mi, s, 0) { ret false }
+    var p = start + 8
+    var ns: i64 = 0
+    if p < n && raw.at(p) == 46 {
+        p = p + 1
+        var dg: i64 = 0
+        while p < n && raw.at(p) >= 48 && raw.at(p) <= 57 {
+            if dg < 9 { ns = ns * 10 + (raw.at(p) - 48) }
+            dg = dg + 1
+            p = p + 1
+        }
+        if dg == 0 { ret false }
+        while dg < 9 {
+            ns = ns * 10
+            dg = dg + 1
+        }
+    }
+    var off: i64 = 0
+    var hasOff = false
+    if withDate && p < n {
+        val c = raw.at(p)
+        if c == 90 || c == 122 {
+            hasOff = true
+            p = p + 1
+        } else if c == 43 || c == 45 {
+            if p + 6 > n { ret false }
+            if raw.at(p + 3) != 58 { ret false }
+            val oh = digitsAt(raw, p + 1, 2)
+            val om = digitsAt(raw, p + 4, 2)
+            if oh < 0 || om < 0 { ret false }
+            if oh > 23 || om > 59 { ret false }
+            off = oh * 60 + om
+            if c == 45 { off = -off }
+            hasOff = true
+            p = p + 6
+        }
+    }
+    if p != n { ret false }
+    if withDate {
+        if hasOff { out[0] = DATE_OFFSET_DATETIME } else { out[0] = DATE_LOCAL_DATETIME }
+        out[4] = h; out[5] = mi; out[6] = s; out[7] = ns; out[8] = off
+    } else {
+        out[0] = DATE_LOCAL_TIME
+        out[1] = 0; out[2] = 0; out[3] = 0
+        out[4] = h; out[5] = mi; out[6] = s; out[7] = ns; out[8] = 0
+    }
+    ret true
+}
+
+/// Parse any of the four TOML date/time forms into `out` (9 i64 slots:
+/// kind, year, month, day, hour, minute, second, nanosecond, offsetMinutes).
+fun parseTomlDate(raw: str, out: *i64): bool {
+    val n = raw.length()
+    if n >= 8 && raw.at(2) == 58 {
+        ret parseTimePart(raw, 0, false, out)
+    }
+    if n < 10 { ret false }
+    if raw.at(4) != 45 || raw.at(7) != 45 { ret false }
+    val y = digitsAt(raw, 0, 4)
+    val mo = digitsAt(raw, 5, 2)
+    val d = digitsAt(raw, 8, 2)
+    if y < 0 || mo < 0 || d < 0 { ret false }
+    if !validDate(y, mo, d) { ret false }
+    out[1] = y; out[2] = mo; out[3] = d
+    if n == 10 {
+        out[0] = DATE_LOCAL_DATE
+        out[4] = 0; out[5] = 0; out[6] = 0; out[7] = 0; out[8] = 0
+        ret true
+    }
+    val sep = raw.at(10)
+    if sep != 84 && sep != 116 && sep != 32 { ret false }
+    ret parseTimePart(raw, 11, true, out)
+}
+
+fun append2(sb: StringBuilder, v: i64): void {
+    sb.appendByte((48 + (v / 10) % 10) as u8)
+    sb.appendByte((48 + v % 10) as u8)
+}
+
+fun append4(sb: StringBuilder, v: i64): void {
+    append2(sb, v / 100)
+    append2(sb, v % 100)
+}
+
+fun appendNano(sb: StringBuilder, ns: i64): void {
+    if ns <= 0 { ret }
+    var digits: i64 = 9
+    while digits > 1 && ns % 10 == 0 {
+        ns = ns / 10
+        digits = digits - 1
+    }
+    val s = fromInt(ns)
+    var pad: i64 = digits - s.length()
+    while pad > 0 {
+        sb.appendByte(48u8)
+        pad = pad - 1
+    }
+    sb.append(s)
+}
+
+fun formatDate(kind: i64, y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64,
+               ns: i64, off: i64): str {
+    val sb = StringBuilder()
+    if kind != DATE_LOCAL_TIME {
+        append4(sb, y)
+        sb.appendByte(45u8)
+        append2(sb, mo)
+        sb.appendByte(45u8)
+        append2(sb, d)
+        if kind == DATE_LOCAL_DATE { ret sb.toString() }
+        sb.appendByte(84u8)
+    }
+    append2(sb, h)
+    sb.appendByte(58u8)
+    append2(sb, mi)
+    sb.appendByte(58u8)
+    append2(sb, s)
+    if ns > 0 {
+        sb.appendByte(46u8)
+        appendNano(sb, ns)
+    }
+    if kind == DATE_OFFSET_DATETIME {
+        if off == 0 {
+            sb.appendByte(90u8)
+        } else {
+            var v = off
+            if v < 0 {
+                sb.appendByte(45u8)
+                v = -v
+            } else {
+                sb.appendByte(43u8)
+            }
+            append2(sb, v / 60)
+            sb.appendByte(58u8)
+            append2(sb, v % 60)
+        }
+    }
+    ret sb.toString()
+}
+
+fun writeIndent(sb: StringBuilder, level: i64): void {
+    var i: i64 = 0
+    while i < level * 2 {
+        sb.appendByte(32u8)
+        i = i + 1
+    }
+}
+
+// ---- parser ---------------------------------------------------------------
+
+class TomlParser {
+    var text: str
+    var pos: i64
+    var len: i64
+    var ok: bool
+
+    TomlParser(input: str) {
+        self.text = input
+        self.pos = 0
+        self.len = input.length()
+        self.ok = true
+    }
+
+    fun at(i: i64): i64 {
+        if i < 0 || i >= self.len { ret -1 }
+        ret self.text.at(i)
+    }
+
+    fun space(): bool => self.pos < self.len && (self.text.at(self.pos) == 32 || self.text.at(self.pos) == 9)
+    fun newline(): bool => self.pos < self.len && (self.text.at(self.pos) == 10 || self.text.at(self.pos) == 13)
+
+    fun skipSpaces(): void {
+        while self.space() { self.pos = self.pos + 1 }
+    }
+
+    /// Consume comment/blank lines and return them verbatim, including their
+    /// original indentation and line endings. Leaves `pos` on the next token.
+    fun takeTrivia(): str {
+        val sb = StringBuilder()
+        while self.pos < self.len {
+            val lineStart = self.pos
+            while self.pos < self.len && self.space() { self.pos = self.pos + 1 }
+            if self.pos < self.len && self.newline() {
+                if self.text.at(self.pos) == 13 { self.pos = self.pos + 1 }
+                if self.pos < self.len && self.text.at(self.pos) == 10 { self.pos = self.pos + 1 }
+                sb.append(self.text.substring(lineStart, self.pos))
+                continue
+            }
+            if self.pos < self.len && self.text.at(self.pos) == 35 {
+                while self.pos < self.len && !self.newline() { self.pos = self.pos + 1 }
+                if self.pos < self.len && self.text.at(self.pos) == 13 { self.pos = self.pos + 1 }
+                if self.pos < self.len && self.text.at(self.pos) == 10 { self.pos = self.pos + 1 }
+                sb.append(self.text.substring(lineStart, self.pos))
+                continue
+            }
+            self.pos = lineStart
+            ret sb.toString()
+        }
+        ret sb.toString()
+    }
+
+    /// Capture a `# ...` comment on the current line, without the newline.
+    fun takeTrail(): str {
+        self.skipSpaces()
+        if self.pos < self.len && self.text.at(self.pos) == 35 {
+            val start = self.pos
+            while self.pos < self.len && !self.newline() { self.pos = self.pos + 1 }
+            ret self.text.substring(start, self.pos)
+        }
+        ret ""
+    }
+
+    fun take(c: i64): bool {
+        if self.at(self.pos) == c {
+            self.pos = self.pos + 1
+            ret true
+        }
+        ret false
+    }
+
+    /// Consume exactly one CR/LF line terminator. Returns false at EOF or
+    /// when the current position is not a newline.
+    fun skipLineEnd(): bool {
+        if self.pos >= self.len { ret false }
+        if self.text.at(self.pos) == 13 {
+            self.pos = self.pos + 1
+            if self.pos < self.len && self.text.at(self.pos) == 10 { self.pos = self.pos + 1 }
+            ret true
+        }
+        if self.text.at(self.pos) == 10 {
+            self.pos = self.pos + 1
+            ret true
+        }
+        ret false
+    }
+
+    fun parseBasicString(multi: bool): str {
+        val sb = StringBuilder()
+        if !multi {
+            if !self.take(34) { self.ok = false; ret "" }
+        }
+        if multi && self.at(self.pos) == 10 { self.pos = self.pos + 1 }
+        if multi && self.at(self.pos) == 13 {
+            self.pos = self.pos + 1
+            if self.at(self.pos) == 10 { self.pos = self.pos + 1 }
+        }
+        while self.pos < self.len {
+            if multi {
+                if self.at(self.pos) == 34 && self.at(self.pos + 1) == 34 && self.at(self.pos + 2) == 34 {
+                    self.pos = self.pos + 3
+                    ret sb.toString()
+                }
+            } else if self.at(self.pos) == 34 {
+                self.pos = self.pos + 1
+                ret sb.toString()
+            }
+            val c = self.text.at(self.pos)
+            if c != 92 {
+                sb.appendByte((c % 256) as u8)
+                self.pos = self.pos + 1
+            } else {
+                self.pos = self.pos + 1
+                if self.pos >= self.len { self.ok = false; ret "" }
+                val e = self.text.at(self.pos)
+                if e == 10 || e == 13 {
+                    while self.pos < self.len {
+                        val w = self.text.at(self.pos)
+                        if w == 32 || w == 9 || w == 10 || w == 13 {
+                            self.pos = self.pos + 1
+                        } else {
+                            break
+                        }
+                    }
+                } else {
+                    self.pos = self.pos + 1
+                    if e == 98 { sb.appendByte(8u8) }
+                    else if e == 116 { sb.appendByte(9u8) }
+                    else if e == 110 { sb.appendByte(10u8) }
+                    else if e == 102 { sb.appendByte(12u8) }
+                    else if e == 114 { sb.appendByte(13u8) }
+                    else if e == 34 { sb.appendByte(34u8) }
+                    else if e == 92 { sb.appendByte(92u8) }
+                    else if e == 117 {
+                        var cp: i64 = 0
+                        var k: i64 = 0
+                        while k < 4 {
+                            val h = hexVal(self.at(self.pos))
+                            if h < 0 { self.ok = false; ret "" }
+                            cp = cp * 16 + h
+                            self.pos = self.pos + 1
+                            k = k + 1
+                        }
+                        appendUtf8(sb, cp)
+                    } else if e == 85 {
+                        var cp: i64 = 0
+                        var k: i64 = 0
+                        while k < 8 {
+                            val h = hexVal(self.at(self.pos))
+                            if h < 0 { self.ok = false; ret "" }
+                            cp = cp * 16 + h
+                            self.pos = self.pos + 1
+                            k = k + 1
+                        }
+                        appendUtf8(sb, cp)
+                    } else {
+                        self.ok = false
+                        ret ""
+                    }
+                }
+            }
+        }
+        self.ok = false
+        ret ""
+    }
+
+    fun parseLiteralString(multi: bool): str {
+        val sb = StringBuilder()
+        if !multi {
+            if !self.take(39) { self.ok = false; ret "" }
+        }
+        if multi && self.at(self.pos) == 10 { self.pos = self.pos + 1 }
+        if multi && self.at(self.pos) == 13 {
+            self.pos = self.pos + 1
+            if self.at(self.pos) == 10 { self.pos = self.pos + 1 }
+        }
+        while self.pos < self.len {
+            if multi {
+                if self.at(self.pos) == 39 && self.at(self.pos + 1) == 39 && self.at(self.pos + 2) == 39 {
+                    self.pos = self.pos + 3
+                    ret sb.toString()
+                }
+            } else if self.at(self.pos) == 39 {
+                self.pos = self.pos + 1
+                ret sb.toString()
+            }
+            sb.appendByte((self.text.at(self.pos) % 256) as u8)
+            self.pos = self.pos + 1
+        }
+        self.ok = false
+        ret ""
+    }
+
+    /// Parse a dotted key path into `out`. `out` is cleared first.
+    fun parseKeyPath(out: List<str>): bool {
+        out.clear()
+        while true {
+            self.skipSpaces()
+            val c = self.at(self.pos)
+            var key: str = ""
+            if c == 34 {
+                key = self.parseBasicString(false)
+            } else if c == 39 {
+                key = self.parseLiteralString(false)
+            } else {
+                val start = self.pos
+                while self.pos < self.len && isBare(self.text.at(self.pos)) {
+                    self.pos = self.pos + 1
+                }
+                if self.pos == start { self.ok = false; ret false }
+                key = self.text.substring(start, self.pos)
+            }
+            if !self.ok { ret false }
+            if key.length() == 0 { self.ok = false; ret false }
+            out.add(key)
+            self.skipSpaces()
+            if self.take(46) { continue }
+            ret true
+        }
+        ret false
+    }
+
+    fun parseScalar(doc: Toml): i64 {
+        val start = self.pos
+        while self.pos < self.len {
+            val c = self.text.at(self.pos)
+            if c == 32 || c == 9 || c == 10 || c == 13 || c == 44 || c == 93 || c == 125 || c == 35 {
+                break
+            }
+            self.pos = self.pos + 1
+        }
+        var raw = self.text.substring(start, self.pos)
+        // TOML permits one space between a date and its time.
+        if raw.length() == 10 && raw.at(4) == 45 && raw.at(7) == 45 && self.at(self.pos) == 32 {
+            val save = self.pos
+            self.pos = self.pos + 1
+            val t0 = self.pos
+            while self.pos < self.len {
+                val c = self.text.at(self.pos)
+                if c == 32 || c == 9 || c == 10 || c == 13 || c == 44 || c == 93 || c == 125 || c == 35 {
+                    break
+                }
+                self.pos = self.pos + 1
+            }
+            val tail = self.text.substring(t0, self.pos)
+            if tail.indexOf(":") < 0 {
+                self.pos = save
+            } else {
+                raw = raw + " " + tail
+            }
+        }
+        if raw.length() == 0 { self.ok = false; ret -1 }
+        if raw == "true" || raw == "false" {
+            val node = doc.addNode(TOML_BOOL)
+            doc.setText(node, raw)
+            if raw == "true" { doc.setInt(node, 1) }
+            ret node
+        }
+        if raw == "inf" || raw == "+inf" || raw == "-inf" || raw == "nan" || raw == "+nan" || raw == "-nan" {
+            val node = doc.addNode(TOML_FLOAT)
+            doc.setText(node, raw)
+            ret node
+        }
+
+        val datebuf = intArray(9, 0)
+        if parseTomlDate(raw, datebuf.data) {
+            val node = doc.addNode(TOML_DATE)
+            doc.setDateFields(node, datebuf)
+            doc.setText(node, raw)
+            ret node
+        }
+        if dateLike(raw) {
+            self.ok = false
+            ret -1
+        }
+
+        var prefix = 0
+        if raw.length() > 2 && raw.at(0) == 48 {
+            val x = raw.at(1)
+            if x == 120 || x == 88 || x == 111 || x == 79 || x == 98 || x == 66 { prefix = 1 }
+        }
+        var isFloat = false
+        var i: i64 = 0
+        while i < raw.length() {
+            val c = raw.at(i)
+            if c == 46 || c == 101 || c == 69 { isFloat = true }
+            i = i + 1
+        }
+        if prefix == 1 { isFloat = false }
+        if isFloat {
+            val node = doc.addNode(TOML_FLOAT)
+            doc.setText(node, raw)
+            doc.setFloat(node, trimUnderscores(raw).toFloat())
+            ret node
+        }
+        if isDigit(raw.at(0)) || raw.at(0) == 45 || raw.at(0) == 43 {
+            val node = doc.addNode(TOML_INT)
+            doc.setText(node, raw)
+            doc.setInt(node, parseTomlInt(raw))
+            ret node
+        }
+        self.ok = false
+        ret -1
+    }
+
+    fun parseArray(doc: Toml): i64 {
+        val node = doc.addNode(TOML_ARRAY)
+        self.pos = self.pos + 1
+        var multi = false
+        if self.skipLineEnd() { multi = true }
+        var pending = self.takeTrivia()
+        if pending.length() > 0 { multi = true }
+        if self.take(93) {
+            doc.setEndtrivia(node, pending)
+            doc.setArrmulti(node, multi)
+            ret node
+        }
+        while true {
+            val v = self.parseValue(doc)
+            if v < 0 { ret -1 }
+            doc.setLead(v, pending)
+            doc.addChild(node, v)
+            var trail = self.takeTrail()
+            self.skipSpaces()
+            var comma = false
+            if self.take(44) {
+                comma = true
+                val afterComma = self.takeTrail()
+                if afterComma.length() > 0 {
+                    trail = cloneText(afterComma)
+                    doc.setTrailafter(v, 1)
+                }
+            }
+            if trail.length() > 0 { doc.setTrail(v, trail) }
+            if doc.arrayMultiline(v) { multi = true }
+            if self.skipLineEnd() { multi = true }
+            val after = self.takeTrivia()
+            if after.length() > 0 { multi = true }
+            if self.take(93) {
+                doc.setEndtrivia(node, after)
+                doc.setArrcomma(node, comma)
+                doc.setArrmulti(node, multi)
+                ret node
+            }
+            if !comma {
+                self.ok = false
+                ret -1
+            }
+            pending = cloneText(after)
+        }
+        ret -1
+    }
+
+    fun parseInlineTable(doc: Toml): i64 {
+        val node = doc.addNode(TOML_TABLE)
+        self.pos = self.pos + 1
+        val path = List<str>()
+        self.skipSpaces()
+        if self.take(125) { ret node }
+        while true {
+            if !self.parseKeyPath(path) { ret -1 }
+            self.skipSpaces()
+            if !self.take(61) { self.ok = false; ret -1 }
+            self.skipSpaces()
+            val v = self.parseValue(doc)
+            if v < 0 { ret -1 }
+            if !doc.assignPath(node, path, v) { self.ok = false; ret -1 }
+            self.skipSpaces()
+            if self.take(44) {
+                self.skipSpaces()
+                continue
+            }
+            if self.take(125) { ret node }
+            self.ok = false
+            ret -1
+        }
+        ret -1
+    }
+
+    fun parseValue(doc: Toml): i64 {
+        self.skipSpaces()
+        val c = self.at(self.pos)
+        if c == 34 {
+            if self.at(self.pos + 1) == 34 && self.at(self.pos + 2) == 34 {
+                self.pos = self.pos + 3
+                val v = self.parseBasicString(true)
+                if !self.ok { ret -1 }
+                val node = doc.addNode(TOML_STRING)
+                doc.setText(node, v)
+                ret node
+            }
+            val v = self.parseBasicString(false)
+            if !self.ok { ret -1 }
+            val node = doc.addNode(TOML_STRING)
+            doc.setText(node, v)
+            ret node
+        }
+        if c == 39 {
+            if self.at(self.pos + 1) == 39 && self.at(self.pos + 2) == 39 {
+                self.pos = self.pos + 3
+                val v = self.parseLiteralString(true)
+                if !self.ok { ret -1 }
+                val node = doc.addNode(TOML_STRING)
+                doc.setText(node, v)
+                ret node
+            }
+            val v = self.parseLiteralString(false)
+            if !self.ok { ret -1 }
+            val node = doc.addNode(TOML_STRING)
+            doc.setText(node, v)
+            ret node
+        }
+        if c == 91 { ret self.parseArray(doc) }
+        if c == 123 { ret self.parseInlineTable(doc) }
+        ret self.parseScalar(doc)
+    }
+
+    fun run(doc: Toml): bool {
+        doc.clear()
+        val root = doc.tableValue()
+        var current = root
+        val path = List<str>()
+        while true {
+            val lead = self.takeTrivia()
+            if self.pos >= self.len {
+                doc.setDocumentTail(lead)
+                ret true
+            }
+            if self.at(self.pos) == 91 {
+                self.pos = self.pos + 1
+                var arrayTable = false
+                if self.take(91) { arrayTable = true }
+                if !self.parseKeyPath(path) { ret false }
+                self.skipSpaces()
+                if !self.take(93) { ret false }
+                if arrayTable {
+                    if !self.take(93) { ret false }
+                }
+                val trail = self.takeTrail()
+                if self.pos < self.len && !self.skipLineEnd() { ret false }
+                if arrayTable {
+                    current = doc.ensureArrayTable(root, path)
+                } else {
+                    current = doc.ensureTablePath(root, path)
+                }
+                if current < 0 { ret false }
+                doc.setLead(current, lead)
+                doc.setTrail(current, trail)
+            } else {
+                if !self.parseKeyPath(path) { ret false }
+                self.skipSpaces()
+                if !self.take(61) { ret false }
+                self.skipSpaces()
+                val v = self.parseValue(doc)
+                if v < 0 { ret false }
+                val trail = self.takeTrail()
+                if self.pos < self.len && !self.skipLineEnd() { ret false }
+                doc.setLead(v, lead)
+                doc.setTrail(v, trail)
+                if !doc.assignPath(current, path, v) { ret false }
+            }
+        }
+        ret true
+    }
+}
+
+// ---- document -------------------------------------------------------------
+
+/// TOML document: a node pool plus parse/serialize helpers.
+pub class Toml {
+    var kinds: List<i64>
+    var texts: List<str>
+    var ints: List<i64>
+    var floats: List<f64>
+    var firstchild: List<i64>
+    var nextsibling: List<i64>
+    var counts: List<i64>
+    var keys: List<str>
+    var leads: List<str>
+    var trails: List<str>
+    var endtrivia: List<str>
+    var arrmulti: List<i64>
+    var arrcomma: List<i64>
+    var trailafter: List<i64>
+    var datevals: List<i64>
+    var tail: str
+
+    Toml() {
+        self.kinds = List<i64>()
+        self.texts = List<str>()
+        self.ints = List<i64>()
+        self.floats = List<f64>()
+        self.firstchild = List<i64>()
+        self.nextsibling = List<i64>()
+        self.counts = List<i64>()
+        self.keys = List<str>()
+        self.leads = List<str>()
+        self.trails = List<str>()
+        self.endtrivia = List<str>()
+        self.arrmulti = List<i64>()
+        self.arrcomma = List<i64>()
+        self.trailafter = List<i64>()
+        self.datevals = List<i64>()
+        self.tail = ""
+        self.addNode(TOML_TABLE)
+    }
+
+    fun clear(): void {
+        self.kinds.clear()
+        self.texts.clear()
+        self.ints.clear()
+        self.floats.clear()
+        self.firstchild.clear()
+        self.nextsibling.clear()
+        self.counts.clear()
+        self.keys.clear()
+        self.leads.clear()
+        self.trails.clear()
+        self.endtrivia.clear()
+        self.arrmulti.clear()
+        self.arrcomma.clear()
+        self.trailafter.clear()
+        self.datevals.clear()
+        self.tail = ""
+    }
+
+    fun addNode(kind: i64): i64 {
+        val node = self.kinds.size()
+        self.kinds.add(kind)
+        self.texts.add("")
+        self.ints.add(0)
+        self.floats.add(0.0)
+        self.firstchild.add(-1)
+        self.nextsibling.add(-1)
+        self.counts.add(0)
+        self.keys.add("")
+        self.leads.add("")
+        self.trails.add("")
+        self.endtrivia.add("")
+        self.arrmulti.add(0)
+        self.arrcomma.add(0)
+        self.trailafter.add(0)
+        var i: i64 = 0
+        while i < 9 {
+            self.datevals.add(0)
+            i = i + 1
+        }
+        ret node
+    }
+
+    fun addChild(parent: i64, child: i64): void {
+        val n = self.counts.get(parent)
+        if n == 0 {
+            self.firstchild.set(parent, child)
+        } else {
+            var at = self.firstchild.get(parent)
+            while self.nextsibling.get(at) >= 0 {
+                at = self.nextsibling.get(at)
+            }
+            self.nextsibling.set(at, child)
+        }
+        self.counts.set(parent, n + 1)
+    }
+
+    fun setText(node: i64, v: str): void => self.texts.set(node, v)
+    fun setInt(node: i64, v: i64): void => self.ints.set(node, v)
+    fun setFloat(node: i64, v: f64): void => self.floats.set(node, v)
+    fun setLead(node: i64, v: str): void => self.leads.set(node, v)
+    fun setTrail(node: i64, v: str): void => self.trails.set(node, v)
+    fun setEndtrivia(node: i64, v: str): void => self.endtrivia.set(node, v)
+    fun setArrmulti(node: i64, v: bool): void {
+        self.arrmulti.set(node, v ? 1 : 0)
+    }
+    fun setArrcomma(node: i64, v: bool): void {
+        self.arrcomma.set(node, v ? 1 : 0)
+    }
+    fun setTrailafter(node: i64, v: i64): void => self.trailafter.set(node, v)
+
+    fun dget(node: i64, i: i64): i64 => self.datevals.get(node * 9 + i)
+    fun dset(node: i64, i: i64, v: i64): void => self.datevals.set(node * 9 + i, v)
+
+    fun setDateFields(node: i64, buf: Array<i64>): void {
+        var i: i64 = 0
+        while i < 9 {
+            self.datevals.set(node * 9 + i, buf.get(i))
+            i = i + 1
+        }
+    }
+
+    pub fun parse(text: str): bool {
+        val parser = TomlParser(text)
+        if !parser.run(self) {
+            self.clear()
+            ret false
+        }
+        ret true
+    }
+
+    pub fun root(): i64 {
+        if self.kinds.size() == 0 { ret -1 }
+        ret 0
+    }
+
+    pub fun kind(node: i64): i64 => self.kinds.get(node)
+    pub fun size(node: i64): i64 => self.counts.get(node)
+    pub fun keyAt(node: i64, i: i64): str => self.keys.get(self.indexAt(node, i))
+
+    pub fun indexAt(node: i64, i: i64): i64 {
+        var at = self.firstchild.get(node)
+        var k: i64 = 0
+        while k < i {
+            at = self.nextsibling.get(at)
+            k = k + 1
+        }
+        ret at
+    }
+
+    pub fun isTable(node: i64): bool => self.kind(node) == TOML_TABLE
+    pub fun isArray(node: i64): bool => self.kind(node) == TOML_ARRAY
+    pub fun isString(node: i64): bool => self.kind(node) == TOML_STRING
+    pub fun isInt(node: i64): bool => self.kind(node) == TOML_INT
+    pub fun isFloat(node: i64): bool => self.kind(node) == TOML_FLOAT
+    pub fun isBool(node: i64): bool => self.kind(node) == TOML_BOOL
+    pub fun isDate(node: i64): bool => self.kind(node) == TOML_DATE
+
+    pub fun asString(node: i64): str => self.texts.get(node)
+    pub fun asInt(node: i64): i64 {
+        if self.kind(node) == TOML_INT { ret self.ints.get(node) }
+        ret self.texts.get(node).toLong()
+    }
+    pub fun asFloat(node: i64): f64 => self.texts.get(node).toFloat()
+    pub fun asBool(node: i64): bool => self.ints.get(node) != 0
+
+    // ---- comments / formatting ----
+    pub fun leadingTrivia(node: i64): str => self.leads.get(node)
+    pub fun trailingComment(node: i64): str => self.trails.get(node)
+    pub fun setLeadingTrivia(node: i64, v: str): void => self.leads.set(node, v)
+    pub fun setTrailingComment(node: i64, v: str): void => self.trails.set(node, v)
+    pub fun documentTail(): str => self.tail
+    pub fun setDocumentTail(v: str): void => self.tail = cloneText(v)
+    pub fun arrayMultiline(node: i64): bool => self.arrmulti.get(node) != 0
+    pub fun arrayTrailingComma(node: i64): bool => self.arrcomma.get(node) != 0
+    pub fun setArrayMultiline(node: i64, v: bool): void => self.arrmulti.set(node, v ? 1 : 0)
+
+    // ---- dates ----
+    pub fun dateKind(node: i64): i64 => self.dget(node, 0)
+    pub fun isOffsetDateTime(node: i64): bool => self.isDate(node) && self.dget(node, 0) == DATE_OFFSET_DATETIME
+    pub fun isLocalDateTime(node: i64): bool => self.isDate(node) && self.dget(node, 0) == DATE_LOCAL_DATETIME
+    pub fun isLocalDate(node: i64): bool => self.isDate(node) && self.dget(node, 0) == DATE_LOCAL_DATE
+    pub fun isLocalTime(node: i64): bool => self.isDate(node) && self.dget(node, 0) == DATE_LOCAL_TIME
+    pub fun hasDateOffset(node: i64): bool => self.isDate(node) && self.dget(node, 0) == DATE_OFFSET_DATETIME
+    pub fun dateYear(node: i64): i64 => self.dget(node, 1)
+    pub fun dateMonth(node: i64): i64 => self.dget(node, 2)
+    pub fun dateDay(node: i64): i64 => self.dget(node, 3)
+    pub fun dateHour(node: i64): i64 => self.dget(node, 4)
+    pub fun dateMinute(node: i64): i64 => self.dget(node, 5)
+    pub fun dateSecond(node: i64): i64 => self.dget(node, 6)
+    pub fun dateNanosecond(node: i64): i64 => self.dget(node, 7)
+    pub fun dateOffsetMinutes(node: i64): i64 => self.dget(node, 8)
+    pub fun asDateText(node: i64): str => self.texts.get(node)
+
+    pub fun offsetDateTime(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64,
+                           ns: i64, offsetMinutes: i64): i64 {
+        if !validDate(y, mo, d) { ret -1 }
+        if !validTime(h, mi, s, ns) { ret -1 }
+        if !validOffset(offsetMinutes) { ret -1 }
+        val n = self.addNode(TOML_DATE)
+        self.dset(n, 0, DATE_OFFSET_DATETIME)
+        self.dset(n, 1, y); self.dset(n, 2, mo); self.dset(n, 3, d)
+        self.dset(n, 4, h); self.dset(n, 5, mi); self.dset(n, 6, s)
+        self.dset(n, 7, ns); self.dset(n, 8, offsetMinutes)
+        self.texts.set(n, formatDate(DATE_OFFSET_DATETIME, y, mo, d, h, mi, s, ns, offsetMinutes))
+        ret n
+    }
+
+    pub fun localDateTime(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64, ns: i64): i64 {
+        if !validDate(y, mo, d) { ret -1 }
+        if !validTime(h, mi, s, ns) { ret -1 }
+        val n = self.addNode(TOML_DATE)
+        self.dset(n, 0, DATE_LOCAL_DATETIME)
+        self.dset(n, 1, y); self.dset(n, 2, mo); self.dset(n, 3, d)
+        self.dset(n, 4, h); self.dset(n, 5, mi); self.dset(n, 6, s)
+        self.dset(n, 7, ns)
+        self.texts.set(n, formatDate(DATE_LOCAL_DATETIME, y, mo, d, h, mi, s, ns, 0))
+        ret n
+    }
+
+    pub fun localDate(y: i64, mo: i64, d: i64): i64 {
+        if !validDate(y, mo, d) { ret -1 }
+        val n = self.addNode(TOML_DATE)
+        self.dset(n, 0, DATE_LOCAL_DATE)
+        self.dset(n, 1, y); self.dset(n, 2, mo); self.dset(n, 3, d)
+        self.texts.set(n, formatDate(DATE_LOCAL_DATE, y, mo, d, 0, 0, 0, 0, 0))
+        ret n
+    }
+
+    pub fun localTime(h: i64, mi: i64, s: i64, ns: i64): i64 {
+        if !validTime(h, mi, s, ns) { ret -1 }
+        val n = self.addNode(TOML_DATE)
+        self.dset(n, 0, DATE_LOCAL_TIME)
+        self.dset(n, 4, h); self.dset(n, 5, mi); self.dset(n, 6, s)
+        self.dset(n, 7, ns)
+        self.texts.set(n, formatDate(DATE_LOCAL_TIME, 0, 0, 0, h, mi, s, ns, 0))
+        ret n
+    }
+
+    // ---- lookup ----
+    pub fun get(node: i64, key: str): i64 {
+        if !self.isTable(node) { ret -1 }
+        val n = self.counts.get(node)
+        var at = self.firstchild.get(node)
+        var i: i64 = 0
+        while i < n {
+            if self.keys.get(at) == key { ret at }
+            at = self.nextsibling.get(at)
+            i = i + 1
+        }
+        ret -1
+    }
+
+    pub fun getString(node: i64, key: str, fallback: str): str {
+        val at = self.get(node, key)
+        if at < 0 { ret fallback }
+        ret self.asString(at)
+    }
+    pub fun getInt(node: i64, key: str, fallback: i64): i64 {
+        val at = self.get(node, key)
+        if at < 0 { ret fallback }
+        ret self.asInt(at)
+    }
+    pub fun getFloat(node: i64, key: str, fallback: f64): f64 {
+        val at = self.get(node, key)
+        if at < 0 { ret fallback }
+        ret self.asFloat(at)
+    }
+    pub fun getBool(node: i64, key: str, fallback: bool): bool {
+        val at = self.get(node, key)
+        if at < 0 { ret fallback }
+        ret self.asBool(at)
+    }
+
+    fun findChild(parent: i64, key: str): i64 {
+        val n = self.counts.get(parent)
+        var at = self.firstchild.get(parent)
+        var i: i64 = 0
+        while i < n {
+            if self.keys.get(at) == key { ret at }
+            at = self.nextsibling.get(at)
+            i = i + 1
+        }
+        ret -1
+    }
+
+    fun ensureTable(parent: i64, key: str): i64 {
+        val found = self.findChild(parent, key)
+        if found >= 0 {
+            if self.kind(found) == TOML_TABLE { ret found }
+            if self.isTableArray(found) && self.counts.get(found) > 0 {
+                var at = self.firstchild.get(found)
+                while self.nextsibling.get(at) >= 0 {
+                    at = self.nextsibling.get(at)
+                }
+                ret at
+            }
+            ret -1
+        }
+        val node = self.addNode(TOML_TABLE)
+        self.keys.set(node, key)
+        self.addChild(parent, node)
+        ret node
+    }
+
+    fun ensureTablePath(root: i64, path: List<str>): i64 {
+        var cur = root
+        var i: i64 = 0
+        while i < path.size() {
+            cur = self.ensureTable(cur, path.get(i))
+            if cur < 0 { ret -1 }
+            i = i + 1
+        }
+        ret cur
+    }
+
+    fun ensureArrayTable(root: i64, path: List<str>): i64 {
+        var cur = root
+        var i: i64 = 0
+        while i < path.size() - 1 {
+            cur = self.ensureTable(cur, path.get(i))
+            if cur < 0 { ret -1 }
+            i = i + 1
+        }
+        val key = path.get(path.size() - 1)
+        var arr = self.findChild(cur, key)
+        if arr < 0 {
+            arr = self.addNode(TOML_ARRAY)
+            self.keys.set(arr, key)
+            self.addChild(cur, arr)
+        } else if self.kind(arr) != TOML_ARRAY {
+            ret -1
+        }
+        val t = self.addNode(TOML_TABLE)
+        self.addChild(arr, t)
+        ret t
+    }
+
+    fun assignPath(table: i64, path: List<str>, value: i64): bool {
+        var cur = table
+        var i: i64 = 0
+        while i < path.size() - 1 {
+            cur = self.ensureTable(cur, path.get(i))
+            if cur < 0 { ret false }
+            i = i + 1
+        }
+        val key = path.get(path.size() - 1)
+        if self.findChild(cur, key) >= 0 { ret false }
+        self.keys.set(value, key)
+        self.addChild(cur, value)
+        ret true
+    }
+
+    fun addNodeValue(kind: i64, text: str): i64 {
+        val n = self.addNode(kind)
+        self.texts.set(n, text)
+        ret n
+    }
+
+    pub fun tableValue(): i64 => self.addNode(TOML_TABLE)
+    pub fun arrayValue(): i64 => self.addNode(TOML_ARRAY)
+    pub fun stringValue(v: str): i64 => self.addNodeValue(TOML_STRING, v)
+    pub fun dateValue(v: str): i64 {
+        val buf = intArray(9, 0)
+        if !parseTomlDate(v, buf.data) { ret -1 }
+        val n = self.addNode(TOML_DATE)
+        self.setDateFields(n, buf)
+        self.texts.set(n, v)
+        ret n
+    }
+    pub fun intValue(v: i64): i64 {
+        val n = self.addNode(TOML_INT)
+        self.ints.set(n, v)
+        self.texts.set(n, fromInt(v))
+        ret n
+    }
+    pub fun floatValue(v: f64): i64 {
+        val n = self.addNode(TOML_FLOAT)
+        self.floats.set(n, v)
+        self.texts.set(n, fromFloat(v))
+        ret n
+    }
+    pub fun boolValue(v: bool): i64 {
+        val n = self.addNode(TOML_BOOL)
+        if v { self.ints.set(n, 1) }
+        self.texts.set(n, v ? "true" : "false")
+        ret n
+    }
+
+    pub fun add(parent: i64, child: i64): i64 {
+        self.addChild(parent, child)
+        ret child
+    }
+    pub fun put(parent: i64, key: str, child: i64): i64 {
+        self.keys.set(child, key)
+        self.addChild(parent, child)
+        ret child
+    }
+    pub fun putTable(parent: i64, key: str): i64 => self.put(parent, key, self.tableValue())
+    pub fun putArray(parent: i64, key: str): i64 => self.put(parent, key, self.arrayValue())
+    pub fun putString(parent: i64, key: str, v: str): i64 => self.put(parent, key, self.stringValue(v))
+    pub fun putInt(parent: i64, key: str, v: i64): i64 => self.put(parent, key, self.intValue(v))
+    pub fun putFloat(parent: i64, key: str, v: f64): i64 => self.put(parent, key, self.floatValue(v))
+    pub fun putBool(parent: i64, key: str, v: bool): i64 => self.put(parent, key, self.boolValue(v))
+    pub fun addTable(array: i64): i64 => self.add(array, self.tableValue())
+
+    // ---- serialization ----
+    fun writeKey(k: str, sb: StringBuilder): void {
+        var bare = k.length() > 0
+        var i: i64 = 0
+        while i < k.length() {
+            if !isBare(k.at(i)) { bare = false }
+            i = i + 1
+        }
+        if bare {
+            sb.append(k)
+            ret
+        }
+        sb.appendByte(34u8)
+        i = 0
+        while i < k.length() {
+            val c = k.at(i)
+            if c == 34 { sb.append("\\\"") }
+            else if c == 92 { sb.append("\\\\") }
+            else if c == 10 { sb.append("\\n") }
+            else if c == 13 { sb.append("\\r") }
+            else if c == 9 { sb.append("\\t") }
+            else if c < 32 {
+                sb.append("\\u")
+                appendHex4(sb, c)
+            } else {
+                sb.appendByte((c % 256) as u8)
+            }
+            i = i + 1
+        }
+        sb.appendByte(34u8)
+    }
+
+    fun writePath(parent: str, key: str, sb: StringBuilder): void {
+        if parent.length() > 0 {
+            sb.append(parent)
+            sb.append(".")
+        }
+        self.writeKey(key, sb)
+    }
+
+    fun writeString(v: str, sb: StringBuilder): void {
+        sb.appendByte(34u8)
+        var i: i64 = 0
+        while i < v.length() {
+            val c = v.at(i)
+            if c == 34 { sb.append("\\\"") }
+            else if c == 92 { sb.append("\\\\") }
+            else if c == 10 { sb.append("\\n") }
+            else if c == 13 { sb.append("\\r") }
+            else if c == 9 { sb.append("\\t") }
+            else if c == 8 { sb.append("\\b") }
+            else if c == 12 { sb.append("\\f") }
+            else if c < 32 {
+                sb.append("\\u")
+                appendHex4(sb, c)
+            } else {
+                sb.appendByte((c % 256) as u8)
+            }
+            i = i + 1
+        }
+        sb.appendByte(34u8)
+    }
+
+    fun isTableArray(node: i64): bool {
+        if self.kind(node) != TOML_ARRAY { ret false }
+        val n = self.counts.get(node)
+        if n == 0 { ret false }
+        var at = self.firstchild.get(node)
+        var i: i64 = 0
+        while i < n {
+            if self.kind(at) != TOML_TABLE { ret false }
+            at = self.nextsibling.get(at)
+            i = i + 1
+        }
+        ret true
+    }
+
+    fun writeValue(node: i64, sb: StringBuilder, indent: i64): void {
+        val k = self.kinds.get(node)
+        if k == TOML_STRING {
+            self.writeString(self.texts.get(node), sb)
+            ret
+        }
+        if k == TOML_INT || k == TOML_FLOAT || k == TOML_BOOL || k == TOML_DATE {
+            sb.append(self.texts.get(node))
+            ret
+        }
+        if k == TOML_ARRAY {
+            val n = self.counts.get(node)
+            if !self.arrayMultiline(node) {
+                sb.appendByte(91u8)
+                var at = self.firstchild.get(node)
+                var i: i64 = 0
+                while i < n {
+                    if i > 0 { sb.append(", ") }
+                    self.writeValue(at, sb, indent)
+                    at = self.nextsibling.get(at)
+                    i = i + 1
+                }
+                sb.appendByte(93u8)
+                ret
+            }
+            sb.append("[\n")
+            var at = self.firstchild.get(node)
+            var i: i64 = 0
+            while i < n {
+                sb.append(self.leads.get(at))
+                writeIndent(sb, indent + 1)
+                self.writeValue(at, sb, indent + 1)
+                val trail = self.trails.get(at)
+                val after = self.trailafter.get(at) != 0
+                val last = i + 1 == n
+                if after {
+                    sb.appendByte(44u8)
+                    if trail.length() > 0 {
+                        sb.appendByte(32u8)
+                        sb.append(trail)
+                    }
+                } else {
+                    if !last || self.arrcomma.get(node) != 0 { sb.appendByte(44u8) }
+                    if trail.length() > 0 {
+                        sb.appendByte(32u8)
+                        sb.append(trail)
+                    }
+                }
+                sb.appendByte(10u8)
+                at = self.nextsibling.get(at)
+                i = i + 1
+            }
+            sb.append(self.endtrivia.get(node))
+            writeIndent(sb, indent)
+            sb.appendByte(93u8)
+            ret
+        }
+        if k == TOML_TABLE {
+            val n = self.counts.get(node)
+            sb.append("{ ")
+            var at = self.firstchild.get(node)
+            var i: i64 = 0
+            while i < n {
+                if i > 0 { sb.append(", ") }
+                self.writeKey(self.keys.get(at), sb)
+                sb.append(" = ")
+                self.writeValue(at, sb, indent)
+                at = self.nextsibling.get(at)
+                i = i + 1
+            }
+            sb.append(" }")
+            ret
+        }
+        sb.append("\"\"")
+    }
+
+    fun writeTable(node: i64, path: str, sb: StringBuilder) {
+        // key/value members first, in their original order among themselves
+        var at = self.firstchild.get(node)
+        val n = self.counts.get(node)
+        var i: i64 = 0
+        while i < n {
+            val k = self.kind(at)
+            if k != TOML_TABLE && !self.isTableArray(at) {
+                sb.append(self.leads.get(at))
+                self.writeKey(self.keys.get(at), sb)
+                sb.append(" = ")
+                self.writeValue(at, sb, 0)
+                val trail = self.trails.get(at)
+                if trail.length() > 0 {
+                    sb.appendByte(32u8)
+                    sb.append(trail)
+                }
+                sb.appendByte(10u8)
+            }
+            at = self.nextsibling.get(at)
+            i = i + 1
+        }
+        // then sub-tables and arrays of tables
+        at = self.firstchild.get(node)
+        i = 0
+        while i < n {
+            val k = self.kind(at)
+            if k == TOML_TABLE {
+                sb.append(self.leads.get(at))
+                sb.appendByte(91u8)
+                self.writePath(path, self.keys.get(at), sb)
+                sb.appendByte(93u8)
+                val trail = self.trails.get(at)
+                if trail.length() > 0 {
+                    sb.appendByte(32u8)
+                    sb.append(trail)
+                }
+                sb.appendByte(10u8)
+                self.writeTable(at, self.childPath(path, self.keys.get(at)), sb)
+            } else if self.isTableArray(at) {
+                var el = self.firstchild.get(at)
+                val m = self.counts.get(at)
+                var j: i64 = 0
+                while j < m {
+                    sb.append(self.leads.get(el))
+                    sb.appendByte(91u8)
+                    sb.appendByte(91u8)
+                    self.writePath(path, self.keys.get(at), sb)
+                    sb.appendByte(93u8)
+                    sb.appendByte(93u8)
+                    val trail = self.trails.get(el)
+                    if trail.length() > 0 {
+                        sb.appendByte(32u8)
+                        sb.append(trail)
+                    }
+                    sb.appendByte(10u8)
+                    self.writeTable(el, self.childPath(path, self.keys.get(at)), sb)
+                    el = self.nextsibling.get(el)
+                    j = j + 1
+                }
+            }
+            at = self.nextsibling.get(at)
+            i = i + 1
+        }
+    }
+
+    fun childPath(parent: str, key: str): str {
+        val sb = StringBuilder()
+        self.writePath(parent, key, sb)
+        ret sb.toString()
+    }
+
+    pub fun serialize(): str {
+        val sb = StringBuilder()
+        val root = self.root()
+        if root >= 0 { self.writeTable(root, "", sb) }
+        sb.append(self.tail)
+        ret sb.toString()
+    }
+}

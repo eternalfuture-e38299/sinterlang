@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: `Pair<A, B>` — two-element tuple
+//
+// `Pair<str, i64>` and `Pair<i64, str>` are separate monomorphizations
+// (`Pair_str_i64` / `Pair_i64_str`); copying, releasing and rendering each
+// component are dispatched on A / B.
+//
+//     import std.pair
+//
+//     val p = Pair<str, i64>("count", 42)
+//     println(p.toText())       // count=42
+//     val q = p.swap()          // Pair_i64_str(42, "count")
+module std.pair
+import std.core
+// Element actions (sinter_gen_text / _join_text / _eq_text) come from std.generic.
+import std.generic
+
+/// Two-element tuple. The first component is dispatched on A, the second on B via its type label:
+/// `Pair_str_i64` uses `_str` + `_i64`, `Pair_i64_str` uses `_i64` + `_str`.
+pub struct Pair<A, B> : Any {
+    Pair(first: A, second: B) {
+        self.first = first
+        self.second = second
+    }
+
+    pub fun component1(): A => self.first
+    pub fun component2(): B => self.second
+
+    pub fun typeLabel(): str => "Pair"
+
+    /// Synonym for `toText()`: `Pair<str, i64>("count", 42).toString()` → `count=42`.
+    /// Uses nested expressions instead of accumulating into a local — `sinter_gen_join_text`
+    /// is concat_own and frees both sides, so putting the result in a local would be
+    /// double-freed by `sinter_string_assign`.
+    pub fun toString(): str => sinter_gen_join_text(
+        sinter_gen_join_text(sinter_gen_text(self.first), sinter_gen_eq_text()),
+        sinter_gen_text(self.second, B),
+    )
+
+    /// Join the two texts with `=`: `Pair<str, i64>("count", 42).toText()` → `count=42`.
+    /// The trailing `B` is only a compile-time tag; it produces no C code and no argument.
+    pub fun toText(): str => sinter_gen_join_text(
+        sinter_gen_join_text(sinter_gen_text(self.first), sinter_gen_eq_text()),
+        sinter_gen_text(self.second, B),
+    )
+
+    pub fun replaceFirst(v: A): void { self.first = v }
+    pub fun replaceSecond(v: B): void { self.second = v }
+
+    /// Swap the two components, yielding the other monomorphization:
+    /// `Pair<str, i64>("count", 42).swap()` → `Pair_i64_str(42, "count")`.
+    pub fun swap(): Pair<B, A> {
+        val out: Pair<B, A> = Pair<B, A>(self.second, self.first)
+        return out
+    }
+}

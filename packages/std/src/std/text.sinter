@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: StringBuilder
+//
+// A mutable builder like a conventional `StringBuilder`. Sinter's `str` is an immutable
+// length-carrying value, so joining N pieces with `+` is O(N²); this uses a growable C-side buffer.
+//
+//     val sb = StringBuilder()
+//     sb.append("n=").appendInt(42).appendLine("")
+//     println(sb.toString())
+module std.text
+
+import std
+import std.list
+import std.string
+
+embed C {
+    #include <stdlib.h>
+    #include <string.h>
+
+    typedef struct {
+        char* data;
+        int64_t len;
+        int64_t cap;
+    } sinter_sb;
+
+    static sinter_sb* sinter_sb_new(int64_t cap) {
+        sinter_sb* sb = (sinter_sb*)calloc(1, sizeof(sinter_sb));
+        if (!sb) return NULL;
+        sb->cap = cap > 0 ? cap : 64;
+        sb->data = (char*)malloc((size_t)sb->cap);
+        if (!sb->data) { free(sb); return NULL; }
+        sb->data[0] = '\0';
+        return sb;
+    }
+
+    static void sinter_sb_free(sinter_sb* sb) {
+        if (!sb) return;
+        free(sb->data);
+        free(sb);
+    }
+
+    static void sinter_sb_ensure(sinter_sb* sb, int64_t extra) {
+        if (!sb) return;
+        const int64_t need = sb->len + extra + 1;
+        if (need <= sb->cap) return;
+        int64_t cap = sb->cap;
+        while (cap < need) cap *= 2;
+        char* p = (char*)realloc(sb->data, (size_t)cap);
+        if (!p) return;
+        sb->data = p;
+        sb->cap = cap;
+    }
+
+    static void sinter_sb_append(sinter_sb* sb, sinter_string s) {
+        if (!sb || !s.data || s.len <= 0) return;
+        sinter_sb_ensure(sb, s.len);
+        memcpy(sb->data + sb->len, s.data, (size_t)s.len);
+        sb->len += s.len;
+        sb->data[sb->len] = '\0';
+    }
+
+    static void sinter_sb_append_cstr(sinter_sb* sb, const char* s) {
+        if (!sb || !s) return;
+        const int64_t n = (int64_t)strlen(s);
+        sinter_sb_ensure(sb, n);
+        memcpy(sb->data + sb->len, s, (size_t)n);
+        sb->len += n;
+        sb->data[sb->len] = '\0';
+    }
+
+    static void sinter_sb_append_byte(sinter_sb* sb, int64_t v) {
+        if (!sb) return;
+        sinter_sb_ensure(sb, 1);
+        sb->data[sb->len++] = (char)(v & 0xff);
+        sb->data[sb->len] = '\0';
+    }
+
+    static void sinter_sb_append_int(sinter_sb* sb, int64_t v) {
+        sinter_sb_append(sb, sinter_string_from_int(v));
+    }
+
+    static void sinter_sb_append_float(sinter_sb* sb, double v) {
+        sinter_sb_append(sb, sinter_string_from_num(v));
+    }
+
+    static void sinter_sb_append_bool(sinter_sb* sb, uint8_t v) {
+        sinter_sb_append_cstr(sb, v ? "true" : "false");
+    }
+
+    static void sinter_sb_clear(sinter_sb* sb) {
+        if (!sb) return;
+        sb->len = 0;
+        if (sb->data) sb->data[0] = '\0';
+    }
+
+    static int64_t sinter_sb_length(sinter_sb* sb) { return sb ? sb->len : 0; }
+
+    static sinter_string sinter_sb_to_string(sinter_sb* sb) {
+        if (!sb || sb->len <= 0) return sinter_string_from_literal("", 0);
+        return sinter_string_from_buf(sb->data, sb->len);
+    }
+}
+
+pub class StringBuilder : Any {
+    var handle: ptr
+
+    StringBuilder() { self.handle = sinter_sb_new(64) }
+    StringBuilder(capacity: i64) { self.handle = sinter_sb_new(capacity) }
+
+    ~StringBuilder() {
+        if self.handle != null { sinter_sb_free(self.handle) }
+        self.handle = null
+    }
+
+    pub fun append(s: str): StringBuilder {
+        sinter_sb_append(self.handle, s)
+        ret self
+    }
+
+    pub fun appendInt(v: i64): StringBuilder {
+        sinter_sb_append_int(self.handle, v)
+        ret self
+    }
+
+    pub fun appendByte(v: u8): StringBuilder {
+        sinter_sb_append_byte(self.handle, v as i64)
+        ret self
+    }
+
+    pub fun appendFloat(v: f64): StringBuilder {
+        sinter_sb_append_float(self.handle, v)
+        ret self
+    }
+
+    pub fun appendBool(v: bool): StringBuilder {
+        sinter_sb_append_bool(self.handle, v ? 1 : 0)
+        ret self
+    }
+
+    pub fun appendLine(s: str): StringBuilder {
+        sinter_sb_append(self.handle, s)
+        sinter_sb_append(self.handle, "\n")
+        ret self
+    }
+
+    pub fun newline(): StringBuilder {
+        sinter_sb_append(self.handle, "\n")
+        ret self
+    }
+
+    pub fun clear(): void => sinter_sb_clear(self.handle)
+    pub fun length(): i64 => sinter_sb_length(self.handle)
+    pub override fun toString(): str => sinter_sb_to_string(self.handle)
+}
+
+
+
+// ============================================================================
+// split / join (conventional split / joinToString helpers)
+// ============================================================================
+// shortcut: returning a local List currently inserts a destructor call, so @no_raii disables destruction for this function;
+// remove this annotation once the compiler has return-value move semantics.
+@no_raii
+pub fun split(text: str, separator: str): List<str> {
+    val out = List<str>()
+    if separator.length() == 0 {
+        out.add(text)
+        ret out
+    }
+    var start: i64 = 0
+    var index = text.indexOf(separator)
+    while index >= 0 {
+        out.add(text.substring(start, index))
+        start = index + separator.length()
+        index = text.indexOfFrom(separator, start)
+    }
+    out.add(text.substring(start, text.length()))
+    ret out
+}
+
+pub fun splitLines(text: str): List<str> => split(text, "\n")
+
+pub fun joinToString(xs: List<str>, separator: str): str {
+    var out: str = ""
+    var i: i64 = 0
+    while i < xs.size() {
+        if i > 0 { out = out + separator }
+        out = out + xs.get(i)
+        i = i + 1
+    }
+    ret out
+}

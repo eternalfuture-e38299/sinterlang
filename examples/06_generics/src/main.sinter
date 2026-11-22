@@ -1,0 +1,39 @@
+// 06 —— 泛型 / Generics
+module generics
+import std
+import std.list
+import std.map
+import std.hashmap
+import std.box
+
+// 泛型在语义分析前单态化，零装箱、无运行时开销。
+fun id<T>(v: T): T => v
+
+class Box<T>(val value: T) {
+    fun get(): T => self.value
+}
+
+fun main(): void {
+    println(id<i64>(7))
+    println(id("hi"))
+
+    val bi = Box<i64>(7)
+    println(bi.get())
+
+    val bs = Box<str>("hello")
+    println(bs.get())
+
+    val xs = List<i64>()
+    xs.add(10)
+    xs.add(20)
+    println(xs.size())
+    println(xs.get(0))
+
+    val m = Map<str, i64>()
+    m.put("a", 1)
+    println(m.get("a"))
+
+    val h = HashMap<i64, str>()
+    h.put(1, "one")
+    println(h.get(1))
+}

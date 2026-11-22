@@ -1,0 +1,29 @@
+module genericclass
+import std
+import std.list
+import std.map
+import std.hashmap
+import std.box
+
+class Point(val x: i64, val y: i64) { }
+
+fun main(): void {
+    val xs = List<Point>()
+    xs.add(Point(1, 2))
+    xs.add(Point(3, 4))
+    println(xs.size())
+    println(xs.get(0).x)
+    println(xs.get(1).y)
+
+    val m = Map<str, Point>()
+    m.put("a", Point(5, 6))
+    println(m.get("a").y)
+    println(m.size())
+
+    val h = HashMap<i64, Point>()
+    h.put(1, Point(7, 8))
+    println(h.get(1).x)
+
+    val b = Box<Point>(Point(9, 10))
+    println(b.get().x)
+}

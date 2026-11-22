@@ -1,0 +1,47 @@
+module sugar
+import std
+
+data class Point(val x: i64, val y: i64)
+
+struct Pair(val a: i64, val b: i64)
+
+fun twice(f: () -> void): void {
+    f()
+    f()
+}
+
+class Button {
+    var text: str = "x"
+}
+
+fun build(f: () -> void): Button {
+    val b = Button()
+    f()
+    ret b
+}
+
+fun buildButton(block: Button.() -> void): Button {
+    val b = Button()
+    b.block()
+    ret b
+}
+
+fun main(): void {
+    val p = Point(1, 2)
+    val q = Point(1, 2)
+    println(p.equals(q))
+    println(p.toString())
+    println(p.copyWith(3, 4).toString())
+    println(p.copy(7).toString())
+    println(p.copy(y = 9).toString())
+    println(p.component1())
+    val pr = Pair(5, 6)
+    println(pr.a + pr.b)
+    twice { println("tick") }
+    val b = Button().apply { text = "OK" }
+    println(b.text)
+    val c = build { println("built") }
+    println(c.text)
+    val d = buildButton { text = "DSL" }
+    println(d.text)
+}

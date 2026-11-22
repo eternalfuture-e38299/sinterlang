@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted sinterd entry point.
+module main
+
+import std
+import std.io
+import ops
+import server
+import sver
+
+fun version(): str => sver.text()
+
+fun usage(): void {
+    writeLine("sinterd " + version() + " - Sinter backend daemon")
+    writeLine("")
+    writeLine("usage: sinterd [options]")
+    writeLine("  --socket PATH        Unix socket path (default /tmp/sinterd.sock)")
+    writeLine("  --verbose, -v        log requests to stderr")
+    writeLine("  --foreground         run in foreground (default)")
+    writeLine("  --idle-timeout SEC   accepted for compatibility")
+    writeLine("  --self-test          run built-in checks and exit")
+    writeLine("  --version, -V        print version")
+    writeLine("  --help, -h           show this help")
+}
+
+var ST_FAILED: i64 = 0
+var ST_TOTAL: i64 = 0
+
+fun check(name: str, got: str, want: str): void {
+    ST_TOTAL = ST_TOTAL + 1
+    if got.contains(want) {
+        writeLine("  [ OK ] " + name)
+    } else {
+        writeLine("  [FAIL] " + name)
+        writeLine("         expected: " + want)
+        writeLine("         actual:   " + got)
+        ST_FAILED = ST_FAILED + 1
+    }
+}
+
+fun selfTest(): i32 {
+    ST_FAILED = 0
+    ST_TOTAL = 0
+    writeLine("sinterd self-test")
+    check("ping", ops.handleRaw("{\"id\":\"1\",\"op\":\"ping\"}"), "\"pong\":true")
+    check("format", ops.handleRaw("{\"id\":2,\"op\":\"format\",\"text\":\"fun main(): void{\\nret 0\\n}\"}"), "    ret 0")
+    check("format ops", ops.handleRaw("{\"id\":\"2a\",\"op\":\"format\",\"text\":\"fun f(a:i64,b:i64):i64{ret a+b}\"}"), "fun f(a: i64, b: i64): i64 {ret a + b }")
+    check("format compact", ops.handleRaw("{\"id\":\"2b\",\"op\":\"format\",\"text\":\"if(x){y()}\"}"), "if (x) {y() }")
+    check("format embed C", ops.handleRaw("{\"id\":\"2c\",\"op\":\"format\",\"text\":\"embed C {\\nint x=1;\\n}\\n\"}"), "int x=1;")
+    check("format indent", ops.handleRaw("{\"id\":\"2d\",\"op\":\"format\",\"indent\":2,\"text\":\"fun f(){\\nret 0\\n}\"}"), "  ret 0")
+    check("tokens", ops.handleRaw("{\"id\":3,\"op\":\"tokens\",\"text\":\"int x;\"}"), "\"kind\":\"ident\"")
+    check("reindent", ops.handleRaw("{\"id\":3,\"op\":\"reindent\",\"text\":\"if(x){\\ny();\\n}\"}"), "    y();")
+    check("diagnose", ops.handleRaw("{\"id\":4,\"op\":\"diagnose\",\"text\":\"int main(void){return 0;}\"}"), "\"diagnostics\":[]")
+    check("diagnose error", ops.handleRaw("{\"id\":\"4a\",\"op\":\"diagnose\",\"text\":\"int main(void){ int x = ; }\"}"), "expected expression, found ';'")
+    check("cparse", ops.handleRaw("{\"id\":5,\"op\":\"cparse\",\"text\":\"int add(int a,int b){return a+b;}\"}"), "\"functions\":[\"add\"]")
+    check("cparse include", ops.handleRaw("{\"id\":\"5a\",\"op\":\"cparse\",\"text\":\"#include <stdio.h>\\nint main(void){return 0;}\"}"), "stdio.h")
+    check("cparse2", ops.handleRaw("{\"id\":\"5b\",\"op\":\"cparse2\",\"text\":\"typedef int T; struct P{int x;}; int add(int a,int b){return a+b;}\"}"), "\"frontend\":\"cfront2\"")
+    check("cparse2 clean", ops.handleRaw("{\"id\":\"5b2\",\"op\":\"cparse2\",\"text\":\"typedef int T; struct P{int x;}; int add(int a,int b){return a+b;}\"}"), "\"diagnostics\":[]")
+    check("cparse2 function", ops.handleRaw("{\"id\":\"5c\",\"op\":\"cparse2\",\"text\":\"int add(int a,int b){return a+b;}\"}"), "\"name\":\"add\"")
+    check("cparse2 struct", ops.handleRaw("{\"id\":\"5d\",\"op\":\"cparse2\",\"text\":\"struct P{int x; int y;};\"}"), "\"name\":\"P\"")
+    check("cparse2 typedef", ops.handleRaw("{\"id\":\"5e\",\"op\":\"cparse2\",\"text\":\"typedef unsigned long size2;\"}"), "\"name\":\"size2\"")
+    check("cheader missing", ops.handleRaw("{\"id\":\"5f\",\"op\":\"cheader\"}"), "\"ok\":false")
+    check("unknown op", ops.handleRaw("{\"id\":6,\"op\":\"nope\"}"), "\"ok\":false")
+    check("invalid json", ops.handleRaw("{not json}"), "\"ok\":false")
+    check("number id", ops.handleRaw("{\"id\":7,\"op\":\"ping\"}"), "\"id\":7,")
+    if ST_FAILED == 0 { writeLine("all passed (" + fromInt(ST_TOTAL) + ")") }
+    else { writeLine("failed " + fromInt(ST_FAILED) + " / " + fromInt(ST_TOTAL)) }
+    if ST_FAILED == 0 { ret 0 }
+    ret 1
+}
+
+fun main(argc: i32, argv: **u8): i32 {
+    var socket_path = "/tmp/sinterd.sock"
+    var verbose = false
+    var i: i32 = 1
+    while i < argc {
+        val a = fromCStr(argv[i])
+        if a == "--help" || a == "-h" { usage(); ret 0 }
+        if a == "--version" || a == "-V" { writeLine("sinterd " + version()); ret 0 }
+        if a == "--self-test" { ret selfTest() }
+        if a == "--verbose" || a == "-v" { verbose = true }
+        else if a == "--foreground" { }
+        else if a == "--socket" {
+            if i + 1 < argc { socket_path = fromCStr(argv[i + 1]); i = i + 1 }
+        }
+        else if a == "--idle-timeout" {
+            if i + 1 < argc { i = i + 1 }
+        }
+        else {
+            writeErrLine("sinterd: unknown argument '" + a + "'")
+            ret 2
+        }
+        i = i + 1
+    }
+    ret Server(socket_path, verbose).run() as i32
+}

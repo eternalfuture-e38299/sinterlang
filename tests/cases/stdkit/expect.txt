@@ -1,0 +1,17 @@
+7
+true
+n=42!
+
+6
+6
+true
+120
+true
+1
+true
+true
+true
+3
+b
+a|b|c
+2

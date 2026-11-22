@@ -1,0 +1,41 @@
+// 05 —— struct、枚举与可见性 / Structs, enums, visibility
+module structs
+import std
+
+// struct 的括号参数自动成为字段；当前后端把它当作类处理。
+struct Pair(val first: i64, val second: i64) {
+    fun sum(): i64 => self.first + self.second
+}
+
+enum Color { Red, Green, Blue }
+
+fun colorCode(c: Color): i64 {
+    var code = 3
+    when (c) {
+        Color.Red => { code = 1 }
+        Color.Green => { code = 2 }
+        else => { code = 3 }
+    }
+    ret code
+}
+
+// pub/priv 块用于声明默认可见性。
+pub {
+    fun publicValue(): i64 => 42
+}
+
+priv {
+    fun hiddenValue(): i64 => 0
+}
+
+fun main(): void {
+    val p = Pair(3, 4)
+    println(p.sum())
+    println(p.first)
+
+    println(colorCode(Color.Red))
+    println(colorCode(Color.Blue))
+
+    println(publicValue())
+    println(hiddenValue())
+}

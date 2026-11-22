@@ -1,0 +1,67 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: `Box<T>` — a single-value container
+//
+// `Box<str>` / `Box<i64>` each monomorphize into a separate struct (`Box_str` /
+// `Box_i64`), with element actions dispatched on T (clone / blank / text, see `std.generic`).
+//
+//     import std.box
+//
+//     val b = Box<str>("boxed")
+//     println(b.get())          // boxed
+//     b.set("rebound")
+//     println(b.describe())     // rebound
+//
+//     val n = Box<i64>(7)
+//     println(n.describe())     // 7     same generic method, two specializations
+module std.box
+import std.core
+// Element actions (sinter_gen_clone / _blank / _text) come from std.generic;
+// an import only brings symbols and does not drag in other containers.
+import std.generic
+
+/// Single-value container. Constructor parameters are the fields themselves (in
+/// Sinter a constructor parameter is a field: `Box(value: T)` and `var value: T` are
+/// the same member), so the field is not declared again.
+///
+/// It inherits `Any`: when passed through an `Any` parameter it
+/// dispatches via the vtable and gets the real inner value's `toString()`.
+pub struct Box<T> : Any {
+    Box(value: T) {
+        self.value = value
+    }
+
+    pub fun get(): T => self.value
+
+    pub fun typeLabel(): str => "Box"
+
+    /// The text form is just the boxed value (the same dispatch path as `describe()`).
+    pub fun toString(): str => sinter_gen_text(self.value)
+
+    pub fun set(v: T): void {
+        self.value = v
+    }
+
+    /// Take out and clear (element ownership is handed to the caller)
+    pub fun take(): T {
+        val old: T = self.value
+        self.value = self.blank()
+        return old
+    }
+
+    /// The type's "empty value": i64 → 0, str → the empty string
+    pub fun blank(): T => sinter_gen_blank()
+
+    /// The type's text form. **Same method name, two specializations**:
+    /// `Box<str>("x").describe()` returns `x` (the string itself, cloned),
+    /// `Box<i64>(7).describe()` returns `7` (a decimal number).
+    pub fun describe(): str => sinter_gen_text(self.value)
+
+    /// Overwrite with the given value and return the old one
+    pub fun swapIn(v: T): T {
+        val old: T = self.value
+        self.value = v
+        return old
+    }
+}

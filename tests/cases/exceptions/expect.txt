@@ -1,0 +1,5 @@
+ok
+caught negative: -2
+finally
+anonymous catch
+done

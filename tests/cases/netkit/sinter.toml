@@ -1,0 +1,8 @@
+[package]
+name = "netkit"
+version = "0.1.0"
+entry = "src/main.sinter"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+net = { version = "1.0.0", source = "path:../../../packages/net" }

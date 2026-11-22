@@ -1,0 +1,47 @@
+module refs
+import std
+import std.memory
+
+fun inc(x: i64&): void { x = x + 1 }
+fun addTo(x: i64&, n: i64): void { x = x + n }
+
+class Box(val v: i64) { }
+fun bump(b: Box&): void { b.v = b.v + 1 }
+
+fun main(): void {
+    var a: i64 = 1
+    inc(&a)
+    inc(&a)
+    println(a)
+    addTo(&a, 10)
+    println(a)
+
+    val box: Box = Box(5)
+    bump(box)
+    println(box.v)
+
+    var c: i64 = 3
+    val r: i64& = &c
+    r = 8
+    println(c)
+    println(*r)
+
+    var nums: i64[3]
+    nums[0] = 7
+    nums[1] = 8
+    nums[2] = 9
+    val p: *i64 = &nums[0]
+    println(p[1])
+    println(*(p + 2))
+    println(p == null)
+    val raw: ptr = p
+    val back: *i64 = raw as *i64
+    println(back[0])
+
+    val mem = alloc(16)
+    store<i64>(mem as *i64, 42)
+    println(load<i64>(mem as *i64))
+    writeU32(mem, 99)
+    println(readU32(mem))
+    dealloc(mem)
+}

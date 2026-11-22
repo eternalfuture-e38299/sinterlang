@@ -1,0 +1,15 @@
+// 编译器自举固定点用的最小递归程序。
+module fib
+
+fun fib(n: i64): i64 {
+    if (n < 2) { ret n }
+    ret fib(n - 1) + fib(n - 2)
+}
+
+fun main(): void {
+    var i: i64 = 0
+    while (i < 10) {
+        println(fib(i))
+        i = i + 1
+    }
+}

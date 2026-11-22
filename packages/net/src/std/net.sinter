@@ -1,0 +1,186 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: TCP/UDP sockets (POSIX + Windows Winsock2)
+//
+// Thin, blocking wrappers over BSD sockets. Sockets are plain i64 file
+// descriptors, so there is no hidden allocation and nothing to finalize with
+// RAII; call `tcpClose` when done.
+//
+//     val srv = tcpListen("127.0.0.1", 8080)
+//     val fd  = tcpAccept(srv)
+//     val req = tcpRecvLine(fd)
+//     tcpSend(fd, "hello\n")
+//     tcpClose(fd); tcpClose(srv)
+//
+// Windows uses Winsock2; sockets remain plain i64 handles on both platforms.
+module std.net
+
+import std
+import std.string
+import std.sys
+
+
+/// Bind and listen. Returns a socket descriptor, or -1 on failure.
+pub fun tcpListen(host: str, port: i64): i64 => osTcpListen(host, port, 16)
+pub fun tcpListen[tcpListenBacklog](host: str, port: i64, backlog: i64): i64 =>
+    osTcpListen(host, port, backlog)
+
+/// Connect to `host:port` (DNS names are resolved). Returns -1 on failure.
+pub fun tcpConnect(host: str, port: i64): i64 => osTcpConnect(host, port)
+/// Accept one connection (blocks). Returns -1 on failure.
+pub fun tcpAccept(server: i64): i64 => osTcpAccept(server)
+
+/// Write the whole string. Returns bytes written, or -1 on failure.
+pub fun tcpSend(fd: i64, text: str): i64 => osTcpSend(fd, text)
+/// Read up to `maxBytes`; returns an empty string on EOF or error.
+pub fun tcpRecv(fd: i64, maxBytes: i64): str => osTcpRecv(fd, maxBytes)
+/// Read until EOF (or `maxBytes`, 0 means no limit).
+pub fun tcpRecvAll(fd: i64, maxBytes: i64): str => osTcpRecvAll(fd, maxBytes)
+/// Read one line without the trailing newline; returns "" on EOF.
+pub fun tcpRecvLine(fd: i64): str => osTcpRecvLine(fd)
+
+pub fun tcpClose(fd: i64): void => osTcpClose(fd)
+pub fun tcpShutdown(fd: i64): void => osTcpShutdown(fd)
+/// Set receive/send timeouts in milliseconds (0 disables). Returns bool.
+pub fun setSocketTimeout(fd: i64, ms: i64): bool => osSocketTimeout(fd, ms) != 0
+/// Port the socket is bound to (useful after listening on port 0).
+pub fun socketLocalPort(fd: i64): i64 => osSocketLocalPort(fd)
+/// Last socket error text (from `errno`).
+pub fun socketLastError(): str => osSocketLastError()
+
+/// Bind a UDP socket. Returns a descriptor, or -1 on failure.
+pub fun udpBind(host: str, port: i64): i64 => osUdpBind(host, port)
+pub fun udpSendTo(fd: i64, host: str, port: i64, text: str): i64 =>
+    osUdpSendTo(fd, host, port, text)
+/// Receive one datagram and remember its sender (see udpLastPeer*).
+pub fun udpRecvFrom(fd: i64, maxBytes: i64): str => osUdpRecvFrom(fd, maxBytes)
+pub fun udpLastPeerHost(): str => osUdpLastPeerHost()
+pub fun udpLastPeerPort(): i64 => osUdpLastPeerPort()
+
+// ============================================================================
+// Buffered, RAII connection wrapper
+// ============================================================================
+
+/// A TCP connection with an internal read buffer. `readLine` reads chunks,
+/// not one syscall per byte, and keeps the remaining bytes for the next call.
+pub class TcpConnection {
+    var fd: i64
+    var buf: str
+    var eof: bool
+
+    TcpConnection(handle: i64) {
+        self.fd = handle
+        self.buf = ""
+        self.eof = false
+    }
+
+    ~TcpConnection() { self.close() }
+
+    pub fun isOpen(): bool => self.fd >= 0
+    pub fun fdValue(): i64 => self.fd
+    pub fun atEnd(): bool => self.eof && self.buf.length() == 0
+
+    pub fun close(): void {
+        if self.fd >= 0 {
+            tcpClose(self.fd)
+            self.fd = -1
+        }
+        self.buf = ""
+        self.eof = true
+    }
+
+    pub fun write(text: str): i64 {
+        if self.fd < 0 { ret -1 }
+        ret tcpSend(self.fd, text)
+    }
+
+    pub fun writeLine(text: str): i64 {
+        if self.fd < 0 { ret -1 }
+        ret tcpSend(self.fd, text + "\n")
+    }
+
+    pub fun setTimeout(ms: i64): bool {
+        if self.fd < 0 { ret false }
+        ret setSocketTimeout(self.fd, ms)
+    }
+
+    /// Read up to `n` bytes. Returns "" at EOF/error.
+    pub fun read(n: i64): str {
+        if n <= 0 { ret "" }
+        if self.buf.length() > 0 {
+            val take = n < self.buf.length() ? n : self.buf.length()
+            val out = self.buf.substring(0, take)
+            self.buf = self.buf.substring(take, self.buf.length())
+            ret out
+        }
+        if self.fd < 0 { ret "" }
+        val out = tcpRecv(self.fd, n)
+        if out.length() == 0 { self.eof = true }
+        ret out
+    }
+
+    /// Read one line without the trailing `\n` / `\r\n`.
+    pub fun readLine(): str {
+        while true {
+            val at = self.buf.indexOf("\n")
+            if at >= 0 {
+                var end = at
+                if end > 0 && self.buf.substring(end - 1, end) == "\r" { end = end - 1 }
+                val line = self.buf.substring(0, end)
+                self.buf = self.buf.substring(at + 1, self.buf.length())
+                ret line
+            }
+            if self.fd < 0 || self.eof { ret "" }
+            val chunk = tcpRecv(self.fd, 4096)
+            if chunk.length() == 0 {
+                self.eof = true
+                val rest = self.buf
+                self.buf = ""
+                ret rest
+            }
+            self.buf = self.buf + chunk
+        }
+        ret ""
+    }
+
+    /// Read until EOF or `maxBytes` (0 = no limit).
+    pub fun readAll(maxBytes: i64): str {
+        var out: str = self.buf
+        self.buf = ""
+        var left: i64 = maxBytes > 0 ? maxBytes - out.length() : 0
+        while self.fd >= 0 && !self.eof && (maxBytes <= 0 || left > 0) {
+            val want = maxBytes > 0 && left < 4096 ? left : 4096
+            val chunk = tcpRecv(self.fd, want)
+            if chunk.length() == 0 { self.eof = true; break }
+            out = out + chunk
+            if maxBytes > 0 { left = left - chunk.length() }
+        }
+        ret out
+    }
+}
+
+/// RAII TCP listener.
+pub class TcpListener {
+    var fd: i64
+
+    TcpListener(host: str, port: i64, backlog: i64) {
+        self.fd = tcpListen(host, port, backlog)
+    }
+
+    ~TcpListener() { self.close() }
+
+    pub fun isOpen(): bool => self.fd >= 0
+    pub fun fdValue(): i64 => self.fd
+    pub fun localPort(): i64 => socketLocalPort(self.fd)
+
+    pub fun close(): void {
+        if self.fd >= 0 {
+            tcpClose(self.fd)
+            self.fd = -1
+        }
+    }
+
+    /// Accept a connection descriptor. Wrap it with `TcpConnection(fd)`.
+    pub fun acceptFd(): i64 => tcpAccept(self.fd)
+}

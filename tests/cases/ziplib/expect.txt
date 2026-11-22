@@ -1,0 +1,31 @@
+1
+hello.txt
+hello zip
+second line
+
+true
+alpha
+2
+true
+true
+true
+x.txt
+streamed
+y.txt
+second
+true
+hello.txt
+22
+true
+1
+true
+true
+true
+hello.txt
+encrypted hello
+true
+true
+encrypted hello
+true
+true
+secret stream

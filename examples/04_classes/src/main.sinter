@@ -1,0 +1,46 @@
+// 04 —— 类与析构 / Classes and destructors
+module classes
+import std
+
+class Counter {
+    var value: i64
+    var label: str
+
+    Counter(start: i64 = 0, name: str = "unnamed") {
+        self.value = start
+        self.label = name
+    }
+
+    fun inc(): void { self.value = self.value + 1 }
+    fun get(): i64 => self.value
+}
+
+// data class 自动生成 toString / equals / copy / copyWith / componentN。
+data class Point(val x: i64, val y: i64)
+
+// 析构函数在作用域结束时自动运行，也可以 del 提前释放。
+class Resource(val name: str) {
+    ~Resource() { println("dtor " + self.name) }
+}
+
+fun main(): void {
+    val c = Counter(10, "hits")
+    c.inc()
+    println(c.get())
+
+    val c2 = Counter(name = "lazy")
+    println(c2.get())
+
+    val p = Point(3, 4)
+    val q = Point(3, 4)
+    println(p.toString())
+    println(p.equals(q))
+    println(p.copyWith(5, 6).toString())
+    println(p.component1())
+
+    val r = Resource("tmp")
+    println(r.name)
+
+    var early = Resource("early")
+    del early
+}

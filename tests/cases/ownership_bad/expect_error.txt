@@ -1,0 +1,2 @@
+returning pointer 'p', which aliases local 'x'
+deleted more than once

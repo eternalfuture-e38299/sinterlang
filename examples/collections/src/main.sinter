@@ -1,0 +1,153 @@
+// examples/collections —— 泛型结构体 / 泛型容器 + 字符串特化
+//
+// 构建：sinter build --run
+//
+// 同一份泛型定义按类型实参单态化：
+//   `Box<str>` / `Box<i64>` 是两个互不相干的结构体，`describe()` 也跟着变
+//   （str 返回字符串本身，i64 返回十进制数字）；
+//   `List<str>` 的元素拷贝与释放走 sinter_string_clone / sinter_string_free，
+//   而 `List<i64>` 只是数值赋值 —— 没有 `StrList` 这种「字符串专用副本」。
+//
+// 容器**一个类型一个模块**（不再挤在 std.collections 里）：
+//   std.box      Box<T>
+//   std.pair     Pair<A, B>
+//   std.list     List<T>
+//   std.map      Map<K, V>        有序，二分
+//   std.hashmap  HashMap<K, V>    哈希，开放寻址
+//   std.arrays   Array<T> / IntArray / FloatArray
+module collections
+import std
+import std.box
+import std.pair
+import std.list
+import std.map
+import std.hashmap
+import std.arrays
+// 字符串扩展函数（`e.length()`）与哈希在 std.string。
+import std.string
+
+fun main(): void {
+    println("== box ==")
+    val b = Box < str >("boxed")
+    println("get=${b.get()}")
+    b.set("rebound")
+    println("set=${b.get()}")
+    val nb = Box < i64 >( 7)
+    println("int=${nb.get()}")
+    val e = b.blank()
+    println("blank_box_len=${e.length()}")
+    // 同一个泛型方法、两种特化：str 返回字符串本身，i64 返回十进制数字
+    println("describe_str=${b.describe()}")
+    println("describe_num=${nb.describe()}")
+
+    println("== pair ==")
+    val p = Pair < str, i64 >("count", 42)
+    println("p=${p.component1()}/${p.component2()}")
+    val q = Pair < i64, str >( 1, "one")
+    println("q=${q.component1()}/${q.component2()}")
+    p.replaceSecond(43)
+    println("p2=${p.component2()}")
+    // 分量文本按 A / B 各自分派
+    println("to_text=${p.toText()}")
+    val sw = p.swap()
+    println("swap=${sw.component1()}/${sw.component2()}")
+
+    println("== list_str ==")
+    val xs = List < str >()
+    xs.add("alpha")
+    xs.add("beta")
+    xs.add("gamma")
+    println("len=${xs.size()} first=${xs.get(0)} last=${xs.last()}")
+    println("idx=${xs.indexOf("gamma")} has_beta=${xs.contains("beta")}")
+    println("pop=${xs.removeLast()} len=${xs.size()}")
+    xs.addAt(0, "omega")
+    println("at0=${xs.at(0)} len=${xs.size()}")
+    xs.set(1, "ALPHA")
+    println("set1=${xs.get(1)}")
+    xs.clear()
+    println("cleared=${xs.size()}")
+
+    println("== list_i64 ==")
+    val ns = List < i64 >()
+    ns.add(3)
+    ns.add(4)
+    ns.add(5)
+    var sum: i64 = 0
+    var i: i64 = 0
+    while ( i < ns.size()) {
+        sum = sum + ns.get(i)
+        i = i + 1
+    }
+    println("sum=${sum} idx4=${ns.indexOf(4)}")
+
+    // 泛型数组：Array<i64> / Array<str> 各自单态化，方法全套按 T 分派
+    println("== array_i64 ==")
+    val a = arrayOf < i64 >( 3, 1, 2)
+    println("raw=${a.toString()}")
+    a.sort()
+    println("sorted=${a.toString()} sum=${a.sum()} has2=${a.contains(2)}")
+    a.reverse()
+    println("rev=${a.toString()} idx1=${a.indexOf(1)}")
+    val ac = a.copyOf()
+    ac.fill(9)
+    println("copy_filled=${ac.toString()} src=${a.toString()}")
+
+    println("== array_str ==")
+    val names = arrayOf < str >("pear", "apple", "fig")
+    println("raw=${names.toString()}")
+    names.sort()
+    println("sorted=${names.toString()} idx=${names.indexOf("fig")}")
+    val filled = arrayOf < str >("x", "y")
+    filled.fill("z")
+    println("filled=${filled.toString()}")
+
+    println("== map_str ==")
+    val m = Map < str, i64 >()
+    m.put("delta", 4)
+    m.put("alpha", 1)
+    m.put("charlie", 3)
+    m.put("bravo", 2)
+    println("len=${m.size()} alpha=${m.get("alpha")} miss=${m.getOr("zulu", -1)}")
+    // 有序：键按字典序保存
+    println("k0=${m.keyAt(0)} k3=${m.keyAt(3)} all=${m.toString()}")
+    println("del=${m.remove("bravo")} len=${m.size()} has=${m.containsKey("bravo")}")
+
+    println("== hashmap_str ==")
+    val h = HashMap < str, i64 >()
+    h.put("one", 1)
+    h.put("two", 2)
+    h.put("three", 3)
+    println("len=${h.size()} two=${h.get("two")} miss=${h.getOr("nope", -1)}")
+    h.put("two", 22)
+    println("update=${h.get("two")}")
+    println("del=${h.remove("one")} len=${h.size()} has=${h.containsKey("one")}")
+
+    println("== hash ==")
+    // str.hashCode() 与 HashMap<str, V> 的桶位同源（FNV-1a 64）
+    println("eq=${("sinter".hashCode() == "sinter".hashCode())}")
+    println("ne=${("a".hashCode() == "b".hashCode())}")
+    // hashSlot(mask) = hashCode() & mask（掩码落位，HashMap 就用它选桶）
+    val abcSlot = "abc". hashSlot(15)
+    println("slot_in_range=${(abcSlot >= 0 && abcSlot <= 15)} slot=${abcSlot}")
+    val hs = HashMap < str, i64 >()
+    hs.put("abc", 1)
+    println("own_bucket=${hs.get("abc")}")
+
+    println("== consts ==")
+    // 编译期常量：调用点直接折成字面量
+    println("i64max=${I64.MAX_VALUE()} i32max=${I32.MAX_VALUE()} bits=${I64.BITS()}")
+    println("u32max=${U32.MAX_VALUE()}")
+
+    println("== intarray ==")
+    // 现代语言风格的工厂函数：就是 Array<i64>，只是名字更亲切
+    val ia = intArrayOf(5, 3, 9)
+    ia.sort()
+    println("sorted=${ia.toString()} sum=${ia.sum()} type=${ia.typeLabel()}")
+
+    println("== bytarray ==")
+    val by = byteArrayOf(9, 4, 7)
+    by.sort()
+    println("sorted=${by.toString()} sum=${by.sum()} has4=${by.contains(4)}")
+
+    println("== done ==")
+}

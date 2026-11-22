@@ -1,0 +1,31 @@
+// tests/cases/lowlevel —— 多行字符串、`!!` 非空断言、指针/内存、main(argv, argc)
+module lowlevel
+
+import std
+import std.memory
+
+class Box(val v: i64) { }
+
+fun maybe(ok: bool): Box? {
+    if ok { ret Box(7) }
+    ret null
+}
+
+fun main(argv: i32, argc: *cstr): i32 {
+    println("""
+alpha
+  beta
+""")
+    val b = maybe(true)!!
+    println(b.v)
+
+    val p = alloc(16)
+    writeI32(p, 123)
+    println(readI32(p))
+    writeF64(offset(p, 8), 2.5)
+    println(readF64(offset(p, 8)))
+    dealloc(p)
+
+    println(argv)
+    ret 0
+}

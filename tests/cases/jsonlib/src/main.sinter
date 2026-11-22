@@ -1,0 +1,43 @@
+module jsonlib
+import std
+import json
+
+fun main(): void {
+    val doc = Json()
+    println(doc.parse(readText("data.json")))
+    val r = doc.root()
+    println(doc.getString(r, "name", ""))
+    println(doc.getInt(r, "version", 0))
+    println(doc.getFloat(r, "ratio", 0.0))
+    println(doc.getBool(r, "ok", false))
+    println(doc.isNull(doc.get(r, "none")))
+    val tags = doc.get(r, "tags")
+    println(doc.size(tags))
+    println(doc.asString(doc.indexAt(tags, 1)))
+    val nested = doc.get(r, "nested")
+    println(doc.getInt(nested, "x", 0))
+    val ys = doc.get(nested, "y")
+    println(doc.size(ys))
+    println(doc.asInt(doc.indexAt(ys, 2)))
+    println(doc.getString(r, "escaped", ""))
+    println(doc.getString(r, "unicode", ""))
+
+    val out = Json()
+    val obj = out.objectValue()
+    out.putString(obj, "name", "sinter")
+    out.putInt(obj, "year", 2026)
+    val arr = out.arrayValue()
+    out.put(obj, "items", arr)
+    out.addInt(arr, 1)
+    out.addString(arr, "two")
+    out.addBool(arr, true)
+    println(out.compact())
+    println(out.pretty())
+
+    val round = Json()
+    println(round.parse(out.compact()))
+    println(round.getInt(round.root(), "year", 0))
+    println(round.asString(round.indexAt(round.get(round.root(), "items"), 1)))
+    println(doc.parse("{bad}"))
+    println(doc.isValid())
+}

@@ -1,0 +1,13 @@
+[package]
+name = "json"
+version = "1.0.1"
+entry = "json.sinter"
+description = "Independent Sinter JSON library: parser and serializer (DOM by node index), no third-party code"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "json_lib"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../std" }

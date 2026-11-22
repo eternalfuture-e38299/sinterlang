@@ -1,0 +1,13 @@
+module genericalias
+import std
+
+fun pick<T>[anyPick<T>](a: T, b: T): T => a
+fun firstOf<T>[anyFirstOf<T>](e: T...): T => e[0]
+
+fun main(): void {
+    println(pick(3, 4))
+    println(anyPick(5, 6))
+    println(anyPick<i64>(7, 8))
+    println(firstOf(9, 10, 11))
+    println(anyFirstOf(12, 13, 14))
+}

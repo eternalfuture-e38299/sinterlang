@@ -1,0 +1,36 @@
+module kit
+import std
+import std.option
+import std.text
+import std.math
+import std.time
+import std.random
+import std.set
+import std.env
+
+fun main(): void {
+    println(someInt(7).getOr(-1))
+    println(noneStr().isNone())
+    val sb = StringBuilder()
+    sb.append("n=").appendInt(42).appendLine("!")
+    println(sb.toString())
+    println(sb.length())
+    println(gcd(12, 18))
+    println(isPrime(97))
+    println(factorial(5))
+    val r = Random(123)
+    val roll = r.nextIntRange(1, 6)
+    println(roll >= 1 && roll <= 6)
+    val s = StrSet()
+    s.add("a")
+    s.add("a")
+    println(s.size())
+    println(s.contains("a"))
+    println(hasEnv("PATH"))
+    println(nowMillis() > 0)
+    val parts = split("a,b,c", ",")
+    println(parts.size())
+    println(parts.get(1))
+    println(joinToString(parts, "|"))
+    println(splitLines("x\ny").size())
+}

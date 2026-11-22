@@ -1,0 +1,11 @@
+module ann_bad
+import std
+
+annotation class Route(val path: str, val code: i64 = 200)
+
+@Route(201)
+fun handler(): str => "x"
+
+fun main(): void {
+    println(handler())
+}

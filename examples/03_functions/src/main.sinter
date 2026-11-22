@@ -1,0 +1,56 @@
+// 03 —— 函数 / Functions
+module functions
+import std
+
+fun add(a: i64, b: i64): i64 {
+    ret a + b
+}
+
+// 表达式体。
+fun square(x: i64): i64 => x * x
+
+// void 可省略，ret 可单独使用。
+fun greet(name: str): void {
+    println("hi, ${name}")
+    ret
+}
+
+// 默认参数与命名参数。
+fun intro(name: str, age: i64 = 18, city: str = "unknown"): str {
+    ret "${name}/${age}/${city}"
+}
+
+// 可变参数，元素个数由 <name>__n 给出。
+fun sumAll(xs: i64...): i64 {
+    var total = 0
+    var i = 0
+    while (i < xs__n) { total = total + xs[i]; i = i + 1 }
+    ret total
+}
+
+// 重载需要各自的链接名，否则同一模块内同名函数会报 E0204。
+fun twice[twice_i64](x: i64): i64 => x * 2
+fun twice[twice_str](x: str): str => x + x
+
+// 扩展函数：接收者写 i64.，函数体内用 self。
+ext fun i64.double[double_i64](): i64 => self * 2
+
+// 函数类型与 lambda。
+fun apply(f: (i64) -> i64, x: i64): i64 => f(x)
+
+fun main(): void {
+    println(add(2, 3))
+    println(square(7))
+    greet("sinter")
+
+    println(intro("ada"))
+    println(intro("grace", city = "nyc"))
+
+    println(sumAll(1, 2, 3))
+    println(twice(21))
+    println(twice("ab"))
+    println(5.double())
+
+    println(apply(fun (n: i64): i64 => n + 1, 41))
+    println(apply(fun (n: i64): i64 => n * n, 9))
+}

@@ -1,0 +1,15 @@
+module aes
+import std
+import std.binary
+import algo.aes
+
+fun main(): void {
+    val key = hexDecode("000102030405060708090a0b0c0d0e0f")
+    val iv = hexDecode("000102030405060708090a0b0c0d0e0f")
+    val block = hexDecode("00112233445566778899aabbccddeeff")
+    println(hexEncode(aesBlockEncrypt(key, block)))
+    println(hexEncode(aesBlockDecrypt(key, aesBlockEncrypt(key, block))) == hexEncode(block))
+    val c = aesCbcEncrypt(key, iv, "hello sinter")
+    println(aesCbcDecrypt(key, iv, c))
+    println(aesCtr(key, iv, "same") == aesCtr(key, iv, "same"))
+}

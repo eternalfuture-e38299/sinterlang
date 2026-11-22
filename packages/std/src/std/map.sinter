@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: `Map<K, V>` — **ordered** map (keys ascending, binary search)
+//
+// Division of labour with `HashMap`:
+//   - `Map` keeps an ordered array using **key comparison** (`sinter_gen_cmp`);
+//     lookup is binary search. Suits "iterate in key order", "key ranges" and
+//     "stable output".
+//   - `HashMap` uses **hashing** (`sinter_gen_hash`) with open addressing, O(1)
+//     on average, but iteration order is not guaranteed.
+//     They are **different types, different files, different algorithms**.
+//
+//     import std.map
+//
+//     val m = Map<str, i64>()
+//     m.put("alpha", 1); m.put("beta", 2)
+//     println(m.keyAt(0))       // alpha (keys in order)
+//     println(m.get("beta"))    // 2
+module std.map
+import std.core
+import std.generic
+
+/// Ordered map: keys are kept in ascending order, lookup uses binary search. Key comparison is dispatched on K (str uses string comparison).
+pub class Map<K, V> : Any {
+    var keys: *K
+    var vals: *V
+    var cnt: i64
+    var cap: i64
+
+    Map() {
+        self.keys = null
+        self.vals = null
+        self.cnt = 0
+        self.cap = 0
+    }
+
+    ~Map() {
+        self.clear()
+        free(self.keys)
+        free(self.vals)
+        self.keys = null
+        self.vals = null
+        self.cnt = 0
+        self.cap = 0
+    }
+
+    pub fun typeLabel(): str => "Map"
+
+    /// Modern-style `{k=v, ...}` (keys in order, text rendered by dispatching on `K` / `V` separately).
+    pub fun toString(): str {
+        val sb: *u8 = sinter_gen_sb_new()
+        sinter_gen_sb_mark(sb, 2)
+        var i: i64 = 0
+        while (i < self.cnt) {
+            if (i > 0) { sinter_gen_sb_mark(sb, 4) }
+            val kt: str = sinter_gen_text(self.keys[i], K)
+            sinter_gen_sb_append_text(sb, kt)
+            sinter_gen_sb_mark(sb, 5)
+            val vt: str = sinter_gen_text(self.vals[i], V)
+            sinter_gen_sb_append_text(sb, vt)
+            i = i + 1
+        }
+        sinter_gen_sb_mark(sb, 3)
+        return sinter_gen_sb_finish(sb)
+    }
+
+    pub fun size(): i64 => self.cnt
+    pub fun capacity(): i64 => self.cap
+    pub fun isEmpty(): bool => self.cnt == 0
+
+    pub fun reserve(need: i64): void {
+        if (need <= self.cap) { return }
+        var next: i64 = self.cap
+        if (next < 8) { next = 8 }
+        while (next < need) { next = next * 2 }
+        val nk: *K = sinter_gen_grow(self.keys, next)
+        if (nk == null) { return }
+        self.keys = nk
+        val nv: *V = sinter_gen_grow(self.vals, next, V)
+        if (nv == null) { return }
+        self.vals = nv
+        self.cap = next
+    }
+
+    /// First position >= want
+    pub fun lowerBound(want: K): i64 {
+        var lo: i64 = 0
+        var hi: i64 = self.cnt
+        while (lo < hi) {
+            val mid: i64 = (lo + hi) / 2
+            if (sinter_gen_cmp(self.keys[mid], want) < 0) {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return lo
+    }
+
+    pub fun put(key: K, value: V): void {
+        val at: i64 = self.lowerBound(key)
+        if (at < self.cnt && sinter_gen_cmp(self.keys[at], key) == 0) {
+            self.vals[at] = sinter_gen_clone(value, V)
+            return
+        }
+        self.reserve(self.cnt + 1)
+        if (self.cnt >= self.cap) { return }
+        var k: i64 = self.cnt
+        while (k > at) {
+            self.keys[k] = self.keys[k - 1]
+            self.vals[k] = self.vals[k - 1]
+            k = k - 1
+        }
+        self.keys[at] = sinter_gen_clone(key)
+        self.vals[at] = sinter_gen_clone(value, V)
+        self.cnt = self.cnt + 1
+    }
+
+    pub fun containsKey(key: K): bool {
+        val at: i64 = self.lowerBound(key)
+        return at < self.cnt && sinter_gen_cmp(self.keys[at], key) == 0
+    }
+
+    pub fun getOr(key: K, fallback: V): V {
+        val at: i64 = self.lowerBound(key)
+        if (at < self.cnt && sinter_gen_cmp(self.keys[at], key) == 0) {
+            return sinter_gen_clone(self.vals[at], V)
+        }
+        return fallback
+    }
+
+    /// Get the value for a key; if absent, returns the blank value for that type (`i64` → 0, `str` → empty string)
+    pub fun get(key: K): V {
+        val at: i64 = self.lowerBound(key)
+        if (at < self.cnt && sinter_gen_cmp(self.keys[at], key) == 0) {
+            return sinter_gen_clone(self.vals[at], V)
+        }
+        return sinter_gen_blank(V)
+    }
+
+    /// Remove a key and return the removed value (blank value of that type if the key is absent).
+    /// Later elements shift down to keep the order.
+    pub fun remove(key: K): V {
+        val at: i64 = self.lowerBound(key)
+        if (at >= self.cnt || sinter_gen_cmp(self.keys[at], key) != 0) {
+            return sinter_gen_blank(V)
+        }
+        val old: V = sinter_gen_clone(self.vals[at], V)
+        sinter_gen_drop(self.keys[at])
+        sinter_gen_drop(self.vals[at], V)
+        var k: i64 = at
+        while (k + 1 < self.cnt) {
+            self.keys[k] = self.keys[k + 1]
+            self.vals[k] = self.vals[k + 1]
+            k = k + 1
+        }
+        self.cnt = self.cnt - 1
+        self.keys[self.cnt] = sinter_gen_blank()
+        self.vals[self.cnt] = sinter_gen_blank(V)
+        return old
+    }
+
+    pub fun keyAt(i: i64): K {
+        if (i < 0 || i >= self.cnt) { return sinter_gen_blank() }
+        return sinter_gen_clone(self.keys[i])
+    }
+
+    pub fun valueAt(i: i64): V {
+        if (i < 0 || i >= self.cnt) { return sinter_gen_blank(V) }
+        return sinter_gen_clone(self.vals[i], V)
+    }
+
+    pub fun clear(): void {
+        var i: i64 = 0
+        while (i < self.cnt) {
+            sinter_gen_drop(self.keys[i])
+            sinter_gen_drop(self.vals[i], V)
+            i = i + 1
+        }
+        self.cnt = 0
+    }
+}

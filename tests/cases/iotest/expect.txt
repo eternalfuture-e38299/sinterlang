@@ -1,0 +1,70 @@
+== path ==
+join1=/tmp/a.txt
+join2=/tmp/a.txt
+join3=a.txt
+join4=/tmp
+abs1=1
+abs2=0
+name1=c.txt
+name2=c.txt
+name3=
+parent1=/a/b
+parent2=/
+parent3=
+ext1=txt
+ext2=
+ext3=c
+== mkdirs ==
+mk=1
+isDir=1
+isFile=0
+exists=1
+sub=1
+subDir=1
+== write_read ==
+w1=1
+exists=1
+isFile=1
+size=12
+r1=12
+a1=1
+size2=18
+lines=3
+mt=1
+L0=line1
+L1=line2
+L2=line3
+over=1
+size3=1
+content=x
+== listDir ==
+count=4
+N0=a.txt
+N1=b.txt
+N2=hello.txt
+N3=sub
+== errors ==
+missExists=0
+missRead=0
+missErr=2
+missSize=-1
+== rename_remove ==
+ren=1
+oldGone=0
+newThere=1
+rm=1
+rmGone=0
+rmb=1
+rmf=1
+rmsub=1
+left=0
+rmroot=1
+rootGone=0
+== io_write ==
+w1-w2
+line
+A
+bytes-will-be-2
+hibytes=2
+
+== done ==

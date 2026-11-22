@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: threads (thin pthread wrapper)
+//
+// The language itself has no async/await syntax; threading is provided as a library:
+//
+//     fun work(arg: ptr): ptr {
+//         println("worker")
+//         ret null
+//     }
+//
+//     val t = Thread(work, null)
+//     t.join()
+//
+// Why the thread function is `(ptr) -> ptr` rather than `() -> void`: pthread's entry point is
+// `void* (*)(void*)`, and Sinter does not add a C -> Sinter callback layer; arguments are passed as `ptr`
+// (`ptrFromInt` / `intFromPtr` convert between integers and pointers).
+//
+// Sync primitives: Mutex / Condvar storage is malloc'd on the C side; the Sinter side only holds handles.
+module std.thread
+
+import std.core
+
+embed C {
+#ifdef _WIN32
+    #include <windows.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+
+    typedef void* (*sinter_thread_fn)(void*);
+
+    typedef struct { sinter_thread_fn fn; void* arg; } sinter_th_start;
+
+    static DWORD WINAPI sinter_th_entry(LPVOID raw) {
+        sinter_th_start* s = (sinter_th_start*)raw;
+        sinter_thread_fn fn = s->fn;
+        void* arg = s->arg;
+        free(s);
+        fn(arg);
+        return 0;
+    }
+
+    static int64_t sinter_th_spawn(sinter_thread_fn fn, void* arg) {
+        if (!fn) return 0;
+        sinter_th_start* s = (sinter_th_start*)malloc(sizeof(sinter_th_start));
+        if (!s) return 0;
+        s->fn = fn;
+        s->arg = arg;
+        HANDLE h = CreateThread(NULL, 0, sinter_th_entry, s, 0, NULL);
+        if (!h) { free(s); return 0; }
+        return (int64_t)(intptr_t)h;
+    }
+
+    static void sinter_th_join(int64_t h) {
+        if (!h) return;
+        WaitForSingleObject((HANDLE)(intptr_t)h, INFINITE);
+        CloseHandle((HANDLE)(intptr_t)h);
+    }
+
+    static void sinter_th_detach(int64_t h) {
+        if (h) CloseHandle((HANDLE)(intptr_t)h);
+    }
+
+    static int64_t sinter_th_current(void) { return (int64_t)GetCurrentThreadId(); }
+    static void sinter_th_sleep_ms(int64_t ms) { if (ms > 0) Sleep((DWORD)ms); }
+    static void sinter_th_yield(void) { SwitchToThread(); }
+    static void* sinter_th_ptr_from_int(int64_t v) { return (void*)(intptr_t)v; }
+    static int64_t sinter_th_int_from_ptr(void* p) { return (int64_t)(intptr_t)p; }
+
+    typedef struct { CRITICAL_SECTION cs; } sinter_mutex;
+
+    static void* sinter_th_mutex_new(void) {
+        sinter_mutex* m = (sinter_mutex*)calloc(1, sizeof(sinter_mutex));
+        if (!m) return NULL;
+        InitializeCriticalSection(&m->cs);
+        return m;
+    }
+    static void sinter_th_mutex_free(void* p) {
+        if (!p) return;
+        DeleteCriticalSection(&((sinter_mutex*)p)->cs);
+        free(p);
+    }
+    static void sinter_th_mutex_lock(void* p) {
+        if (p) EnterCriticalSection(&((sinter_mutex*)p)->cs);
+    }
+    static int64_t sinter_th_mutex_try_lock(void* p) {
+        return p ? (TryEnterCriticalSection(&((sinter_mutex*)p)->cs) ? 1 : 0) : 0;
+    }
+    static void sinter_th_mutex_unlock(void* p) {
+        if (p) LeaveCriticalSection(&((sinter_mutex*)p)->cs);
+    }
+
+    typedef struct { CONDITION_VARIABLE cv; } sinter_cond;
+
+    static void* sinter_th_cond_new(void) {
+        sinter_cond* c = (sinter_cond*)calloc(1, sizeof(sinter_cond));
+        if (!c) return NULL;
+        InitializeConditionVariable(&c->cv);
+        return c;
+    }
+    static void sinter_th_cond_free(void* p) { free(p); }
+    static void sinter_th_cond_wait(void* cv, void* mu) {
+        if (cv && mu) SleepConditionVariableCS(&((sinter_cond*)cv)->cv,
+                                               &((sinter_mutex*)mu)->cs, INFINITE);
+    }
+    static void sinter_th_cond_signal(void* cv) {
+        if (cv) WakeConditionVariable(&((sinter_cond*)cv)->cv);
+    }
+    static void sinter_th_cond_broadcast(void* cv) {
+        if (cv) WakeAllConditionVariable(&((sinter_cond*)cv)->cv);
+    }
+#else
+    #include <pthread.h>
+    #include <sched.h>
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <unistd.h>
+
+    typedef void* (*sinter_thread_fn)(void*);
+
+    static int64_t sinter_th_spawn(sinter_thread_fn fn, void* arg) {
+        pthread_t t;
+        if (!fn) return 0;
+        if (pthread_create(&t, NULL, fn, arg) != 0) return 0;
+        return (int64_t)(uintptr_t)t;
+    }
+
+    static void sinter_th_join(int64_t h) {
+        if (h) pthread_join((pthread_t)(uintptr_t)h, NULL);
+    }
+
+    static void sinter_th_detach(int64_t h) {
+        if (h) pthread_detach((pthread_t)(uintptr_t)h);
+    }
+
+    static int64_t sinter_th_current(void) {
+        return (int64_t)(uintptr_t)pthread_self();
+    }
+
+    static void sinter_th_sleep_ms(int64_t ms) {
+        // Declared here: under strict C17 <unistd.h> does not expose usleep / useconds_t.
+        extern int usleep(unsigned int usec);
+        if (ms > 0) usleep((unsigned int)(ms * 1000));
+    }
+
+    static void sinter_th_yield(void) { sched_yield(); }
+
+    static void* sinter_th_ptr_from_int(int64_t v) { return (void*)(uintptr_t)v; }
+    static int64_t sinter_th_int_from_ptr(void* p) { return (int64_t)(uintptr_t)p; }
+
+    typedef struct { pthread_mutex_t mu; } sinter_mutex;
+
+    static void* sinter_th_mutex_new(void) {
+        sinter_mutex* m = (sinter_mutex*)calloc(1, sizeof(sinter_mutex));
+        if (!m) return NULL;
+        if (pthread_mutex_init(&m->mu, NULL) != 0) { free(m); return NULL; }
+        return m;
+    }
+
+    static void sinter_th_mutex_free(void* p) {
+        if (!p) return;
+        pthread_mutex_destroy(&((sinter_mutex*)p)->mu);
+        free(p);
+    }
+
+    static void sinter_th_mutex_lock(void* p) {
+        if (p) pthread_mutex_lock(&((sinter_mutex*)p)->mu);
+    }
+
+    static int64_t sinter_th_mutex_try_lock(void* p) {
+        return p ? (pthread_mutex_trylock(&((sinter_mutex*)p)->mu) == 0 ? 1 : 0) : 0;
+    }
+
+    static void sinter_th_mutex_unlock(void* p) {
+        if (p) pthread_mutex_unlock(&((sinter_mutex*)p)->mu);
+    }
+
+    typedef struct { pthread_cond_t cv; } sinter_cond;
+
+    static void* sinter_th_cond_new(void) {
+        sinter_cond* c = (sinter_cond*)calloc(1, sizeof(sinter_cond));
+        if (!c) return NULL;
+        if (pthread_cond_init(&c->cv, NULL) != 0) { free(c); return NULL; }
+        return c;
+    }
+
+    static void sinter_th_cond_free(void* p) {
+        if (!p) return;
+        pthread_cond_destroy(&((sinter_cond*)p)->cv);
+        free(p);
+    }
+
+    static void sinter_th_cond_wait(void* cv, void* mu) {
+        if (cv && mu) pthread_cond_wait(&((sinter_cond*)cv)->cv, &((sinter_mutex*)mu)->mu);
+    }
+
+    static void sinter_th_cond_signal(void* cv) {
+        if (cv) pthread_cond_signal(&((sinter_cond*)cv)->cv);
+    }
+
+    static void sinter_th_cond_broadcast(void* cv) {
+        if (cv) pthread_cond_broadcast(&((sinter_cond*)cv)->cv);
+    }
+#endif
+}
+
+/// A pthread thread. The return value of `fn` is ignored.
+pub class Thread {
+    var handle: i64
+
+    Thread(fn: (ptr) -> ptr, arg: ptr) {
+        self.handle = sinter_th_spawn(fn, arg)
+    }
+
+    ~Thread() {
+        // Without detach the thread resources leak; a joined handle is already 0.
+        if self.handle != 0 { sinter_th_detach(self.handle) }
+        self.handle = 0
+    }
+
+    pub fun isAlive(): bool => self.handle != 0
+    pub fun join(): void {
+        if self.handle != 0 {
+            sinter_th_join(self.handle)
+            self.handle = 0
+        }
+    }
+    pub fun detach(): void {
+        if self.handle != 0 {
+            sinter_th_detach(self.handle)
+            self.handle = 0
+        }
+    }
+}
+
+pub class Mutex {
+    var handle: ptr
+
+    Mutex() { self.handle = sinter_th_mutex_new() }
+    ~Mutex() {
+        if self.handle != null { sinter_th_mutex_free(self.handle) }
+        self.handle = null
+    }
+
+    pub fun lock(): void => sinter_th_mutex_lock(self.handle)
+    pub fun tryLock(): bool => sinter_th_mutex_try_lock(self.handle) != 0
+    pub fun unlock(): void => sinter_th_mutex_unlock(self.handle)
+}
+
+pub class Condvar {
+    var handle: ptr
+
+    Condvar() { self.handle = sinter_th_cond_new() }
+    ~Condvar() {
+        if self.handle != null { sinter_th_cond_free(self.handle) }
+        self.handle = null
+    }
+
+    /// Must be called after `m.lock()`; the lock is still held on return.
+    pub fun wait(m: Mutex): void => sinter_th_cond_wait(self.handle, m.handle)
+    pub fun signal(): void => sinter_th_cond_signal(self.handle)
+    pub fun broadcast(): void => sinter_th_cond_broadcast(self.handle)
+}
+
+pub fun sleepMs(ms: i64): void => sinter_th_sleep_ms(ms)
+pub fun yieldThread(): void => sinter_th_yield()
+pub fun currentThreadId(): i64 => sinter_th_current()
+
+/// Integer → opaque pointer (for passing arguments to threads/async tasks).
+pub fun ptrFromInt(v: i64): ptr => sinter_th_ptr_from_int(v)
+/// Opaque pointer → integer.
+pub fun intFromPtr(p: ptr): i64 => sinter_th_int_from_ptr(p)

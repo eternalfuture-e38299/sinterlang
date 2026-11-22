@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: console input/output
+//
+// This layer only covers line/byte reads and writes on the standard streams;
+// filesystem operations live in `std.filesystem`.
+// Relation to the `std` prelude: `println` / `print` / `eprintln` are already in
+// the prelude; this module adds **reading** (`readLine` / `readAll` / `readChar`)
+// and **writing raw bytes**.
+//
+// Design choices:
+//
+//   1) Everything goes through `read(2)` / `write(2)`; <stdio.h> is not pulled in.
+//      The runtime header then needs no `FILE*`, and libc buffering cannot hide
+//      already-printed output when the program crashes.
+//   2) Reads **buffer internally**: the kernel may return any amount at a time, so
+//      `readLine` must keep reading until `\n` or EOF. The buffer lives in the
+//      embedded C; the Sinter side holds only a handle.
+//   3) EOF and "empty line" must be distinguished: reading `\n` yields `""`,
+//      reading to end of file yields null.
+//      The language has no address-of syntax, so out-parameter style C interfaces
+//      cannot be written on the Sinter side; hence two calls: ask `eof()` first,
+//      then take `readLine()`.
+module std.io
+
+import std.core
+import std.string
+
+embed C {
+    #include <errno.h>
+
+    typedef __SIZE_TYPE__ std_io_size_t;
+    typedef __PTRDIFF_TYPE__ std_io_ssize_t;
+
+    /* Standard stream numbers (identical on Linux / musl / Android) */
+    #define SINTER_IO_STDIN  0
+    #define SINTER_IO_STDOUT 1
+    #define SINTER_IO_STDERR 2
+
+#ifdef _WIN32
+    #include <io.h>
+    #define read  _read
+    #define write _write
+#else
+    /* Include the declarations instead of redeclaring them: Darwin's unistd.h
+       attaches an asm label to write, which is invalid after a prior use. */
+    #include <unistd.h>
+#endif
+
+    #define SINTER_IO_BUF 4096
+
+    /* Read buffer for one input stream. */
+    typedef struct {
+        int     fd;
+        char    buf[SINTER_IO_BUF];
+        int64_t pos;    /* next unconsumed byte */
+        int64_t len;    /* number of valid bytes */
+        uint8_t eof;    /* inner read has returned 0 */
+        uint8_t err;    /* inner read returned -1 */
+    } sinter_io_reader;
+
+    static sinter_io_reader* sinter_io_reader_new(int fd) {
+        sinter_io_reader* r = (sinter_io_reader*)malloc(sizeof(sinter_io_reader));
+        if (!r) return NULL;
+        r->fd = fd;
+        r->pos = 0;
+        r->len = 0;
+        r->eof = 0;
+        r->err = 0;
+        return r;
+    }
+
+    static void sinter_io_reader_free(sinter_io_reader* r) { free(r); }
+
+    /* Fetch the next byte: 0..255, or -1 on EOF / read error.
+       Only enters the kernel when the buffer is empty and EOF has not been seen. */
+    static int32_t sinter_io_next(sinter_io_reader* r) {
+        if (!r) return -1;
+        if (r->pos >= r->len) {
+            if (r->eof || r->err) return -1;
+            std_io_ssize_t n = read(r->fd, r->buf, SINTER_IO_BUF);
+            if (n < 0) {
+                /* Retry once on EINTR: a signal interruption does not end input */
+                if (errno == EINTR) n = read(r->fd, r->buf, SINTER_IO_BUF);
+                if (n < 0) { r->err = 1; return -1; }
+            }
+            if (n == 0) { r->eof = 1; return -1; }
+            r->pos = 0;
+            r->len = n;
+        }
+        return (int32_t)(unsigned char)r->buf[r->pos++];
+    }
+
+    /* Read one line (excluding `\n`; a trailing `\r` is dropped too, for CRLF
+       text). Not a single byte read means EOF: `*out_len = -1`. */
+    static int32_t sinter_io_read_line(sinter_io_reader* r, char** out, int64_t* out_len) {
+        if (!r || !out || !out_len) return -1;
+        int64_t cap = 128;
+        int64_t n = 0;
+        char* p = (char*)malloc((std_io_size_t)cap);
+        if (!p) return -1;
+        int32_t c = sinter_io_next(r);
+        if (c < 0) {
+            free(p);
+            *out = NULL;
+            *out_len = -1;      /* real EOF */
+            return 0;
+        }
+        while (c >= 0 && c != '\n') {
+            if (n + 1 >= cap) {
+                cap *= 2;
+                char* np = (char*)realloc(p, (std_io_size_t)cap);
+                if (!np) { free(p); return -1; }
+                p = np;
+            }
+            p[n++] = (char)c;
+            c = sinter_io_next(r);
+        }
+        /* CRLF: a trailing '\r' is not part of the content */
+        if (n > 0 && p[n - 1] == '\r') n--;
+        *out = p;
+        *out_len = n;
+        return 0;
+    }
+
+    /* Read all remaining bytes (up to EOF). */
+    static int32_t sinter_io_read_all(sinter_io_reader* r, char** out, int64_t* out_len) {
+        if (!r || !out || !out_len) return -1;
+        int64_t cap = 1024;
+        int64_t n = 0;
+        char* p = (char*)malloc((std_io_size_t)cap);
+        if (!p) return -1;
+        for (;;) {
+            int32_t c = sinter_io_next(r);
+            if (c < 0) break;
+            if (n + 1 >= cap) {
+                cap *= 2;
+                char* np = (char*)realloc(p, (std_io_size_t)cap);
+                if (!np) { free(p); return -1; }
+                p = np;
+            }
+            p[n++] = (char)c;
+        }
+        *out = p;
+        *out_len = n;
+        return 0;
+    }
+
+    /* Write all bytes: handles short writes and EINTR. Returns bytes written, -1 on error. */
+    static int64_t sinter_io_write_bytes(int fd, const char* data, int64_t n) {
+        if (n <= 0 || !data) return 0;
+        int64_t done = 0;
+        while (done < n) {
+            std_io_ssize_t w = write(fd, data + done, (std_io_size_t)(n - done));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                return -1;
+            }
+            if (w == 0) break;      /* should not happen; guards against an infinite loop */
+            done += w;
+        }
+        return done;
+    }
+
+    static inline void sinter_io_write_str(int fd, sinter_string s) {
+        sinter_io_write_bytes(fd, s.data, s.len);
+    }
+
+    static inline void sinter_io_write_line(int fd, sinter_string s) {
+        sinter_io_write_bytes(fd, s.data, s.len);
+        sinter_io_write_bytes(fd, "\n", 1);
+    }
+
+    static inline void sinter_io_write_char(int fd, int64_t ch) {
+        char c = (char)ch;
+        sinter_io_write_bytes(fd, &c, 1);
+    }
+
+    static int64_t sinter_io_write_buf_u8(int fd, uint8_t* data, int64_t n) {
+        return sinter_io_write_bytes(fd, (const char*)data, n);
+    }
+
+    /* Wrap the (char*, len) result into a sinter_string. On EOF an empty string
+       is returned — whether the stream is finished is answered separately by
+       `sinter_io_at_eof` (Sinter cannot pass addresses out). */
+    static sinter_string sinter_io_read_line_str(sinter_io_reader* r) {
+        char* p = NULL;
+        int64_t n = -1;
+        if (sinter_io_read_line(r, &p, &n) != 0) return sinter_string_from_literal("", 0);
+        if (n < 0) return sinter_string_from_literal("", 0);
+        sinter_string s = sinter_string_from_buf(p, n);
+        free(p);
+        return s;
+    }
+
+    static sinter_string sinter_io_read_all_str(sinter_io_reader* r) {
+        char* p = NULL;
+        int64_t n = 0;
+        if (sinter_io_read_all(r, &p, &n) != 0) return sinter_string_from_literal("", 0);
+        sinter_string s = sinter_string_from_buf(p, n);
+        free(p);
+        return s;
+    }
+
+    static uint8_t sinter_io_at_eof(sinter_io_reader* r) {
+        if (!r) return 1;
+        return (r->eof && r->pos >= r->len) ? 1 : 0;
+    }
+
+    /* Default read buffer for standard input (created lazily). */
+    static sinter_io_reader* sinter_io_g_stdin = NULL;
+    static inline sinter_io_reader* sinter_io_stdin(void) {
+        if (!sinter_io_g_stdin) sinter_io_g_stdin = sinter_io_reader_new(SINTER_IO_STDIN);
+        return sinter_io_g_stdin;
+    }
+}
+
+// ============================================================================
+// Reading: standard input
+// ============================================================================
+/// Whether standard input has reached end of file.
+///
+///     while (!eof()) { val line = readLine(); println(line) }
+///
+pub fun eof(): bool => sinter_io_at_eof(sinter_io_stdin()) != 0
+
+/// Read one line (without the newline; a trailing `\r` of CRLF is dropped too).
+/// Returns an empty string at EOF — test for the end with `eof()`, don't treat
+/// the empty string as the end marker.
+pub fun readLine(): str => sinter_io_read_line_str(sinter_io_stdin())
+
+/// All input up to EOF (`\n` kept as-is).
+pub fun readAll(): str => sinter_io_read_all_str(sinter_io_stdin())
+
+/// Read one byte (0..255); returns -1 at EOF.
+pub fun readByte(): i64 => sinter_io_next(sinter_io_stdin())
+
+// ============================================================================
+// Output: standard output / standard error
+// ============================================================================
+// The prelude's `println` / `print` are enough; this adds the "explicit stream"
+// and "write raw bytes" cases, so they read naturally next to the readers.
+pub fun write(s: str): void { sinter_io_write_str(1, s) }
+pub fun writeErr(s: str): void { sinter_io_write_str(2, s) }
+
+pub fun writeLine(s: str): void { sinter_io_write_line(1, s) }
+pub fun writeErrLine(s: str): void { sinter_io_write_line(2, s) }
+
+pub fun writeChar(ch: i64): void { sinter_io_write_char(1, ch) }
+pub fun writeErrChar(ch: i64): void { sinter_io_write_char(2, ch) }
+
+/// Write a run of raw bytes (no trailing newline). Returns bytes actually written, -1 on failure.
+pub fun writeBytes(data: *u8, n: i64): i64 => sinter_io_write_buf_u8(1, data, n)
+
+pub fun writeErrBytes(data: *u8, n: i64): i64 => sinter_io_write_buf_u8(2, data, n)
+
+/// Output goes straight to the kernel with no user-space buffer, so nothing
+/// needs flushing. The name is kept so call sites won't change if buffering is
+/// added later.
+pub fun flush(): void { }

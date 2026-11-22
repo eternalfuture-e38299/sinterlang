@@ -1,0 +1,17 @@
+[package]
+name = "sem"
+version = "file:../../version.txt"
+entry = "src/sem.sinter"
+description = "Self-hosted Sinter semantic model: symbols, types, classes, generics, ownership"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_sem"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+syntax = { version = "1.0.0", source = "path:../syntax" }
+
+[build]
+opt = "2"

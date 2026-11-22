@@ -1,0 +1,54 @@
+// tests/cases/strtmp —— A.1 回归：调用实参里的字符串临时值
+//
+// 覆盖「临时字符串实参」会出现的六种语句形态。判定看两处：
+//   expect.txt      —— 程序行为没被改动（尤其是 while / do-while 的循环次数与 continue）
+//   assert_gen.txt  —— 生成的 C 里内层调用没有被内联两次，且临时值都有释放
+//
+// 注意：这里的 `wrap` / `cat2` 都必须返回**新缓冲**。写 `fun id(s: str): str { return s }`
+// 那种恒等函数会把借来的缓冲区当所有权交出去，调用方释放它就会 double free——
+// 那是用户程序的语义错误，不是编译器 bug，用在这里会造成假失败。
+module strtmp
+import std
+
+fun cat2(a: str, b: str): str { return a + b }
+fun wrap(s: str): str { return "[" + s + "]" }
+fun lenOf(s: str): i32 { return s.len }
+
+// return 位置：返回表达式本身不提升，但它的实参要提升
+fun retProbe(): str {
+    return wrap(cat2("u", "v"))
+}
+
+fun main(): void {
+    // ① 表达式语句
+    println("x=" + wrap(cat2("a", "b")))
+
+    // ② var 初始化（字符串结果绑到变量；实参里的临时值要释放）
+    var n = lenOf(wrap(cat2("p", "q")))
+    println(n)
+    var s = cat2("m", "n")
+    println(s)
+
+    // ③ return
+    println(retProbe())
+
+    // ④ if 条件
+    if (lenOf(wrap(cat2("c", "d"))) > 0) {
+        println("if-ok")
+    }
+
+    // ⑤ while 条件：条件每轮重新求值，循环两次
+    var i = 0
+    while (lenOf(wrap(cat2("w", "w"))) > 0 && i < 2) {
+        println("while")
+        i = i + 1
+    }
+
+    // ⑥ do-while 条件 + continue：第一轮被 continue 跳过，只有第二轮打印
+    var j = 0
+    do {
+        j = j + 1
+        if (j == 1) { continue }
+        println("do")
+    } while (lenOf(wrap(cat2("d", "d"))) > 0 && j < 2)
+}

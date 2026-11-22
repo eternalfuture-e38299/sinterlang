@@ -1,0 +1,46 @@
+module netkit
+import std
+import std.net
+
+fun main(): void {
+    val srv = tcpListen("127.0.0.1", 0)
+    println(srv >= 0)
+    val port = socketLocalPort(srv)
+    println(port > 0)
+    val cli = tcpConnect("127.0.0.1", port)
+    val conn = tcpAccept(srv)
+    println(cli >= 0 && conn >= 0)
+    println(tcpSend(cli, "ping\n"))
+    println(tcpRecvLine(conn))
+    println(tcpSend(conn, "pong"))
+    println(tcpRecv(cli, 16))
+    tcpClose(cli)
+    tcpClose(conn)
+    tcpClose(srv)
+
+    val u1 = udpBind("127.0.0.1", 0)
+    val u2 = udpBind("127.0.0.1", 0)
+    val up = socketLocalPort(u1)
+    println(udpSendTo(u2, "127.0.0.1", up, "dgram"))
+    println(udpRecvFrom(u1, 64))
+    println(udpLastPeerHost())
+    println(udpLastPeerPort() == socketLocalPort(u2))
+    tcpClose(u1)
+    tcpClose(u2)
+
+    val l = TcpListener("127.0.0.1", 0, 16)
+    println(l.isOpen())
+    val cport = l.localPort()
+    val c1 = TcpConnection(tcpConnect("127.0.0.1", cport))
+    val c2 = TcpConnection(l.acceptFd())
+    println(c1.isOpen() && c2.isOpen())
+    println(c1.write("one\ntwo\n"))
+    println(c2.readLine())
+    println(c2.readLine())
+    println(c1.writeLine("three"))
+    println(c2.readLine())
+    c1.close()
+    c2.close()
+    l.close()
+    println(l.isOpen())
+}

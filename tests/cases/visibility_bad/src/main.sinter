@@ -1,0 +1,7 @@
+module visibility_bad
+import std
+import lib
+
+fun main(): void {
+    println(Greeter().secret())
+}

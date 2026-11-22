@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: Option (an explicit optional-value type for a modern language)
+//
+//     val a = someInt(7)
+//     if a.isSome() { println(a.expect("missing")) }
+//     println(noneInt().getOr(-1))
+//
+// Relation to the nullable type `T?`: `T?` is language-level null safety (a zero-cost pointer null check),
+// while `Option<T>` is an explicit value that can go in containers and be returned; both are kept.
+module std.option
+
+import std
+
+embed C {
+    static inline sinter_string sinter_option_clone(sinter_string s) {
+        return sinter_string_clone(s);
+    }
+}
+
+pub class Option<T> : Any {
+    Option(has: bool, v: T) {
+        self.has = has
+        self.v = sinter_gen_clone(v)
+    }
+
+    ~Option() { sinter_gen_drop(self.v) }
+
+    pub fun isSome(): bool => self.has
+    pub fun isNone(): bool => !self.has
+
+    pub fun getOr(fallback: T): T {
+        if self.has { ret sinter_gen_clone(self.v) }
+        ret fallback
+    }
+
+    pub fun expect(message: str): T {
+        if !self.has { panic(message) }
+        ret sinter_gen_clone(self.v)
+    }
+
+    pub fun orElse(other: Option<T>): Option<T> {
+        if self.has { ret self }
+        ret other
+    }
+}
+
+pub fun someInt(v: i64): Option<i64> => Option<i64>(true, v)
+pub fun noneInt(): Option<i64> => Option<i64>(false, 0)
+pub fun someStr(v: str): Option<str> => Option<str>(true, v)
+pub fun noneStr(): Option<str> => Option<str>(false, "")
+pub fun someBool(v: bool): Option<bool> => Option<bool>(true, v)
+pub fun noneBool(): Option<bool> => Option<bool>(false, false)

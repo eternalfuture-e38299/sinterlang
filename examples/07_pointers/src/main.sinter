@@ -1,0 +1,43 @@
+// 07 —— 指针、引用与内存 / Pointers, references, memory
+module pointers
+import std
+import std.memory
+
+fun swap(a: *i64, b: *i64): void {
+    val tmp = *a
+    *a = *b
+    *b = tmp
+}
+
+// 引用参数用 &T 声明，调用时传 &x。
+fun addTo(x: i64&, n: i64): void { x = x + n }
+
+fun main(): void {
+    var x: i64 = 1
+    var y: i64 = 2
+    swap(&x, &y)
+    println(x)
+    println(y)
+
+    addTo(&x, 10)
+    println(x)
+
+    var nums: i64[3]
+    nums[0] = 7
+    nums[1] = 8
+    nums[2] = 9
+
+    val p: *i64 = &nums[0]
+    println(p[1])
+    println(*(p + 2))
+    println(p == null)
+
+    val raw: ptr = p
+    val back: *i64 = raw as *i64
+    println(back[0])
+
+    val mem = alloc(16)
+    store<i64>(mem as *i64, 42)
+    println(load<i64>(mem as *i64))
+    dealloc(mem)
+}

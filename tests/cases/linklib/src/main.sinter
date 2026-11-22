@@ -1,0 +1,20 @@
+module linklib
+import std
+
+embed C {
+#include <stdint.h>
+int64_t greet_value(void);
+
+int64_t linklib_platform(void) {
+#ifdef LINKLIB_WINDOWS
+    return LINKLIB_WINDOWS;
+#else
+    return -1;
+#endif
+}
+}
+
+fun main(): void {
+    println(greet_value())
+    println(linklib_platform())
+}

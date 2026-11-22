@@ -1,0 +1,76 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: pseudo-random numbers (xorshift64*, reproducible)
+//
+// Does not use `rand()`: the C standard library's `rand()` differs across platforms and is not reproducible in tests.
+module std.random
+
+import std
+import std.arrays
+
+embed C {
+    #include <stdint.h>
+
+    static inline uint64_t sinter_rand_u(int64_t state) {
+        uint64_t x = (uint64_t)state;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        return x * 2685821657736338717ULL;
+    }
+
+    static inline int64_t sinter_rand_next(int64_t state) {
+        return (int64_t)sinter_rand_u(state);
+    }
+
+    static inline double sinter_rand_double(int64_t state) {
+        return (double)(sinter_rand_u(state) >> 11) * (1.0 / 9007199254740992.0);
+    }
+}
+
+pub class Random {
+    var state: i64
+
+    Random(seed: i64) {
+        self.state = seed == 0 ? 88172645463325252 : seed
+    }
+
+    pub fun nextInt(): i64 {
+        self.state = sinter_rand_next(self.state)
+        ret self.state
+    }
+
+    /// [lo, hi] inclusive; returns lo when lo >= hi.
+    pub fun nextIntRange(lo: i64, hi: i64): i64 {
+        if hi <= lo { ret lo }
+        self.state = sinter_rand_next(self.state)
+        val r = self.state
+        val u = r < 0 ? -r : r
+        ret lo + u % (hi - lo + 1)
+    }
+
+    /// [0, 1) double.
+    pub fun nextFloat(): f64 {
+        self.state = sinter_rand_next(self.state)
+        ret sinter_rand_double(self.state)
+    }
+
+    pub fun nextBool(): bool => self.nextInt() % 2 == 0
+
+    /// In-place shuffle convenience entry for `Array<i64>` (keeps Random reproducible).
+    pub fun shuffleInts(xs: Array<i64>): void {
+        var i: i64 = xs.size - 1
+        while i > 0 {
+            val j = self.nextIntRange(0, i)
+            val a = xs.get(i)
+            val b = xs.get(j)
+            xs.set(i, b)
+            xs.set(j, a)
+            i = i - 1
+        }
+    }
+}
+
+/// Random seeded with the current time; pass a seed explicitly when reproducibility is needed.
+pub fun seededRandom(seed: i64): Random => Random(seed)

@@ -1,0 +1,108 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: low-level memory and pointer operations
+//
+// Sinter's `ptr` is C's `void*`; `*T` is `T*`. This wraps the most common C operations —
+// alloc / copy / read / pointer offset — in slightly type-safe functions, so every project
+// need not write `embed C`. All functions are thin wrappers with no extra allocation.
+module std.memory
+
+import std
+
+embed C {
+    #include <stdint.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    static inline void* sinter_mem_alloc(int64_t n) {
+        return malloc((size_t)(n > 0 ? n : 1));
+    }
+    static inline void* sinter_mem_alloc_zero(int64_t n) {
+        return calloc((size_t)(n > 0 ? n : 1), 1);
+    }
+    static inline void* sinter_mem_realloc(void* p, int64_t n) {
+        return realloc(p, (size_t)(n > 0 ? n : 1));
+    }
+    static inline void sinter_mem_free(void* p) { free(p); }
+    static inline void sinter_mem_copy(void* dst, const void* src, int64_t n) {
+        if (dst && src && n > 0) memcpy(dst, src, (size_t)n);
+    }
+    static inline void sinter_mem_move(void* dst, const void* src, int64_t n) {
+        if (dst && src && n > 0) memmove(dst, src, (size_t)n);
+    }
+    static inline void sinter_mem_set(void* dst, int64_t byte, int64_t n) {
+        if (dst && n > 0) memset(dst, (int)byte, (size_t)n);
+    }
+    static inline int64_t sinter_mem_compare(const void* a, const void* b, int64_t n) {
+        if (!a || !b || n <= 0) return 0;
+        return (int64_t)memcmp(a, b, (size_t)n);
+    }
+    static inline void* sinter_mem_offset(void* p, int64_t bytes) {
+        return (void*)((char*)p + bytes);
+    }
+    static inline int64_t sinter_mem_diff(const void* a, const void* b) {
+        return (int64_t)((const char*)a - (const char*)b);
+    }
+    static inline int64_t sinter_mem_to_int(void* p) { return (int64_t)(uintptr_t)p; }
+    static inline void* sinter_mem_from_int(int64_t v) { return (void*)(uintptr_t)v; }
+    static inline int64_t sinter_mem_ptr_size(void) { return (int64_t)sizeof(void*); }
+
+    static inline int8_t sinter_mem_read_i8(void* p) { return p ? *(int8_t*)p : 0; }
+    static inline int16_t sinter_mem_read_i16(void* p) { return p ? *(int16_t*)p : 0; }
+    static inline int32_t sinter_mem_read_i32(void* p) { return p ? *(int32_t*)p : 0; }
+    static inline int64_t sinter_mem_read_i64(void* p) { return p ? *(int64_t*)p : 0; }
+    static inline uint8_t sinter_mem_read_u8(void* p) { return p ? *(uint8_t*)p : 0; }
+    static inline uint16_t sinter_mem_read_u16(void* p) { return p ? *(uint16_t*)p : 0; }
+    static inline uint32_t sinter_mem_read_u32(void* p) { return p ? *(uint32_t*)p : 0; }
+    static inline uint64_t sinter_mem_read_u64(void* p) { return p ? *(uint64_t*)p : 0; }
+    static inline double sinter_mem_read_f64(void* p) { return p ? *(double*)p : 0.0; }
+    static inline void sinter_mem_write_i8(void* p, int8_t v) { if (p) *(int8_t*)p = v; }
+    static inline void sinter_mem_write_i16(void* p, int16_t v) { if (p) *(int16_t*)p = v; }
+    static inline void sinter_mem_write_i32(void* p, int32_t v) { if (p) *(int32_t*)p = v; }
+    static inline void sinter_mem_write_i64(void* p, int64_t v) { if (p) *(int64_t*)p = v; }
+    static inline void sinter_mem_write_u8(void* p, uint8_t v) { if (p) *(uint8_t*)p = v; }
+    static inline void sinter_mem_write_u16(void* p, uint16_t v) { if (p) *(uint16_t*)p = v; }
+    static inline void sinter_mem_write_u32(void* p, uint32_t v) { if (p) *(uint32_t*)p = v; }
+    static inline void sinter_mem_write_u64(void* p, uint64_t v) { if (p) *(uint64_t*)p = v; }
+    static inline void sinter_mem_write_f64(void* p, double v) { if (p) *(double*)p = v; }
+}
+
+pub fun alloc(bytes: i64): ptr => sinter_mem_alloc(bytes)
+pub fun allocZero(bytes: i64): ptr => sinter_mem_alloc_zero(bytes)
+pub fun realloc(p: ptr, bytes: i64): ptr => sinter_mem_realloc(p, bytes)
+pub fun dealloc(p: ptr): void => sinter_mem_free(p)
+pub fun copy(dst: ptr, src: ptr, bytes: i64): void => sinter_mem_copy(dst, src, bytes)
+pub fun move(dst: ptr, src: ptr, bytes: i64): void => sinter_mem_move(dst, src, bytes)
+pub fun fill(dst: ptr, byte: i64, bytes: i64): void => sinter_mem_set(dst, byte, bytes)
+pub fun compare(a: ptr, b: ptr, bytes: i64): i64 => sinter_mem_compare(a, b, bytes)
+pub fun offset(p: ptr, bytes: i64): ptr => sinter_mem_offset(p, bytes)
+pub fun distance(a: ptr, b: ptr): i64 => sinter_mem_diff(a, b)
+pub fun ptrToInt(p: ptr): i64 => sinter_mem_to_int(p)
+pub fun intToPtr(v: i64): ptr => sinter_mem_from_int(v)
+pub fun pointerSize(): i64 => sinter_mem_ptr_size()
+pub fun isNull(p: ptr): bool => p == null
+
+pub fun readI8(p: ptr): i8 => sinter_mem_read_i8(p)
+pub fun readI16(p: ptr): i16 => sinter_mem_read_i16(p)
+pub fun readI32(p: ptr): i32 => sinter_mem_read_i32(p)
+pub fun readI64(p: ptr): i64 => sinter_mem_read_i64(p)
+pub fun readU8(p: ptr): u8 => sinter_mem_read_u8(p)
+pub fun readU16(p: ptr): u16 => sinter_mem_read_u16(p)
+pub fun readU32(p: ptr): u32 => sinter_mem_read_u32(p)
+pub fun readU64(p: ptr): u64 => sinter_mem_read_u64(p)
+pub fun readF64(p: ptr): f64 => sinter_mem_read_f64(p)
+pub fun writeI8(p: ptr, v: i8): void => sinter_mem_write_i8(p, v)
+pub fun writeI16(p: ptr, v: i16): void => sinter_mem_write_i16(p, v)
+pub fun writeI32(p: ptr, v: i32): void => sinter_mem_write_i32(p, v)
+pub fun writeI64(p: ptr, v: i64): void => sinter_mem_write_i64(p, v)
+pub fun writeU8(p: ptr, v: u8): void => sinter_mem_write_u8(p, v)
+pub fun writeU16(p: ptr, v: u16): void => sinter_mem_write_u16(p, v)
+pub fun writeU32(p: ptr, v: u32): void => sinter_mem_write_u32(p, v)
+pub fun writeU64(p: ptr, v: u64): void => sinter_mem_write_u64(p, v)
+pub fun writeF64(p: ptr, v: f64): void => sinter_mem_write_f64(p, v)
+
+/// Typed pointer helpers (generic; cross-module instantiation is supported).
+pub fun load<T>(p: *T): T => *p
+pub fun store<T>(p: *T, v: T): void { *p = v }
+pub fun ptrAt<T>(p: *T, index: i64): *T => p + index

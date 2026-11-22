@@ -1,0 +1,15 @@
+module ann
+import std
+
+annotation class Route(val path: str, val code: i64 = 200)
+
+@Route("/x")
+fun handler(): str => "ok"
+
+@Route("/y", 201)
+fun other(): str => "ok2"
+
+fun main(): void {
+    println(handler())
+    println(other())
+}

@@ -1,0 +1,12 @@
+module lib
+import std
+
+pub class Greeter() {
+    priv {
+        fun secret(): str => "s"
+    }
+    pub {
+        fun open(): str => "o"
+        fun callSecret(): str => self.secret()
+    }
+}

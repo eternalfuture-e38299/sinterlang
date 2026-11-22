@@ -1,0 +1,36 @@
+# 构建输出
+/build/
+/build-*/
+/cmake-build-*/
+/out/
+*.o
+*.a
+*.so
+*.gch
+*.pch
+
+# 编译器生成的中间 C 文件（在仓库根运行时产生）
+/sinter_*.c
+/sinter_*.h
+/program
+
+# 测试输出
+/tests/out/
+/tests/tmp/
+/tests/cases/*/build/
+
+# 包管理器
+/sinter.lock
+/packages/*/build/
+
+# 编辑器 / 系统
+.DS_Store
+.vscode/
+.idea/
+compile_commands.json
+CMakeCache.txt
+CMakeFiles/
+/src/*/build/
+/src/libs/*/build/
+/examples/*/build/
+/tests/windows/*/build/

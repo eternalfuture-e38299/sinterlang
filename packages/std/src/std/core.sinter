@@ -1,0 +1,183 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: object-model root (Any) and object forms of the basic types
+//
+// In a uniform object model every type inherits from `Any`, and `Int` / `Double` /
+// `Boolean` / `String` are real classes. Sinter keeps `i64` / `f64` / `bool` / `str`
+// as **primitives** at the low level (they map directly to C scalars, with zero
+// overhead and no heap allocation), and this module provides an object layer on top:
+//
+//     val i = Int(42)             // wraps an i64
+//     println(i.toString())       // 42
+//     println(i.plus(Int(1)).toString())
+//     val a: Any = i              // upcast; virtual methods dispatch on the real type
+//
+// Naming is uniform and conventional: `toString` / `typeLabel` / `compareTo` / `plus` / `times`.
+// Note: the language does not support function overloading, nor `operator+` **on
+// classes** (the generated functions are not exported to the header), so arithmetic
+// is written as `plus` / `minus` / `times` / `div` / `rem`, which are in fact the
+// the conventional names that numeric operator helpers use.
+//
+// This module also registers a set of **compile-time constants** (class-scoped
+// constants): `Int.MAX_VALUE` / `Int.MIN_VALUE` / `I64.MAX_VALUE` / `Float.EPSILON` / …
+// They fold into literals before semantic analysis and produce no runtime storage.
+module std.core
+
+comptime {
+    // ---- i64 ----
+    val I64_BITS = 64
+    val I64_MAX = 9223372036854775807
+    val I64_MIN = -9223372036854775807 - 1
+    // ---- i32 ----
+    val I32_BITS = 32
+    val I32_MAX = 2147483647
+    val I32_MIN = -2147483648
+    // ---- u64 / u32 ----
+    val U64_BITS = 64
+    val U32_BITS = 32
+    val U32_MAX = 4294967295
+}
+
+embed C {
+    /* Type conversion helpers between primitives and the object layer. The runtime
+       header only declares str-related functions, so C's implicit conversions are
+       enough here and no header needs to be included. */
+    static inline double sinter_i64_to_f64(int64_t v) { return (double)v; }
+    static inline int64_t sinter_f64_to_i64(double v) { return (int64_t)v; }
+    static inline int64_t sinter_bool_to_i64(uint8_t v) { return v ? 1 : 0; }
+
+    /* Compile-time constants are also exposed as macros: C code inside embed C can
+       get the same numbers (Sinter's `Int.MAX_VALUE` folds to a literal; both must agree). */
+    #define SINTER_I64_BITS 64
+    #define SINTER_I64_MAX  9223372036854775807LL
+    #define SINTER_I32_BITS 32
+    #define SINTER_I32_MAX  2147483647
+    #define SINTER_U32_MAX  4294967295U
+}
+
+// ============================================================================
+// Any: the root of all object types
+// ============================================================================
+/// The smallest object-model root: `toString()` and `typeLabel()` (the RTTI type name).
+///
+/// Subclasses override with `override fun toString(): str`; when called through an
+/// `Any` parameter it dispatches via the vtable and always gets the real type's
+/// implementation.
+pub class Any {
+    Any() = default
+
+    pub fun toString(): str => "Any"
+
+    /// Runtime type name. **Do not call it `typeName`**: a class named `typeName`
+    /// would collide with the `<type>_type_name` constant (RTTI type name) in the generated code.
+    pub fun typeLabel(): str => "Any"
+}
+
+// ============================================================================
+// Int: the object form of i64
+// ============================================================================
+pub class Int(val v: i64) : Any {
+    Int() = default
+
+    pub override fun toString(): str => "${v}"
+    pub override fun typeLabel(): str => "Int"
+
+    pub fun plus(other: Int): Int { ret Int(v + other.v) }
+    pub fun minus(other: Int): Int { ret Int(v - other.v) }
+    pub fun times(other: Int): Int { ret Int(v * other.v) }
+    pub fun div(other: Int): Int { ret Int(v / other.v) }
+    pub fun rem(other: Int): Int { ret Int(v % other.v) }
+
+    pub fun compareTo(other: Int): i64 {
+        if (v < other.v) { ret -1 }
+        if (v > other.v) { ret 1 }
+        ret 0
+    }
+
+    pub fun toFloat(): Float => Float(sinter_i64_to_f64(v))
+    pub fun toBool(): Bool => Bool(v != 0)
+    pub fun abs(): Int {
+        if (v < 0) { ret Int(-v) }
+        ret Int(v)
+    }
+
+    /// `Int.MAX_VALUE`: a compile-time constant folded to a literal at the call site.
+    /// It must be a `static fun` to be called as `Int.MAX_VALUE()` (the class used as a namespace).
+    pub static fun MAX_VALUE(): i64 => I64_MAX
+    pub static fun MIN_VALUE(): i64 => I64_MIN
+}
+
+// ============================================================================
+// Float: the object form of f64
+// ============================================================================
+pub class Float(val v: f64) : Any {
+    Float() = default
+
+    pub override fun toString(): str => "${v}"
+    pub override fun typeLabel(): str => "Float"
+
+    pub fun plus(other: Float): Float { ret Float(v + other.v) }
+    pub fun minus(other: Float): Float { ret Float(v - other.v) }
+    pub fun times(other: Float): Float { ret Float(v * other.v) }
+    pub fun div(other: Float): Float { ret Float(v / other.v) }
+
+    pub fun compareTo(other: Float): i64 {
+        if (v < other.v) { ret -1 }
+        if (v > other.v) { ret 1 }
+        ret 0
+    }
+
+    pub fun toInt(): Int => Int(sinter_f64_to_i64(v))
+
+    /// Machine precision of an IEEE-754 double (`Double.EPSILON`).
+    pub fun EPSILON(): f64 => 2.220446049250313e-16
+}
+
+// ============================================================================
+// Bool: the object form of bool
+// ============================================================================
+pub class Bool(val v: bool) : Any {
+    Bool() = default
+
+    pub override fun toString(): str {
+        if (v) { ret "true" }
+        ret "false"
+    }
+
+    pub override fun typeLabel(): str => "Bool"
+
+    pub fun not(): Bool => Bool(v == false)
+    pub fun toInt(): Int => Int(sinter_bool_to_i64(v))
+}
+
+// ============================================================================
+// Primitive integers: compile-time bounds
+// ============================================================================
+// This family is a set of "boxes named by bit width": they provide only bounds and
+// bit width, and hold no value — real arithmetic still happens on the primitives
+// `i64` / `i32`, at zero overhead. Every function body is a compile-time constant,
+// so the generated C is literally `return 9223372036854775807LL;`.
+pub struct I64 {
+    pub static fun BITS(): i64 => I64_BITS
+    pub static fun MAX_VALUE(): i64 => I64_MAX
+    pub static fun MIN_VALUE(): i64 => I64_MIN
+}
+
+pub struct I32 {
+    pub static fun BITS(): i64 => I32_BITS
+    pub static fun MAX_VALUE(): i64 => I32_MAX
+    pub static fun MIN_VALUE(): i64 => I32_MIN
+}
+
+pub struct U32 {
+    pub static fun BITS(): i64 => U32_BITS
+    pub static fun MAX_VALUE(): i64 => U32_MAX
+    pub static fun MIN_VALUE(): i64 => 0
+}
+
+pub struct U64 {
+    pub static fun BITS(): i64 => U64_BITS
+    pub static fun MAX_VALUE(): i64 => I64_MAX
+    pub static fun MIN_VALUE(): i64 => 0
+}

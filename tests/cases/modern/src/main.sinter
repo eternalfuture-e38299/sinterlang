@@ -1,0 +1,40 @@
+// 回归：函数参数、用户类泛型推断、线程、线程池、算法。
+module modern
+import std
+import std.thread
+import std.async
+import std.arrays
+
+class Point(val x: i64, val y: i64) { }
+
+fun id<T>(v: T): T => v
+fun apply(f: (i64) -> i64, x: i64): i64 => f(x)
+fun inc(x: i64): i64 => x + 1
+
+fun work(arg: ptr): ptr {
+    println("task ${intFromPtr(arg)}")
+    ret null
+}
+
+fun main(): void {
+    val p = id(Point(3, 4))
+    println(p.x)
+    println(apply(inc, 41))
+    println(apply(fun (n: i64): i64 => n * 2, 21))
+
+    val t = Thread(work, ptrFromInt(9))
+    t.join()
+
+    // 单 worker：FIFO 顺序确定，输出可逐行断言。
+    val pool = Executor(1)
+    pool.submit(work, ptrFromInt(1))
+    pool.submit(work, ptrFromInt(2))
+    pool.shutdown()
+
+    val xs = intArrayOf(3, 1, 2)
+    sortInt(xs)
+    println(xs.joinToString(","))
+    println(mapInt(xs, fun (v: i64): i64 => v * 10).joinToString(","))
+    println(reduceInt(xs, 0, fun (a: i64, b: i64): i64 => a + b))
+    println(binarySearchInt(xs, 2))
+}

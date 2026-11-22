@@ -1,0 +1,728 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: files
+//
+// Provides a path-centric `File` abstraction: a `File` object represents one path,
+// and its methods all operate on that path. Names are conventional (`exists` / `isFile` /
+// `isDirectory` / `readText` / `writeText` / `appendText` / `delete` / `mkdirs` /
+// `renameTo` / `listFiles` / `name` / `parent` / `extension` / `path` / `length`).
+//
+//     import std.file
+//
+//     val f = File("/tmp/a.txt")
+//     f.writeText("hello\n")
+//     println(f.readText())        // hello
+//     println(f.length())          // 6
+//     println(f.name)              // a.txt
+//
+// Error handling follows the `std.filesystem` convention:
+//
+//   - boolean predicate fails → `false`
+//   - content-returning call fails → empty string / `-1`
+//   - to tell causes apart, check `lastError()` (`ENOENT=2` / `EACCES=13`)
+//
+// This module also keeps same-named **module-level free functions**
+// (`readText(path)` etc.), so `std.filesystem` users get all the new capabilities
+// without changing code. The two don't conflict: free functions take `str`
+// parameters, `File` methods are members.
+module std.file
+
+import std.core
+import std.string
+import std.arrays
+import std.path
+
+// ============================================================================
+// File
+// ============================================================================
+/// A path plus a full set of operations on it. Construction itself does not
+/// touch disk (lazy), so `File(someNonexistentPath)` is perfectly legal.
+pub class File : Any {
+    /// Path text (kept as-is, not normalized)
+    var content: str
+
+    File(path: str) {
+        // The parameter is a borrow: `self.content = path` would only store the
+        // pointer; after the constructor returns the parameter scope ends and
+        // the buffer is freed, leaving the field dangling.
+        self.content = sinter_file_clone_text(path)
+    }
+
+    // ---- path decomposition (pure strings, no disk access) ----
+    /// Full path
+    pub fun path(): str => self.content
+
+    /// Last segment (`/a/b/c.txt` → `c.txt`)
+    pub fun name(): str => fileName(self.content)
+
+    /// Drops the last segment (`/a/b/c.txt` → `/a/b`)
+    pub fun parent(): str => parentOf(self.content)
+
+    /// Extension (without the dot)
+    pub fun extension(): str => extension(self.content)
+
+    /// File name without its extension
+    pub fun nameWithoutExtension(): str => stem(self.content)
+
+    /// Whether this is an absolute path
+    pub fun isAbsolute(): bool => isAbsolute(self.content)
+
+    /// Absolutize (does not resolve symlinks)
+    pub fun absolutePath(): str => absolute(self.content)
+
+    /// Normalize (collapse `//`, `.`, `..`)
+    pub fun canonicalPath(): str => normalize(self.content)
+
+    /// Change the extension, returns a new `File`
+    pub fun withExtension(newExt: str): File => File(changeExtension(self.content, newExt))
+
+    /// Change the parent directory, returns a new `File` (`name()` unchanged)
+    pub fun withParent(parentPath: str): File => File(join(parentPath, self.name()))
+
+    /// Join a child path, returns a new `File`
+    pub fun child(name: str): File => File(join(self.content, name))
+
+    pub override fun typeLabel(): str => "File"
+
+    pub override fun toString(): str => self.content
+
+    pub override fun equals(other: Any): bool => false
+
+    // ---- queries (touch disk) ----
+    pub fun exists(): bool => sinter_file_exists(toCStr(self.content)) != 0
+
+    pub fun isFile(): bool => sinter_file_is_file(toCStr(self.content)) != 0
+
+    pub fun isDirectory(): bool => sinter_file_is_dir(toCStr(self.content)) != 0
+
+    /// Byte count; -1 if missing or not a regular file.
+    pub fun length(): i64 => sinter_file_size(toCStr(self.content))
+
+    /// Last modified time (Unix seconds); -1 on failure.
+    pub fun lastModified(): i64 => sinter_file_mtime(toCStr(self.content))
+
+    // ---- read / write ----
+    /// Read the whole file as text; empty string on failure.
+    pub fun readText(): str => readText(self.content)
+
+    /// Overwrite; `true` on success.
+    pub fun writeText(data: str): bool => writeText(self.content, data)
+
+    /// Append (creates if missing); `true` on success.
+    pub fun appendText(data: str): bool => appendText(self.content, data)
+
+    // ---- mutation ----
+    /// Delete a file or an **empty** directory; `true` on success.
+    /// (`delete` is a language keyword, hence `removeFile`; same semantics as the usual `delete()`)
+    pub fun removeFile(): bool => sinter_file_remove(toCStr(self.content)) != 0
+
+    /// Create a single directory (the parent must exist).
+    pub fun mkdir(): bool => sinter_file_mkdir(toCStr(self.content)) != 0
+
+    /// Create directories recursively; already existing counts as success.
+    pub fun mkdirs(): bool => sinter_file_mkdirs(toCStr(self.content)) != 0
+
+    /// Rename / move (within the same filesystem).
+    pub fun renameTo(target: File): bool =>
+        sinter_file_rename(toCStr(self.content), toCStr(target.path())) != 0
+
+    /// Rename (string target, saves building a `File` first).
+    pub fun renameToPath(target: str): bool =>
+        sinter_file_rename(toCStr(self.content), toCStr(target)) != 0
+
+    // ---- directories ----
+    /// Entry names in the directory (excluding `.` / `..`); order is filesystem-defined.
+    pub fun list(): Array<str> => listDir(self.content)
+
+    /// Entry count; 0 if missing or empty.
+    pub fun listCount(): i64 => countEntries(self.content)
+
+    /// Lexicographically sorted entry names, one per line.
+    pub fun listSortedText(): str => listSorted(self.content)
+
+    /// `i`-th entry name (lexicographic); empty string if out of range.
+    pub fun entryAt(i: i64): str => sortedEntryAt(self.content, i)
+
+    /// All files in the directory (subdirectories skipped), as full-path text one per line.
+    /// Split with `linesOf`.
+    pub fun filesText(): str => sinter_file_list_paths(self.content, 1)
+
+    /// Full paths of all entries (including subdirectories), one per line.
+    pub fun childrenText(): str => sinter_file_list_paths(self.content, 0)
+}
+
+// ============================================================================
+// Module-level free functions (same names and semantics as std.filesystem, for easy migration)
+// ============================================================================
+/// Construct a `File` (so after `import std.file` you can write `fileOf(..)` as well as `File(..)`)
+pub fun fileOf(path: str): File => File(path)
+
+// ---- queries ----
+pub fun exists(path: str): bool => sinter_file_exists(toCStr(path)) != 0
+
+pub fun isFile(path: str): bool => sinter_file_is_file(toCStr(path)) != 0
+
+pub fun isDir(path: str): bool => sinter_file_is_dir(toCStr(path)) != 0
+
+/// File byte count; -1 if missing or not a regular file.
+pub fun sizeOf(path: str): i64 => sinter_file_size(toCStr(path))
+
+/// Last modified time (Unix seconds); -1 on failure.
+pub fun modifiedAt(path: str): i64 => sinter_file_mtime(toCStr(path))
+
+/// errno of the last system call (0 = the last one succeeded).
+/// Use it to tell "missing" (ENOENT = 2) from "no permission" (EACCES = 13).
+pub fun lastError(): i64 => sinter_file_last_error()
+
+// ---- read / write ----
+/// Read the whole file as text; empty string on failure.
+pub fun readText(path: str): str => sinter_file_read_text(path)
+
+/// One-shot overwrite; `true` on success.
+pub fun writeText(path: str, data: str): bool => sinter_file_write_text(path, data, 0) != 0
+
+/// Append (creates if missing); `true` on success.
+pub fun appendText(path: str, data: str): bool => sinter_file_write_text(path, data, 1) != 0
+
+/// Split text on `\n` (`\r\n` counts as one newline; a trailing newline creates no empty line).
+pub fun linesOf(text: str): Array<str> => sinter_file_split_lines(text)
+
+/// Line count
+pub fun countLines(text: str): i64 => sinter_file_arr_len(linesOf(text))
+
+/// `i`-th line; empty string if out of range
+pub fun lineAt(text: str, i: i64): str => sinter_file_arr_at(linesOf(text), i)
+
+// ---- mutation ----
+pub fun remove(path: str): bool => sinter_file_remove(toCStr(path)) != 0
+
+pub fun mkdir(path: str): bool => sinter_file_mkdir(toCStr(path)) != 0
+
+pub fun mkdirs(path: str): bool => sinter_file_mkdirs(toCStr(path)) != 0
+
+pub fun rename(oldPath: str, newPath: str): bool =>
+    sinter_file_rename(toCStr(oldPath), toCStr(newPath)) != 0
+
+// ---- directories ----
+/// Directory entry names (excluding `.` / `..`); order is filesystem-defined.
+pub fun listDir(path: str): Array<str> => linesOf(sinter_file_list_text(path))
+
+/// Entry count
+pub fun countEntries(path: str): i64 => sinter_file_arr_len(listDir(path))
+
+/// `i`-th entry name (filesystem order); empty string if out of range
+pub fun entryAt(path: str, i: i64): str => sinter_file_arr_at(listDir(path), i)
+
+/// Lexicographically sorted entry names, one per line
+pub fun listSorted(path: str): str => sinter_file_list_sorted(sinter_file_list_text(path))
+
+/// `i`-th entry name in lexicographic order; empty string if out of range
+pub fun sortedEntryAt(path: str, i: i64): str =>
+    sinter_file_arr_at(linesOf(listSorted(path)), i)
+
+// ============================================================================
+// C-side implementation (POSIX syscalls, no <stdio.h>)
+// ============================================================================
+embed C {
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <stdlib.h>
+    #include <string.h>
+
+    typedef __SIZE_TYPE__ std_file_size_t;
+    typedef __PTRDIFF_TYPE__ std_file_ssize_t;
+
+#ifdef _WIN32
+    #include <io.h>
+    #include <direct.h>
+    #include <sys/stat.h>
+    typedef struct _stat64 sinter_file_stat_t;
+    static int sinter_file_stat_path(const char* path, sinter_file_stat_t* st) {
+        return _stat64(path, st);
+    }
+    static int sinter_file_open_path(const char* path, int flags, int mode) {
+        return _open(path, flags | _O_BINARY, mode);
+    }
+    static int sinter_file_close_fd(int fd) { return _close(fd); }
+    static int sinter_file_read_fd(int fd, void* buf, std_file_size_t n) {
+        return _read(fd, buf, (unsigned int)n);
+    }
+    static int sinter_file_write_fd(int fd, const void* buf, std_file_size_t n) {
+        return _write(fd, buf, (unsigned int)n);
+    }
+    static int sinter_file_mkdir_path(const char* path, int mode) {
+        (void)mode;
+        return _mkdir(path);
+    }
+    static int sinter_file_rmdir_path(const char* path) { return _rmdir(path); }
+    static int sinter_file_unlink_path(const char* path) { return _unlink(path); }
+    static int sinter_file_rename_path(const char* from, const char* to) { return rename(from, to); }
+    #define SINTER_S_ISREG(m) (((m) & _S_IFMT) == _S_IFREG)
+    #define SINTER_S_ISDIR(m) (((m) & _S_IFMT) == _S_IFDIR)
+#else
+    #include <sys/stat.h>
+    #include <unistd.h>
+    typedef struct stat sinter_file_stat_t;
+    static int sinter_file_stat_path(const char* path, sinter_file_stat_t* st) {
+        return stat(path, st);
+    }
+    static int sinter_file_open_path(const char* path, int flags, int mode) {
+        return open(path, flags, (unsigned int)mode);
+    }
+    static int sinter_file_close_fd(int fd) { return close(fd); }
+    static int sinter_file_read_fd(int fd, void* buf, std_file_size_t n) {
+        return (int)read(fd, buf, n);
+    }
+    static int sinter_file_write_fd(int fd, const void* buf, std_file_size_t n) {
+        return (int)write(fd, buf, n);
+    }
+    static int sinter_file_mkdir_path(const char* path, int mode) { return mkdir(path, mode); }
+    static int sinter_file_rmdir_path(const char* path) { return rmdir(path); }
+    static int sinter_file_unlink_path(const char* path) { return unlink(path); }
+    static int sinter_file_rename_path(const char* from, const char* to) { return rename(from, to); }
+    #define SINTER_S_ISREG(m) S_ISREG(m)
+    #define SINTER_S_ISDIR(m) S_ISDIR(m)
+#endif
+
+    /* ---- errno ---- */
+    static int sinter_file_g_errno = 0;
+    static inline void sinter_file_set_errno(int e) { sinter_file_g_errno = e; }
+    static inline int64_t sinter_file_last_error(void) { return (int64_t) sinter_file_g_errno; }
+
+    /* Clone a str (used when a class stores a string field: parameters are borrows, so they can't be stored directly). */
+    static sinter_string sinter_file_clone_text(sinter_string s) {
+        if (!s.data || s.len <= 0) return sinter_string_from_literal("", 0);
+        return sinter_string_from_buf(s.data, s.len);
+    }
+
+    /* ---- queries ---- */
+    static int64_t sinter_file_stat_mode(const char* path) {
+        sinter_file_stat_t st;
+        if (!path) return -1;
+        if (sinter_file_stat_path(path, &st) != 0) { sinter_file_set_errno(errno); return -1; }
+        sinter_file_set_errno(0);
+        return (int64_t) st.st_mode;
+    }
+
+    static uint8_t sinter_file_exists(const char* path) {
+        sinter_file_stat_t st;
+        if (!path) return 0;
+        if (sinter_file_stat_path(path, &st) != 0) { sinter_file_set_errno(errno); return 0; }
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    static uint8_t sinter_file_is_file(const char* path) {
+        int64_t m = sinter_file_stat_mode(path);
+        if (m < 0) return 0;
+        return SINTER_S_ISREG((mode_t) m) ? 1 : 0;
+    }
+
+    static uint8_t sinter_file_is_dir(const char* path) {
+        int64_t m = sinter_file_stat_mode(path);
+        if (m < 0) return 0;
+        return SINTER_S_ISDIR((mode_t) m) ? 1 : 0;
+    }
+
+    static int64_t sinter_file_size(const char* path) {
+        sinter_file_stat_t st;
+        if (!path) return -1;
+        if (sinter_file_stat_path(path, &st) != 0) { sinter_file_set_errno(errno); return -1; }
+        if (!SINTER_S_ISREG(st.st_mode)) { sinter_file_set_errno(0); return -1; }
+        sinter_file_set_errno(0);
+        return (int64_t) st.st_size;
+    }
+
+    static int64_t sinter_file_mtime(const char* path) {
+        sinter_file_stat_t st;
+        if (!path) return -1;
+        if (sinter_file_stat_path(path, &st) != 0) { sinter_file_set_errno(errno); return -1; }
+        sinter_file_set_errno(0);
+        return (int64_t) st.st_mtime;
+    }
+
+    /* ---- read whole file ---- */
+    static sinter_string sinter_file_read_text(sinter_string path) {
+        const char* p = sinter_string_to_cstr(path);
+        int fd = sinter_file_open_path(p, O_RDONLY, 0);
+        if (fd < 0) { sinter_file_set_errno(errno); return sinter_string_from_literal("", 0); }
+        int64_t cap = 4096;
+        int64_t n = 0;
+        char* buf = (char*) malloc((std_file_size_t) cap);
+        if (!buf) { sinter_file_close_fd(fd); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+        for (;;) {
+            if (n + 1 >= cap) {
+                int64_t ncap = cap * 2;
+                char* nb = (char*) realloc(buf, (std_file_size_t) ncap);
+                if (!nb) { free(buf); sinter_file_close_fd(fd); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+                buf = nb;
+                cap = ncap;
+            }
+            std_file_ssize_t r = sinter_file_read_fd(fd, buf + n, (std_file_size_t) (cap - n - 1));
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                free(buf); sinter_file_close_fd(fd); sinter_file_set_errno(errno);
+                return sinter_string_from_literal("", 0);
+            }
+            if (r == 0) break;
+            n += (int64_t) r;
+        }
+        sinter_file_close_fd(fd);
+        sinter_file_set_errno(0);
+        sinter_string s = sinter_string_from_buf(buf, n);
+        free(buf);
+        return s;
+    }
+
+    /* ---- write whole file ---- */
+    static uint8_t sinter_file_write_text(sinter_string path, sinter_string data, int64_t append) {
+        const char* p = sinter_string_to_cstr(path);
+        int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+        int fd = sinter_file_open_path(p, flags, 0644);
+        if (fd < 0) { sinter_file_set_errno(errno); return 0; }
+        const char* d = data.data ? data.data : "";
+        int64_t left = data.len;
+        int64_t off = 0;
+        while (left > 0) {
+            std_file_ssize_t w = sinter_file_write_fd(fd, d + off, (std_file_size_t) left);
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                sinter_file_close_fd(fd); sinter_file_set_errno(errno);
+                return 0;
+            }
+            if (w == 0) break;
+            off += (int64_t) w;
+            left -= (int64_t) w;
+        }
+        sinter_file_close_fd(fd);
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    /* ---- mutation ---- */
+    static uint8_t sinter_file_remove(const char* path) {
+        if (!path) return 0;
+        sinter_file_stat_t st;
+        if (sinter_file_stat_path(path, &st) != 0) { sinter_file_set_errno(errno); return 0; }
+        int r = SINTER_S_ISDIR(st.st_mode) ? sinter_file_rmdir_path(path) : sinter_file_unlink_path(path);
+        if (r != 0) { sinter_file_set_errno(errno); return 0; }
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    static uint8_t sinter_file_mkdir(const char* path) {
+        if (!path) return 0;
+        if (sinter_file_mkdir_path(path, 0755) != 0) {
+            if (errno == EEXIST) { sinter_file_set_errno(0); return 1; }
+            sinter_file_set_errno(errno);
+            return 0;
+        }
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    /* mkdir segment by segment: fill in whatever levels of `a/b/c` are missing; EEXIST counts as success. */
+    static uint8_t sinter_file_mkdirs(const char* path) {
+        if (!path || !path[0]) return 0;
+        int64_t n = 0;
+        while (path[n]) n++;
+        char* tmp = (char*) malloc((std_file_size_t) n + 1);
+        if (!tmp) { sinter_file_set_errno(12); return 0; }
+        for (int64_t i = 0; i <= n; i++) tmp[i] = path[i];
+        for (int64_t i = 1; i < n; i++) {
+            if (tmp[i] == '/') {
+                tmp[i] = 0;
+                if (sinter_file_mkdir_path(tmp, 0755) != 0 && errno != EEXIST) {
+                    sinter_file_set_errno(errno);
+                    free(tmp);
+                    return 0;
+                }
+                tmp[i] = '/';
+            }
+        }
+        if (sinter_file_mkdir_path(tmp, 0755) != 0 && errno != EEXIST) {
+            sinter_file_set_errno(errno);
+            free(tmp);
+            return 0;
+        }
+        free(tmp);
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    static uint8_t sinter_file_rename(const char* from, const char* to) {
+        if (!from || !to) return 0;
+        if (sinter_file_rename_path(from, to) != 0) { sinter_file_set_errno(errno); return 0; }
+        sinter_file_set_errno(0);
+        return 1;
+    }
+
+    /* ---- direct field access for Array<str> (calling methods on a generic instance across modules loses the receiver) ---- */
+    static int64_t sinter_file_arr_len(struct std_arrays_array_str* a) {
+        return a ? a->size : 0;
+    }
+
+    static sinter_string sinter_file_arr_at(struct std_arrays_array_str* a, int64_t i) {
+        if (!a || i < 0 || i >= a->size) return sinter_string_from_literal("", 0);
+        return sinter_string_clone(a->data[i]);
+    }
+
+    /* ---- split text into lines ---- */
+    static struct std_arrays_array_str* sinter_file_split_lines(sinter_string text) {
+        const char* d = text.data;
+        int64_t n = text.len;
+        if (n <= 0) return std_arrays_array_str_new(NULL, 0, 0);
+
+        int64_t count = 0;
+        for (int64_t i = 0; i < n; i++) if (d[i] == '\n') count++;
+        if (d[n - 1] != '\n') count++;
+        if (count <= 0) return std_arrays_array_str_new(NULL, 0, 0);
+
+        sinter_string* buf = (sinter_string*) malloc(sizeof(sinter_string) * (size_t) count);
+        if (!buf) return std_arrays_array_str_new(NULL, 0, 0);
+        int64_t slot = 0;
+        int64_t start = 0;
+        for (int64_t i = 0; i < n; i++) {
+            if (d[i] == '\n') {
+                int64_t e = i;
+                if (e > start && d[e - 1] == '\r') e--;   /* drop '\r' for CRLF */
+                buf[slot++] = sinter_string_from_buf(d + start, e - start);
+                start = i + 1;
+            }
+        }
+        if (start < n) {
+            int64_t e = n;
+            if (e > start && d[e - 1] == '\r') e--;
+            buf[slot++] = sinter_string_from_buf(d + start, e - start);
+        }
+        return std_arrays_array_str_new(buf, slot, 1);
+    }
+}
+
+/* Directory traversal needs <dirent.h>: kept in a separate block so projects that don't traverse directories don't expand it. */
+embed C {
+#ifdef _WIN32
+    #include <windows.h>
+    #include <stdlib.h>
+#else
+    #include <dirent.h>
+    #include <sys/stat.h>
+#endif
+
+    /* Read directory entry names into "one text joined with '\n'".
+       Why not return a string array: building an `Array<str>` generic struct on the C side would have to
+       go through `std.arrays` constructors, while concatenated text is simpler and easier to assert on. */
+    static sinter_string sinter_file_list_text(sinter_string path) {
+        const char* p = sinter_string_to_cstr(path);
+        int64_t cap = 256;
+        int64_t n = 0;
+        char* buf = (char*) malloc((std_file_size_t) cap);
+        if (!buf) { sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+#ifdef _WIN32
+        size_t len = strlen(p);
+        char* pat = (char*) malloc(len + 3);
+        if (!pat) { free(buf); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+        if (len > 0 && (p[len - 1] == '/' || p[len - 1] == '\\'))
+            snprintf(pat, len + 3, "%s*", p);
+        else
+            snprintf(pat, len + 3, "%s\\*", p);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        free(pat);
+        if (h == INVALID_HANDLE_VALUE) {
+            free(buf);
+            sinter_file_set_errno(ENOENT);
+            return sinter_string_from_literal("", 0);
+        }
+        do {
+            const char* name = fd.cFileName;
+            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+                continue;
+            int64_t nn = 0;
+            while (name[nn]) nn++;
+            if (n + nn + 2 >= cap) {
+                while (n + nn + 2 >= cap) cap *= 2;
+                char* nb = (char*) realloc(buf, (std_file_size_t) cap);
+                if (!nb) { free(buf); FindClose(h); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+                buf = nb;
+            }
+            for (int64_t i = 0; i < nn; i++) buf[n++] = name[i];
+            buf[n++] = '\n';
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+#else
+        DIR* d = opendir(p);
+        if (!d) { free(buf); sinter_file_set_errno(errno); return sinter_string_from_literal("", 0); }
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            const char* name = e->d_name;
+            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+                continue;
+            int64_t nn = 0;
+            while (name[nn]) nn++;
+            if (n + nn + 2 >= cap) {
+                while (n + nn + 2 >= cap) cap *= 2;
+                char* nb = (char*) realloc(buf, (std_file_size_t) cap);
+                if (!nb) { free(buf); closedir(d); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+                buf = nb;
+            }
+            for (int64_t i = 0; i < nn; i++) buf[n++] = name[i];
+            buf[n++] = '\n';
+        }
+        closedir(d);
+#endif
+        sinter_file_set_errno(0);
+        if (n > 0) n--;
+        sinter_string s = sinter_string_from_buf(buf, n);
+        free(buf);
+        return s;
+    }
+
+    /* Directory entries sorted lexicographically, "one per line" text. */
+    static sinter_string sinter_file_list_sorted(sinter_string text) {
+        const char* d = text.data;
+        int64_t n = text.len;
+        if (n <= 0) return sinter_string_from_literal("", 0);
+
+        int64_t count = 0;
+        for (int64_t i = 0; i < n; i++) if (d[i] == '\n') count++;
+        if (d[n - 1] != '\n') count++;
+        if (count <= 0) return sinter_string_from_literal("", 0);
+
+        const char** starts = (const char**) malloc(sizeof(const char*) * (size_t) count);
+        int64_t* lens = (int64_t*) malloc(sizeof(int64_t) * (size_t) count);
+        int64_t* order = (int64_t*) malloc(sizeof(int64_t) * (size_t) count);
+        if (!starts || !lens || !order) {
+            free(starts); free(lens); free(order);
+            sinter_file_set_errno(12);
+            return sinter_string_from_literal("", 0);
+        }
+        int64_t slot = 0, start = 0;
+        for (int64_t i = 0; i <= n; i++) {
+            if (i == n || d[i] == '\n') {
+                if (slot < count) { starts[slot] = d + start; lens[slot] = i - start; slot++; }
+                start = i + 1;
+            }
+        }
+        for (int64_t i = 0; i < count; i++) order[i] = i;
+        for (int64_t i = 0; i < count; i++) {
+            int64_t best = i;
+            for (int64_t j = i + 1; j < count; j++) {
+                int64_t la = lens[order[j]], lb = lens[order[best]];
+                int64_t m = la < lb ? la : lb;
+                int cmp = memcmp(starts[order[j]], starts[order[best]], (size_t) m);
+                if (cmp == 0) cmp = (la < lb) ? -1 : (la > lb ? 1 : 0);
+                if (cmp < 0) best = j;
+            }
+            int64_t tmp = order[i]; order[i] = order[best]; order[best] = tmp;
+        }
+        int64_t total = 0;
+        for (int64_t i = 0; i < count; i++) total += lens[order[i]] + 1;
+        char* out = (char*) malloc((size_t) total + 1);
+        if (!out) {
+            free(order); free(lens); free(starts);
+            sinter_file_set_errno(12);
+            return sinter_string_from_literal("", 0);
+        }
+        int64_t w = 0;
+        for (int64_t i = 0; i < count; i++) {
+            memcpy(out + w, starts[order[i]], (size_t) lens[order[i]]);
+            w += lens[order[i]];
+            out[w++] = '\n';
+        }
+        out[w] = 0;
+        sinter_string r = sinter_string_from_buf(out, w);
+        free(out); free(order); free(lens); free(starts);
+        return r;
+    }
+
+    /* Full paths under a directory (`filesOnly=1` keeps only regular files), separated by '\n'. */
+    static sinter_string sinter_file_list_paths(sinter_string dir, int64_t filesOnly) {
+        const char* base = sinter_string_to_cstr(dir);
+        int64_t baseLen = 0;
+        while (base[baseLen]) baseLen++;
+        int needSlash = (baseLen > 0 && base[baseLen - 1] != '/' && base[baseLen - 1] != '\\') ? 1 : 0;
+        int64_t cap = 512;
+        int64_t n = 0;
+        char* buf = (char*) malloc((std_file_size_t) cap);
+        if (!buf) { sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+#ifdef _WIN32
+        char* pat = (char*) malloc((size_t)baseLen + 3);
+        if (!pat) { free(buf); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+        if (needSlash) snprintf(pat, (size_t)baseLen + 3, "%s\\*", base);
+        else snprintf(pat, (size_t)baseLen + 3, "%s*", base);
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(pat, &fd);
+        free(pat);
+        if (h == INVALID_HANDLE_VALUE) {
+            free(buf);
+            sinter_file_set_errno(ENOENT);
+            return sinter_string_from_literal("", 0);
+        }
+        do {
+            const char* name = fd.cFileName;
+            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+                continue;
+            int keep = 1;
+            if (filesOnly && (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) keep = 0;
+            if (!keep) continue;
+            int64_t nl = 0;
+            while (name[nl]) nl++;
+            int64_t need = baseLen + needSlash + nl + 2;
+            if (n + need + 2 >= cap) {
+                while (n + need + 2 >= cap) cap *= 2;
+                char* nb = (char*) realloc(buf, (std_file_size_t) cap);
+                if (!nb) { free(buf); FindClose(h); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+                buf = nb;
+            }
+            for (int64_t i = 0; i < baseLen; i++) buf[n++] = base[i];
+            if (needSlash) buf[n++] = '/';
+            for (int64_t i = 0; i < nl; i++) buf[n++] = name[i];
+            buf[n++] = '\n';
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+#else
+        DIR* d = opendir(base);
+        if (!d) { free(buf); sinter_file_set_errno(errno); return sinter_string_from_literal("", 0); }
+        struct dirent* e;
+        while ((e = readdir(d)) != NULL) {
+            const char* name = e->d_name;
+            if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0')))
+                continue;
+            int64_t nl = 0;
+            while (name[nl]) nl++;
+            int64_t need = baseLen + needSlash + nl + 2;
+            char* full = (char*) malloc((std_file_size_t) need);
+            if (!full) continue;
+            int64_t k = 0;
+            for (int64_t i = 0; i < baseLen; i++) full[k++] = base[i];
+            if (needSlash) full[k++] = '/';
+            for (int64_t i = 0; i < nl; i++) full[k++] = name[i];
+            full[k] = 0;
+
+            int keep = 1;
+            if (filesOnly) {
+                sinter_file_stat_t st;
+                if (sinter_file_stat_path(full, &st) != 0 || !SINTER_S_ISREG(st.st_mode)) keep = 0;
+            }
+            if (keep) {
+                if (n + k + 2 >= cap) {
+                    while (n + k + 2 >= cap) cap *= 2;
+                    char* nb = (char*) realloc(buf, (std_file_size_t) cap);
+                    if (!nb) { free(full); free(buf); closedir(d); sinter_file_set_errno(12); return sinter_string_from_literal("", 0); }
+                    buf = nb;
+                }
+                for (int64_t i = 0; i < k; i++) buf[n++] = full[i];
+                buf[n++] = '\n';
+            }
+            free(full);
+        }
+        closedir(d);
+#endif
+        sinter_file_set_errno(0);
+        if (n > 0) n--;
+        sinter_string s = sinter_string_from_buf(buf, n);
+        free(buf);
+        return s;
+    }}

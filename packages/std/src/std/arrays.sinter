@@ -1,0 +1,689 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+module std.arrays
+import std.string
+import std.core
+import std.generic
+
+// ============================================================================
+// C Embed Block: Low-level memory and array operations
+// ============================================================================
+embed C {
+
+    typedef __SIZE_TYPE__ sinter_arr_size_t;
+
+    // Safely truncate i64 to u8.
+    static inline uint8_t sinter_u8_of(int64_t v) {
+        return (uint8_t)v;
+    }
+
+    // ---- Allocation ----
+    // Allocate memory for an array of 'n' elements of a given type.
+    // Returns NULL on allocation failure (handled by caller).
+    static inline int64_t* sinter_gen_alloc_i64(int64_t n) {
+        return (int64_t*)malloc((sinter_arr_size_t)(n > 0 ? n : 1) * sizeof(int64_t));
+    }
+    static inline double* sinter_gen_alloc_f64(int64_t n) {
+        return (double*)malloc((sinter_arr_size_t)(n > 0 ? n : 1) * sizeof(double));
+    }
+    static inline uint8_t* sinter_gen_alloc_u8(int64_t n) {
+        return (uint8_t*)malloc((sinter_arr_size_t)(n > 0 ? n : 1) * sizeof(uint8_t));
+    }
+    static inline sinter_string* sinter_gen_alloc_str(int64_t n) {
+        return (sinter_string*)calloc((sinter_arr_size_t)(n > 0 ? n : 1), sizeof(sinter_string));
+    }
+
+    // ---- Fill ----
+    static void sinter_gen_fill_i64(int64_t* a, int64_t n, int64_t v) {
+        if (!a) return;
+        for (int64_t i = 0; i < n; ++i) a[i] = v;
+    }
+    static void sinter_gen_fill_f64(double* a, int64_t n, double v) {
+        if (!a) return;
+        for (int64_t i = 0; i < n; ++i) a[i] = v;
+    }
+    static void sinter_gen_fill_u8(uint8_t* a, int64_t n, uint8_t v) {
+        if (!a) return;
+        for (int64_t i = 0; i < n; ++i) a[i] = v;
+    }
+    // For strings, we must deep-clone the value for each element.
+    static void sinter_gen_fill_str(sinter_string* a, int64_t n, sinter_string v) {
+        if (!a) return;
+        for (int64_t i = 0; i < n; ++i) a[i] = sinter_string_clone(v);
+    }
+
+    // ---- Index Of ----
+    static int64_t sinter_gen_index_of_i64(int64_t* a, int64_t n, int64_t v) {
+        if (!a) return -1;
+        for (int64_t i = 0; i < n; ++i) if (a[i] == v) return i;
+        return -1;
+    }
+    static int64_t sinter_gen_index_of_f64(double* a, int64_t n, double v) {
+        if (!a) return -1;
+        for (int64_t i = 0; i < n; ++i) if (a[i] == v) return i;
+        return -1;
+    }
+    static int64_t sinter_gen_index_of_u8(uint8_t* a, int64_t n, uint8_t v) {
+        if (!a) return -1;
+        for (int64_t i = 0; i < n; ++i) if (a[i] == v) return i;
+        return -1;
+    }
+    static int64_t sinter_gen_index_of_str(sinter_string* a, int64_t n, sinter_string v) {
+        if (!a) return -1;
+        for (int64_t i = 0; i < n; ++i)
+            if (sinter_string_equals(a[i], v)) return i;
+        return -1;
+    }
+
+    // ---- Reverse In-Place ----
+    static void sinter_gen_reverse_i64(int64_t* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 0, j = n - 1; i < j; ++i, --j) {
+            int64_t t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+    }
+    static void sinter_gen_reverse_f64(double* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 0, j = n - 1; i < j; ++i, --j) {
+            double t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+    }
+    static void sinter_gen_reverse_u8(uint8_t* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 0, j = n - 1; i < j; ++i, --j) {
+            uint8_t t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+    }
+    static void sinter_gen_reverse_str(sinter_string* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 0, j = n - 1; i < j; ++i, --j) {
+            sinter_string t = a[i]; a[i] = a[j]; a[j] = t;
+        }
+    }
+
+    // ---- Insertion Sort In-Place ----
+    static void sinter_gen_sort_i64(int64_t* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 1; i < n; ++i) {
+            int64_t key = a[i];
+            int64_t j = i - 1;
+            while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; --j; }
+            a[j + 1] = key;
+        }
+    }
+    static void sinter_gen_sort_f64(double* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 1; i < n; ++i) {
+            double key = a[i];
+            int64_t j = i - 1;
+            while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; --j; }
+            a[j + 1] = key;
+        }
+    }
+    static void sinter_gen_sort_u8(uint8_t* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 1; i < n; ++i) {
+            uint8_t key = a[i];
+            int64_t j = i - 1;
+            while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; --j; }
+            a[j + 1] = key;
+        }
+    }
+    // String comparison uses lexicographic order via sinter_string_compare.
+    static void sinter_gen_sort_str(sinter_string* a, int64_t n) {
+        if (!a) return;
+        for (int64_t i = 1; i < n; ++i) {
+            sinter_string key = a[i];
+            int64_t j = i - 1;
+            while (j >= 0 && sinter_string_compare(a[j], key) > 0) { a[j + 1] = a[j]; --j; }
+            a[j + 1] = key;
+        }
+    }
+
+    // ---- Deep Copy ----
+    static void sinter_gen_copy_i64(int64_t* dst, int64_t* src, int64_t n) {
+        if (!dst || !src) return;
+        for (int64_t i = 0; i < n; ++i) dst[i] = src[i];
+    }
+    static void sinter_gen_copy_f64(double* dst, double* src, int64_t n) {
+        if (!dst || !src) return;
+        for (int64_t i = 0; i < n; ++i) dst[i] = src[i];
+    }
+    static void sinter_gen_copy_u8(uint8_t* dst, uint8_t* src, int64_t n) {
+        if (!dst || !src) return;
+        for (int64_t i = 0; i < n; ++i) dst[i] = src[i];
+    }
+    // Strings require deep cloning during copy to avoid shared ownership.
+    static void sinter_gen_copy_str(sinter_string* dst, sinter_string* src, int64_t n) {
+        if (!dst || !src) return;
+        for (int64_t i = 0; i < n; ++i) dst[i] = sinter_string_clone(src[i]);
+    }
+
+    // ---- Summation ----
+    static int64_t sinter_gen_sum_i64(int64_t* a, int64_t n) {
+        int64_t s = 0;
+        if (!a) return s;
+        for (int64_t i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    static double sinter_gen_sum_f64(double* a, int64_t n) {
+        double s = 0.0;
+        if (!a) return s;
+        for (int64_t i = 0; i < n; ++i) s += a[i];
+        return s;
+    }
+    static int64_t sinter_gen_sum_u8(uint8_t* a, int64_t n) {
+        int64_t s = 0;
+        if (!a) return s;
+        for (int64_t i = 0; i < n; ++i) s += (int64_t)a[i];
+        return s;
+    }
+    // Summation for strings is concatenation.
+    static sinter_string sinter_gen_sum_str(sinter_string* a, int64_t n) {
+        sinter_string s = sinter_string_from_literal("", 0);
+        if (!a) return s;
+        for (int64_t i = 0; i < n; ++i) {
+            sinter_string_assign(&s, sinter_string_concat_take_right(s, sinter_string_clone(a[i])));
+        }
+        return s;
+    }
+}
+
+// ============================================================================
+// Array<T>: Generic Fixed-Length Array
+// ============================================================================
+/// A fixed-length generic array. Monomorphized into concrete types like
+/// `Array_i64`, `Array_str`. The `owned` flag controls whether the destructor
+/// frees the underlying buffer.
+///
+/// Example:
+/// ```
+/// val a = arrayOf<i64>(3, 1, 2)   // -> Array_i64
+/// a.sort(); a.reverse()
+/// println("${a.sum()}")
+///
+/// val s = arrayOf<str>("b", "a")
+/// s.sort()                         // Lexicographic order
+/// ```
+pub class Array<T> : Any {
+    var data: *T
+    var size: i64
+    var owned: bool
+
+    // Constructor parameter names must differ from field names to avoid shadowing.
+    Array(buf: *T, count: i64, takeOwn: bool) {
+        self.data = buf
+        self.size = count
+        self.owned = takeOwn
+    }
+
+    ~Array() {
+        if self.owned {
+            var i: i64 = 0
+            while i < self.size {
+                sinter_gen_drop(self.data[i])
+                i = i + 1
+            }
+            free(self.data)
+        }
+        self.data = null
+        self.size = 0
+        self.owned = false
+    }
+
+    pub override fun typeLabel(): str => "Array"
+    pub override fun toString(): str => self.joinToString(", ")
+    pub fun isEmpty(): bool => self.size == 0
+
+    /// Get element at index `i`. Returns the default blank value if out of bounds.
+    /// Returns a cloned copy; caller owns the result.
+    pub fun get(i: i64): T {
+        if i < 0 || i >= self.size {
+            return self.blank()
+        }
+        return sinter_gen_clone(self.data[i])
+    }
+
+    /// Set element at index `i` to `v`.
+    pub fun set(i: i64, v: T): void {
+        if i < 0 || i >= self.size {
+            return
+        }
+        sinter_gen_drop(self.data[i])
+        self.data[i] = sinter_gen_clone(v)
+    }
+
+    /// Fill all positions with the same value. Strings are deep-cloned per element.
+    pub fun fill(v: T): void {
+        sinter_gen_fill(self.data, self.size, v)
+    }
+
+    /// Summation for numeric types (`Array<i64>` -> i64, `Array<f64>` -> f64).
+    /// For strings, this performs concatenation.
+    pub fun sum(): T => sinter_gen_sum(self.data, self.size)
+    pub fun indexOf(v: T): i64 => sinter_gen_index_of(self.data, self.size, v)
+    pub fun contains(v: T): bool => self.indexOf(v) >= 0
+    pub fun reverse(): void { sinter_gen_reverse(self.data, self.size) }
+    pub fun sort(): void { sinter_gen_sort(self.data, self.size) }
+
+    /// Create a new owned copy of the array (deep copy of elements).
+    pub fun copyOf(): Array<T> {
+        val p: *T = sinter_gen_alloc(self.size)
+        sinter_gen_copy(p, self.data, self.size)
+        ret Array<T>(p, self.size, true)
+    }
+
+    /// Return the default "blank" value for type `T` (e.g., 0 for i64, "" for str).
+    pub fun blank(): T => sinter_gen_blank()
+
+    /// Format as `[1, 2, 3]`.
+    pub fun joinToString(sep: str): str {
+        var out: str = "["
+        var i: i64 = 0
+        while i < self.size {
+            if i > 0 {
+                out = out + sep
+            }
+            out = out + sinter_gen_text(self.data[i])
+            i = i + 1
+        }
+        ret out + "]"
+    }
+}
+
+// ============================================================================
+// ByteArray: Convenient alias for Array<u8>
+// ============================================================================
+/// A fixed-length byte array, useful for network packets or file contents.
+/// Semantically identical to `Array<u8>` but with a more descriptive name.
+pub class ByteArray : Any {
+    var data: *u8
+    var size: i64
+    var owned: bool
+
+    ByteArray(buf: *u8, count: i64, takeOwn: bool) {
+        self.data = buf
+        self.size = count
+        self.owned = takeOwn
+    }
+
+    ~ByteArray() {
+        if self.owned {
+            free(self.data)
+        }
+        self.data = null
+        self.size = 0
+        self.owned = false
+    }
+
+    pub override fun typeLabel(): str => "ByteArray"
+    pub override fun toString(): str => self.joinToString(", ")
+    pub fun isEmpty(): bool => self.size == 0
+
+    pub fun get(i: i64): u8 {
+        if i < 0 || i >= self.size {
+            return 0
+        }
+        return self.data[i]
+    }
+
+    pub fun set(i: i64, v: u8): void {
+        if i < 0 || i >= self.size {
+            return
+        }
+        self.data[i] = v
+    }
+
+    pub fun fill(v: u8): void { sinter_gen_fill_u8(self.data, self.size, v) }
+    pub fun sum(): i64 => sinter_gen_sum_u8(self.data, self.size)
+    pub fun indexOf(v: u8): i64 => sinter_gen_index_of_u8(self.data, self.size, v)
+    pub fun contains(v: u8): bool => self.indexOf(v) >= 0
+    pub fun reverse(): void { sinter_gen_reverse_u8(self.data, self.size) }
+    pub fun sort(): void { sinter_gen_sort_u8(self.data, self.size) }
+
+    pub fun copyOf(): ByteArray {
+        val p: *u8 = sinter_gen_alloc_u8(self.size)
+        sinter_gen_copy_u8(p, self.data, self.size)
+        ret ByteArray(p, self.size, true)
+    }
+
+    pub fun joinToString(sep: str): str {
+        var out: str = "["
+        var i: i64 = 0
+        while i < self.size {
+            if i > 0 {
+                out = out + sep
+            }
+            // Use the specific text conversion for u8.
+            out = out + sinter_gen_text_u8(self.data[i])
+            i = i + 1
+        }
+        ret out + "]"
+    }
+}
+
+// ============================================================================
+// Factory Functions: conventional intArrayOf / IntArray helpers
+// ============================================================================
+
+/// Creates an `Array<i64>` from variadic arguments. e.g., `intArrayOf(1, 2, 3)`
+pub fun intArrayOf(xs: i64...): Array<i64> {
+    val p: *i64 = sinter_gen_alloc(xs__n, i64)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = xs[i]
+        i = i + 1
+    }
+    ret Array<i64>(p, xs__n, true)
+}
+
+/// Creates an `Array<i64>` of length `size` filled with `init`.
+pub fun intArray(size: i64, init: i64): Array<i64> {
+    val p: *i64 = sinter_gen_alloc(size, i64)
+    sinter_gen_fill(p, size, init, i64)
+    ret Array<i64>(p, size, true)
+}
+
+/// Creates an `Array<f64>` from variadic arguments. e.g., `floatArrayOf(1.5, 2.5)`
+pub fun floatArrayOf(xs: f64...): Array<f64> {
+    val p: *f64 = sinter_gen_alloc(xs__n, f64)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = xs[i]
+        i = i + 1
+    }
+    ret Array<f64>(p, xs__n, true)
+}
+
+/// Creates an `Array<f64>` of length `size` filled with `init`.
+pub fun floatArray(size: i64, init: f64): Array<f64> {
+    val p: *f64 = sinter_gen_alloc(size, f64)
+    sinter_gen_fill(p, size, init, f64)
+    ret Array<f64>(p, size, true)
+}
+
+/// Creates a `ByteArray` from variadic integer arguments. e.g., `byteArrayOf(0x7f, 0x45)`
+pub fun byteArrayOf(xs: i64...): ByteArray {
+    val p: *u8 = sinter_gen_alloc_u8(xs__n)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = sinter_u8_of(xs[i])
+        i = i + 1
+    }
+    ret ByteArray(p, xs__n, true)
+}
+
+/// Creates a `ByteArray` of length `size` filled with `init`.
+pub fun byteArray(size: i64, init: i64): ByteArray {
+    val p: *u8 = sinter_gen_alloc_u8(size)
+    sinter_gen_fill_u8(p, size, sinter_u8_of(init))
+    ret ByteArray(p, size, true)
+}
+
+// ============================================================================
+// Type-Inferred Factories: `arrayOf(1, 2, 3)` / `arrayOf("a", "b")`
+// ============================================================================
+// These functions have distinct link names to avoid symbol conflicts in C.
+
+/// Creates an `Array<i64>` from variadic arguments.
+pub fun arrayOf[std_arrays_array_of_i64](xs: i64...): Array<i64> {
+    val p: *i64 = sinter_gen_alloc(xs__n, i64)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = xs[i]
+        i = i + 1
+    }
+    ret Array<i64>(p, xs__n, true)
+}
+
+/// Creates an `Array<f64>` from variadic arguments.
+pub fun arrayOf[std_arrays_array_of_f64](xs: f64...): Array<f64> {
+    val p: *f64 = sinter_gen_alloc(xs__n, f64)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = xs[i]
+        i = i + 1
+    }
+    ret Array<f64>(p, xs__n, true)
+}
+
+/// Creates an `Array<str>` from variadic arguments. Strings are deep-cloned.
+pub fun arrayOf[std_arrays_array_of_str](xs: str...): Array<str> {
+    val p: *str = sinter_gen_alloc(xs__n, str)
+    var i: i64 = 0
+    while i < xs__n {
+        p[i] = sinter_string_clone(xs[i])
+        i = i + 1
+    }
+    ret Array<str>(p, xs__n, true)
+}
+
+// ============================================================================
+// Empty Array Factories
+// ============================================================================
+// Due to limitations with generic functions and C code generation, we provide
+// concrete factories for creating empty arrays of specific types.
+// Usage: `val names: Array<str> = emptyStrArray()`
+
+/// Creates an empty, owned `Array<i64>`.
+pub fun emptyIntArray(): Array<i64> {
+    ret Array<i64>(sinter_gen_alloc(1, i64), 0, true)
+}
+
+/// Creates an empty, owned `Array<f64>`.
+pub fun emptyFloatArray(): Array<f64> {
+    ret Array<f64>(sinter_gen_alloc(1, f64), 0, true)
+}
+
+/// Creates an empty, owned `Array<str>`.
+pub fun emptyStrArray(): Array<str> {
+    ret Array<str>(sinter_gen_alloc(1, str), 0, true)
+}
+// ============================================================================
+// Algorithms
+// ============================================================================
+// These functions live in the arrays module instead of a separate std.algorithm:
+// method calls on generic containers lose their receiver across modules (see the known limitations in docs/LANGUAGE.md),
+// while inside this module Array<T> methods and fields can be used directly.
+//
+// The parameters `(i64) -> i64` / `(i64, i64) -> i64` are Sinter function types,
+// so top-level functions or lambdas can be passed directly:
+//
+//     val xs = intArrayOf(3, 1, 2)
+//     sortInt(xs)
+//     val ys = mapInt(xs, fun (v: i64): i64 => v * 2)
+
+pub fun sortInt(xs: Array<i64>): void { xs.sort() }
+pub fun reverseInt(xs: Array<i64>): void { xs.reverse() }
+pub fun sumInt(xs: Array<i64>): i64 => xs.sum()
+
+pub fun minInt(xs: Array<i64>): i64 {
+    if xs.size <= 0 { return 0 }
+    var best: i64 = xs.get(0)
+    var i: i64 = 1
+    while i < xs.size {
+        val v = xs.get(i)
+        if v < best { best = v }
+        i = i + 1
+    }
+    return best
+}
+
+pub fun maxInt(xs: Array<i64>): i64 {
+    if xs.size <= 0 { return 0 }
+    var best: i64 = xs.get(0)
+    var i: i64 = 1
+    while i < xs.size {
+        val v = xs.get(i)
+        if v > best { best = v }
+        i = i + 1
+    }
+    return best
+}
+
+/// Binary search; returns the index, or -1 if not found (requires xs to be sorted ascending).
+pub fun binarySearchInt(xs: Array<i64>, target: i64): i64 {
+    var lo: i64 = 0
+    var hi: i64 = xs.size - 1
+    while lo <= hi {
+        val mid = lo + (hi - lo) / 2
+        val v = xs.get(mid)
+        if v == target { return mid }
+        if v < target { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return -1
+}
+
+/// Position of the first element >= target (returns size if none).
+pub fun lowerBoundInt(xs: Array<i64>, target: i64): i64 {
+    var lo: i64 = 0
+    var hi: i64 = xs.size
+    while lo < hi {
+        val mid = lo + (hi - lo) / 2
+        if xs.get(mid) < target { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+pub fun isSortedInt(xs: Array<i64>): bool {
+    var i: i64 = 1
+    while i < xs.size {
+        if xs.get(i - 1) > xs.get(i) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+pub fun forEachInt(xs: Array<i64>, f: (i64) -> void): void {
+    var i: i64 = 0
+    while i < xs.size {
+        f(xs.get(i))
+        i = i + 1
+    }
+}
+
+pub fun mapInt(xs: Array<i64>, f: (i64) -> i64): Array<i64> {
+    val p: *i64 = sinter_gen_alloc(xs.size, i64)
+    var i: i64 = 0
+    while i < xs.size {
+        p[i] = f(xs.get(i))
+        i = i + 1
+    }
+    return Array<i64>(p, xs.size, true)
+}
+
+pub fun filterInt(xs: Array<i64>, keep: (i64) -> bool): Array<i64> {
+    var count: i64 = 0
+    var i: i64 = 0
+    while i < xs.size {
+        if keep(xs.get(i)) { count = count + 1 }
+        i = i + 1
+    }
+    val p: *i64 = sinter_gen_alloc(count, i64)
+    var out: i64 = 0
+    i = 0
+    while i < xs.size {
+        val v = xs.get(i)
+        if keep(v) {
+            p[out] = v
+            out = out + 1
+        }
+        i = i + 1
+    }
+    return Array<i64>(p, count, true)
+}
+
+pub fun reduceInt(xs: Array<i64>, init: i64, f: (i64, i64) -> i64): i64 {
+    var acc: i64 = init
+    var i: i64 = 0
+    while i < xs.size {
+        acc = f(acc, xs.get(i))
+        i = i + 1
+    }
+    return acc
+}
+
+pub fun countIfInt(xs: Array<i64>, pred: (i64) -> bool): i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < xs.size {
+        if pred(xs.get(i)) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+/// Sort by key (insertion sort; good enough for small arrays, and stable).
+pub fun sortByInt(xs: Array<i64>, key: (i64) -> i64): void {
+    var i: i64 = 1
+    while i < xs.size {
+        val v = xs.get(i)
+        val kv = key(v)
+        var j: i64 = i - 1
+        while j >= 0 {
+            val prev = xs.get(j)
+            if key(prev) <= kv { break }
+            xs.set(j + 1, prev)
+            j = j - 1
+        }
+        xs.set(j + 1, v)
+        i = i + 1
+    }
+}
+
+/// Shuffle in place (deterministic LCG, for reproducibility).
+pub fun shuffleInt(xs: Array<i64>, seed: i64): void {
+    var state: i64 = seed
+    var i: i64 = xs.size - 1
+    while i > 0 {
+        state = state * 6364136223846793005 + 1442695040888963407
+        val j = (state / 2147483648) % (i + 1)
+        val a = xs.get(i)
+        val b = xs.get(j)
+        xs.set(i, b)
+        xs.set(j, a)
+        i = i - 1
+    }
+}
+
+/// Slice [from, to), returning a new array.
+pub fun sliceInt(xs: Array<i64>, start: i64, end: i64): Array<i64> {
+    var lo = start
+    var hi = end
+    if lo < 0 { lo = 0 }
+    if hi > xs.size { hi = xs.size }
+    if hi < lo { hi = lo }
+    val n = hi - lo
+    val p: *i64 = sinter_gen_alloc(n, i64)
+    var i: i64 = 0
+    while i < n {
+        p[i] = xs.get(lo + i)
+        i = i + 1
+    }
+    return Array<i64>(p, n, true)
+}
+
+pub fun sortStr(xs: Array<str>): void { xs.sort() }
+
+/// Binary search on a string array (requires it to be sorted lexicographically).
+pub fun binarySearchStr(xs: Array<str>, target: str): i64 {
+    var lo: i64 = 0
+    var hi: i64 = xs.size - 1
+    while lo <= hi {
+        val mid = lo + (hi - lo) / 2
+        val v = xs.get(mid)
+        val cmp = v.compareTo(target)
+        if cmp == 0 { return mid }
+        if cmp < 0 { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return -1
+}
+
+pub fun forEachStr(xs: Array<str>, f: (str) -> void): void {
+    var i: i64 = 0
+    while i < xs.size {
+        f(xs.get(i))
+        i = i + 1
+    }
+}

@@ -1,0 +1,16 @@
+// tests/cases/badmember —— 调用不存在的成员必须在前端报错
+//
+// 走查历史：这类写法以前会生成一个**丢了接收者**的裸调用 `push(9)`，
+// 用户看到的是 gcc 的 `implicit declaration of function 'push'`。
+// 现在由 TypeChecker 发 E0306，带源码位置与继承链/扩展函数的提示。
+module badmember
+import std
+import std.list
+import std.string
+
+fun main(): void {
+    var xs: List<i64> = List<i64>()
+    xs.add(7)
+    println(xs.size())
+    xs.push(9)
+}

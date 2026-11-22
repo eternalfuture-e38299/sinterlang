@@ -1,0 +1,5 @@
+module lib
+import std
+
+pub fun readAt<T>(p: *T): T => *p
+pub fun writeAt<T>(p: *T, v: T): void { *p = v }

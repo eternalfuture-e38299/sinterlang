@@ -1,0 +1,7 @@
+[package]
+name = "result"
+version = "0.1.0"
+entry = "src/main.sinter"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }

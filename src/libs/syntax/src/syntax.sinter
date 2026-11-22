@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Shared syntax data structures: token pool, diagnostics, flat AST.
+module syntax
+
+import std
+import std.list
+import std.string
+
+pub enum TokenKind {
+    Eof,
+    Ident,
+    Integer,
+    Float,
+    String,
+    Char,
+    Punct,
+    Newline,
+    Embed
+}
+
+pub enum NodeKind {
+    Program,
+    Module,
+    Import,
+    Fun,
+    Class,
+    Enum,
+    Field,
+    Param,
+    Block,
+    Unknown,
+    Var,
+    If,
+    While,
+    For,
+    Ret,
+    Break,
+    Continue,
+    ExprStmt,
+    Throw,
+    Try,
+    Del,
+    IntLit,
+    FloatLit,
+    StringLit,
+    CharLit,
+    BoolLit,
+    NullLit,
+    IdentExpr,
+    Binary,
+    Unary,
+    Call,
+    Member,
+    Index,
+    Ternary,
+    Assign,
+    ArrayLit,
+    Group,
+    Cast,
+    When,
+    Lambda,
+    DoWhile,
+    BlockExpr,
+    ThisExpr,
+    Range,
+    TypeParam,
+    StringTemplate,
+    EmbedC,
+    WhenBranch
+}
+
+/// Token pool. Keywords stay TK_IDENT; the parser compares their text.
+pub class Tokens {
+    var kinds: List<i64>
+    var texts: List<str>
+    var lines: List<i64>
+    var cols: List<i64>
+
+    Tokens() {
+        self.kinds = List<i64>()
+        self.texts = List<str>()
+        self.lines = List<i64>()
+        self.cols = List<i64>()
+    }
+
+    pub fun add(kind: TokenKind, text: str, line: i64, col: i64): void {
+        self.kinds.add(kind as i64)
+        self.texts.add(text)
+        self.lines.add(line)
+        self.cols.add(col)
+    }
+
+    pub fun size(): i64 => self.kinds.size()
+    pub fun kind(i: i64): TokenKind => self.kinds.get(i) as TokenKind
+    pub fun text(i: i64): str => self.texts.get(i)
+    pub fun line(i: i64): i64 => self.lines.get(i)
+    pub fun col(i: i64): i64 => self.cols.get(i)
+}
+
+/// Collected diagnostics in source order.
+pub class Diagnostics {
+    var lines: List<i64>
+    var cols: List<i64>
+    var messages: List<str>
+
+    Diagnostics() {
+        self.lines = List<i64>()
+        self.cols = List<i64>()
+        self.messages = List<str>()
+    }
+
+    pub fun add(line: i64, col: i64, msg: str): void {
+        self.lines.add(line)
+        self.cols.add(col)
+        self.messages.add(msg)
+    }
+
+    pub fun size(): i64 => self.messages.size()
+    pub fun line(i: i64): i64 => self.lines.get(i)
+    pub fun col(i: i64): i64 => self.cols.get(i)
+    pub fun message(i: i64): str => self.messages.get(i)
+}
+
+// Modifier flags stored per declaration.
+pub const F_PUB: i64 = 1
+pub const F_STATIC: i64 = 2
+pub const F_VAR: i64 = 4
+pub const F_OVERRIDE: i64 = 8
+pub const F_ABSTRACT: i64 = 16
+pub const F_STRUCT: i64 = 32
+pub const F_INTERFACE: i64 = 64
+pub const F_VARARG: i64 = 128
+pub const F_DATA: i64 = 256
+pub const F_NORAII: i64 = 512
+pub const F_CTOR: i64 = 1024
+pub const F_EXTERN: i64 = 4096
+pub const F_NAMED: i64 = 16384
+
+/// Flat AST: nodes are integer indices into parallel lists.
+pub class Ast {
+    var kinds: List<i64>
+    var texts: List<str>
+    var aux: List<str>
+    var flags: List<i64>
+    var lines: List<i64>
+    var cols: List<i64>
+    var firstchild: List<i64>
+    var nextsibling: List<i64>
+    var counts: List<i64>
+    var mods: List<str>
+    var curmod: str
+    var exts: List<str>
+    var aliases: List<str>
+
+    Ast() {
+        self.kinds = List<i64>()
+        self.texts = List<str>()
+        self.aux = List<str>()
+        self.flags = List<i64>()
+        self.lines = List<i64>()
+        self.cols = List<i64>()
+        self.firstchild = List<i64>()
+        self.nextsibling = List<i64>()
+        self.counts = List<i64>()
+        self.mods = List<str>()
+        self.curmod = ""
+        self.exts = List<str>()
+        self.aliases = List<str>()
+    }
+
+    pub fun add(kind: NodeKind, text: str, line: i64, col: i64): i64 {
+        val n = self.kinds.size()
+        self.kinds.add(kind as i64)
+        self.texts.add(text)
+        self.aux.add("")
+        self.flags.add(0)
+        self.lines.add(line)
+        self.cols.add(col)
+        self.firstchild.add(-1)
+        self.nextsibling.add(-1)
+        self.counts.add(0)
+        self.mods.add(self.curmod)
+        self.exts.add("")
+        self.aliases.add("")
+        ret n
+    }
+
+    pub fun addChild(parent: i64, child: i64): void {
+        val n = self.counts.get(parent)
+        if n == 0 {
+            self.firstchild.set(parent, child)
+        } else {
+            var at = self.firstchild.get(parent)
+            while self.nextsibling.get(at) >= 0 { at = self.nextsibling.get(at) }
+            self.nextsibling.set(at, child)
+        }
+        self.counts.set(parent, n + 1)
+    }
+
+    pub fun child(parent: i64, i: i64): i64 {
+        var at = self.firstchild.get(parent)
+        var k: i64 = 0
+        while k < i {
+            at = self.nextsibling.get(at)
+            k = k + 1
+        }
+        ret at
+    }
+
+    pub fun setModule(m: str): void => self.curmod = cloneText(m)
+    pub fun moduleOf(node: i64): str => self.mods.get(node)
+    pub fun setExt(node: i64, r: str): void => self.exts.set(node, r)
+    pub fun extOf(node: i64): str => self.exts.get(node)
+    pub fun setAlias(node: i64, r: str): void => self.aliases.set(node, r)
+    pub fun aliasOf(node: i64): str => self.aliases.get(node)
+    pub fun size(node: i64): i64 => self.counts.get(node)
+    pub fun kind(node: i64): NodeKind => self.kinds.get(node) as NodeKind
+    pub fun text(node: i64): str => self.texts.get(node)
+    pub fun setName(node: i64, v: str): void => self.texts.set(node, v)
+    pub fun auxText(node: i64): str => self.aux.get(node)
+    pub fun flag(node: i64): i64 => self.flags.get(node)
+    pub fun setAux(node: i64, v: str): void => self.aux.set(node, v)
+    pub fun setFlags(node: i64, v: i64): void => self.flags.set(node, v)
+    pub fun line(node: i64): i64 => self.lines.get(node)
+    pub fun col(node: i64): i64 => self.cols.get(node)
+}

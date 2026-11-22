@@ -1,0 +1,4 @@
+# [build] cstd = "c17" 必须真的落到生成的 CMake 工程上
+>=1|set(CMAKE_C_STANDARD 17)
+# 严格标准：GNU 扩展必须关掉（gnu17 时这里是 ON）
+==1|set(CMAKE_C_EXTENSIONS OFF)

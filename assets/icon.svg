@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Sinter">
+  <!-- Material 3 Expressive: a C-shaped cradle (C ecosystem / glue code)
+       fused with a two-tone S (Sinter), joined by a bright weld slug. -->
+
+  <rect width="512" height="512" rx="128" fill="#161210"/>
+
+  <!-- Tonal surface block -->
+  <circle cx="306" cy="216" r="178" fill="#241A15"/>
+
+  <!-- C cradle: the C ecosystem that Sinter glues into. -->
+  <path d="M 344 124
+           A 148 148 0 1 0 344 388"
+        fill="none" stroke="#40261B" stroke-width="38" stroke-linecap="round"/>
+
+  <!-- S: modern surface fused onto C. -->
+  <path d="M 348 166
+           C 320 130 226 126 186 166
+           C 150 204 170 242 224 257
+           C 238 261 248 265 256 269"
+        fill="none" stroke="#FFC15E" stroke-width="52" stroke-linecap="round"/>
+
+  <path d="M 256 269
+           C 298 283 348 300 352 340
+           C 356 382 300 406 240 402
+           C 204 400 178 388 160 372"
+        fill="none" stroke="#FF8358" stroke-width="52" stroke-linecap="round"/>
+
+  <!-- Glue joint: a short weld slug, not just a dot. -->
+  <rect x="222" y="248" width="72" height="30" rx="15"
+        fill="#FFF0D6" transform="rotate(28 258 263)"/>
+
+  <!-- One expressive accent: the spark of the modern language layer. -->
+  <path d="M 382 132
+           C 384 150 388 154 406 156
+           C 388 158 384 162 382 180
+           C 380 162 376 158 358 156
+           C 376 154 380 150 382 132 Z"
+        fill="#FFDCA8"/>
+</svg>

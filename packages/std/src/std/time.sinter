@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: time
+//
+// Only ISO C `time()` / `clock()` are used, with no POSIX `clock_gettime` dependency,
+// so the generated C also compiles under strict `-std=c99 -pedantic-errors`.
+module std.time
+
+import std
+
+embed C {
+    #include <time.h>
+
+    static int64_t sinter_time_wall_seconds(void) {
+        time_t t = time(NULL);
+        return (int64_t)t;
+    }
+
+    static int64_t sinter_time_clock_ms(void) {
+        return (int64_t)((clock() * 1000) / CLOCKS_PER_SEC);
+    }
+}
+
+/// Unix time (seconds).
+pub fun nowSeconds(): i64 => sinter_time_wall_seconds()
+/// Unix time (milliseconds; precision depends on `time()`).
+pub fun nowMillis(): i64 => sinter_time_wall_seconds() * 1000
+/// Process CPU time (milliseconds), for benchmarking.
+pub fun cpuMillis(): i64 => sinter_time_clock_ms()
+
+pub class Stopwatch {
+    var started: i64
+    var stopped: i64
+
+    Stopwatch() {
+        self.started = sinter_time_clock_ms()
+        self.stopped = 0
+    }
+
+    pub fun restart(): void {
+        self.started = sinter_time_clock_ms()
+        self.stopped = 0
+    }
+
+    pub fun stop(): i64 {
+        self.stopped = sinter_time_clock_ms()
+        ret self.stopped
+    }
+
+    pub fun elapsedMillis(): i64 {
+        val end = self.stopped == 0 ? sinter_time_clock_ms() : self.stopped
+        ret end - self.started
+    }
+}

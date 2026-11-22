@@ -1,0 +1,15 @@
+[package]
+name = "sver"
+version = "file:../../version.txt"
+entry = "src/sver.sinter"
+description = "Build-time Sinter version shared by the self-hosted tools"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_sver"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+[build]
+opt = "2"

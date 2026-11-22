@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// sinter standard library: `HashMap<K, V>` — hash map (open addressing, linear probing)
+//
+// Division of labour with `Map`: `Map` is an **ordered** array + binary search
+// (using `sinter_gen_cmp`); here **hashing** (`sinter_gen_hash`) places entries
+// directly, O(1) on average, iteration order not guaranteed.
+// The two differ in type, file and algorithm; pick by need:
+//
+//     import std.hashmap
+//
+//     val h = HashMap<str, i64>()
+//     h.put("one", 1)
+//     println(h.getOr("one", -1))     // 1
+//
+// A key's hash is the same FNV-1a 64 as `str.hashCode()` (see `std.string`),
+// so "a hash you compute yourself" and "where the container places it" always
+// agree, which lets you diagnose bucketing yourself.
+module std.hashmap
+import std.core
+import std.generic
+
+/// Hash map: keys are dispatched through sinter_gen_hash (str uses FNV-1a 64, i64 uses splitmix).
+///
+/// The slot count is always a power of two; it doubles and rebuilds at a 3/4 load factor.
+pub class HashMap<K, V> : Any {
+    var keys: *K
+    var vals: *V
+    var used: *u8
+    var slots: i64
+    var cnt: i64
+
+    HashMap() {
+        self.keys = null
+        self.vals = null
+        self.used = null
+        self.slots = 0
+        self.cnt = 0
+    }
+
+    ~HashMap() {
+        self.clear()
+        free(self.keys)
+        free(self.vals)
+        free(self.used)
+        self.keys = null
+        self.vals = null
+        self.used = null
+        self.slots = 0
+        self.cnt = 0
+    }
+
+    pub fun typeLabel(): str => "HashMap"
+
+    /// Modern-style `{k=v, ...}`: printed in slot order (open addressing does not guarantee order).
+    pub fun toString(): str {
+        val sb: *u8 = sinter_gen_sb_new()
+        sinter_gen_sb_mark(sb, 2)
+        var j: i64 = 0
+        var first: bool = true
+        while (j < self.slots) {
+            if (self.used[j] != 0) {
+                if (first == false) { sinter_gen_sb_mark(sb, 4) }
+                val kt: str = sinter_gen_text(self.keys[j], K)
+                sinter_gen_sb_append_text(sb, kt)
+                sinter_gen_sb_mark(sb, 5)
+                val vt: str = sinter_gen_text(self.vals[j], V)
+                sinter_gen_sb_append_text(sb, vt)
+                first = false
+            }
+            j = j + 1
+        }
+        sinter_gen_sb_mark(sb, 3)
+        return sinter_gen_sb_finish(sb)
+    }
+
+    pub fun size(): i64 => self.cnt
+    pub fun isEmpty(): bool => self.cnt == 0
+    pub fun capacity(): i64 => self.slots
+
+    /// Rebuild the bucket array to want slots (want must be a power of two)
+    pub fun rebuild(want: i64): void {
+        val old_keys: *K = self.keys
+        val old_vals: *V = self.vals
+        val old_used: *u8 = self.used
+        val old_slots: i64 = self.slots
+        self.keys = null
+        self.vals = null
+        self.used = null
+        self.slots = want
+        val nk: *K = sinter_gen_grow(self.keys, want)
+        if (nk == null) { return }
+        self.keys = nk
+        val nv: *V = sinter_gen_grow(self.vals, want, V)
+        if (nv == null) { return }
+        self.vals = nv
+        val nu: *u8 = sinter_gen_grow(self.used, want, u8)
+        if (nu == null) { return }
+        self.used = nu
+        var i: i64 = 0
+        while (i < want) {
+            self.used[i] = 0
+            i = i + 1
+        }
+        self.cnt = 0
+        var j: i64 = 0
+        while (j < old_slots) {
+            if (old_used[j] == 1) {
+                self.putRaw(old_keys[j], old_vals[j])
+            }
+            j = j + 1
+        }
+        free(old_keys)
+        free(old_vals)
+        free(old_used)
+    }
+
+    /// Find the slot for a key; returns packed(slot, hit flag)
+    pub fun probe(key: K): i64 {
+        if (self.slots == 0) { return sinter_gen_pack(0, 0) }
+        val mask: i64 = self.slots - 1
+        var at: i64 = sinter_gen_slot_of(sinter_gen_hash(key), mask)
+        var step: i64 = 0
+        while (step < self.slots) {
+            if (self.used[at] != 1) { return sinter_gen_pack(at, 0) }
+            if (sinter_gen_cmp(self.keys[at], key) == 0) { return sinter_gen_pack(at, 1) }
+            at = sinter_gen_next_slot(at, mask)
+            step = step + 1
+        }
+        return sinter_gen_pack(0, 0)
+    }
+
+    pub fun put(key: K, value: V): void {
+        if (self.slots == 0) { self.rebuild(16) }
+        val hit: i64 = self.probe(key)
+        val at: i64 = sinter_gen_slot(hit)
+        if (sinter_gen_hit(hit) == 1) {
+            self.vals[at] = sinter_gen_clone(value, V)
+            return
+        }
+        self.used[at] = 1
+        self.keys[at] = sinter_gen_clone(key)
+        self.vals[at] = sinter_gen_clone(value, V)
+        self.cnt = self.cnt + 1
+        if (self.cnt * 4 > self.slots * 3) { self.rebuild(self.slots * 2) }
+    }
+
+    /// Direct insert used while growing (does not trigger another grow)
+    pub fun putRaw(key: K, value: V): void {
+        val hit: i64 = self.probe(key)
+        val at: i64 = sinter_gen_slot(hit)
+        if (sinter_gen_hit(hit) == 1) {
+            self.vals[at] = value
+            return
+        }
+        self.used[at] = 1
+        self.keys[at] = key
+        self.vals[at] = value
+        self.cnt = self.cnt + 1
+    }
+
+    pub fun containsKey(key: K): bool => sinter_gen_hit(self.probe(key)) == 1
+
+    pub fun getOr(key: K, fallback: V): V {
+        val hit: i64 = self.probe(key)
+        if (sinter_gen_hit(hit) != 1) { return fallback }
+        return sinter_gen_clone(self.vals[sinter_gen_slot(hit)], V)
+    }
+
+    /// Get the value for a key; if absent, returns the blank value for that type
+    pub fun get(key: K): V {
+        val hit: i64 = self.probe(key)
+        if (sinter_gen_hit(hit) != 1) { return sinter_gen_blank(V) }
+        return sinter_gen_clone(self.vals[sinter_gen_slot(hit)], V)
+    }
+
+    pub fun remove(key: K): V {
+        val hit: i64 = self.probe(key)
+        if (sinter_gen_hit(hit) != 1) { return sinter_gen_blank(V) }
+        val at: i64 = sinter_gen_slot(hit)
+        val old: V = sinter_gen_clone(self.vals[at], V)
+        sinter_gen_drop(self.keys[at])
+        sinter_gen_drop(self.vals[at], V)
+        self.used[at] = 0
+        self.cnt = self.cnt - 1
+        self.rehashFrom(at)
+        return old
+    }
+
+    /// Local reshuffle after removing a slot: scan forward over the same cluster and re-place its entries
+    pub fun rehashFrom(start: i64): void {
+        val mask: i64 = self.slots - 1
+        var at: i64 = sinter_gen_next_slot(start, mask)
+        while (self.used[at] == 1) {
+            // Do not spill into a `val k: K` local here: when K is str that local
+            // gets freed automatically, while put_raw merely moves the pointer to
+            // another slot (ownership transfer, not a deep copy), so the same
+            // buffer would be freed twice. Move it straight from the field.
+            self.used[at] = 0
+            self.cnt = self.cnt - 1
+            self.putRaw(self.keys[at], self.vals[at])
+            at = sinter_gen_next_slot(at, mask)
+        }
+    }
+
+    pub fun clear(): void {
+        var i: i64 = 0
+        while (i < self.slots) {
+            if (self.used[i] == 1) {
+                sinter_gen_drop(self.keys[i])
+                sinter_gen_drop(self.vals[i], V)
+                self.used[i] = 0
+            }
+            i = i + 1
+        }
+        self.cnt = 0
+    }
+}

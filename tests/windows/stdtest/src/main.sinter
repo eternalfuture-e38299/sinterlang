@@ -1,0 +1,89 @@
+module win
+import std
+import std.file
+import std.stream
+import std.path
+import std.thread
+import std.async
+import std.net
+import std.memory
+import std.env
+import std.random
+import std.math
+import std.time
+
+var counter: i64 = 0
+var mu: Mutex? = null
+
+fun worker(arg: ptr): ptr {
+    println("thread")
+    ret null
+}
+
+fun incRef(x: i64&): void { x = x + 1 }
+
+fun task(arg: ptr): ptr {
+    ret null
+}
+
+fun main(): void {
+    println("start")
+    val dir = "win_test_dir"
+    mkdirs(dir)
+    writeText(dir + "/a.txt", "hello\n")
+    appendText(dir + "/a.txt", "world\n")
+    println(readText(dir + "/a.txt"))
+    println(exists(dir + "/a.txt"))
+    println(isDir(dir))
+    println(sizeOf(dir + "/a.txt"))
+    println(listSorted(dir))
+    writeAllText(dir + "/s.txt", "stream\n")
+    val lr = LineReader(64)
+    lr.openFile(dir + "/s.txt")
+    println(lr.readLine())
+    println(File(dir + "/s.txt").length())
+    println(normalize("C:\\a\\b\\..\\c"))
+    println(join(dir, "a.txt"))
+
+    val t = Thread(worker, null)
+    t.join()
+
+    val m = Mutex()
+    m.lock()
+    counter = counter + 1
+    m.unlock()
+    println(counter)
+    var rv: i64 = 10
+    incRef(&rv)
+    println(rv)
+
+    val ex = Executor(2)
+    ex.submit(task, null)
+    ex.shutdown()
+
+    val srv = tcpListen("127.0.0.1", 0)
+    val port = socketLocalPort(srv)
+    val cli = tcpConnect("127.0.0.1", port)
+    val conn = tcpAccept(srv)
+    tcpSend(cli, "ping\n")
+    println(tcpRecvLine(conn))
+    tcpClose(cli); tcpClose(conn); tcpClose(srv)
+
+    val p = alloc(8)
+    writeI64(p, 42)
+    println(readI64(p))
+    dealloc(p)
+
+    println(hasEnv("PATH"))
+    println(factorial(5))
+    println(nowSeconds() > 0)
+    remove(dir + "/a.txt")
+    remove(dir + "/s.txt")
+    remove(dir)
+    try {
+        throw "win"
+    } catch (e: str) {
+        println("caught=" + e)
+    }
+    println("done")
+}

@@ -1,0 +1,18 @@
+[package]
+name = "sinterc"
+version = "file:../version.txt"
+entry = "src/main.sinter"
+description = "Self-hosted Sinter compiler (bootstrap project)"
+authors = ["sinter"]
+license = "MIT"
+artifact = "exe"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../packages/std" }
+syntax = { version = "1.0.0", source = "path:../libs/syntax" }
+sem = { version = "1.0.0", source = "path:../libs/sem" }
+codegen = { version = "1.0.0", source = "path:../libs/codegen" }
+sver = { version = "1.0.0", source = "path:../libs/sver" }
+
+[build]
+opt = "2"

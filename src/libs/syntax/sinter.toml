@@ -1,0 +1,15 @@
+[package]
+name = "syntax"
+version = "file:../../version.txt"
+entry = "src/syntax.sinter"
+description = "Self-hosted Sinter lexer, parser and flat AST"
+authors = ["sinter"]
+license = "MIT"
+artifact = "static"
+target = "sinter_syntax"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+
+[build]
+opt = "2"

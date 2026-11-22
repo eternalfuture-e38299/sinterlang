@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+module std.string
+import std.core
+
+embed C {
+    typedef __SIZE_TYPE__ std_str_size_t;
+
+    long long strtoll(const char* s, char** end, int base);
+    double strtod(const char* s, char** end);
+
+    static inline int64_t sinter_str_len_str(sinter_string s) { return s.len; }
+
+    static inline int64_t sinter_str_cmp_str(sinter_string a, sinter_string b) {
+        return (int64_t)sinter_string_compare(a, b);
+    }
+
+    static inline uint8_t sinter_str_eq_str(sinter_string a, sinter_string b) {
+        return sinter_string_equals(a, b);
+    }
+
+    static inline uint8_t sinter_str_is_empty(sinter_string s) {
+        return (uint8_t)(s.len == 0);
+    }
+
+    static inline int64_t sinter_str_at(sinter_string s, int64_t i) {
+        if (!s.data || i < 0 || i >= s.len) return 0;
+        return (int64_t)(unsigned char)s.data[i];
+    }
+
+    static sinter_string sinter_str_sub(sinter_string s, int64_t start, int64_t end) {
+        const char* base = s.data ? s.data : "";
+        if (start < 0) start = 0;
+        if (end > s.len) end = s.len;
+        if (end < start) end = start;
+        return sinter_string_from_buf(base + start, end - start);
+    }
+
+    static int64_t sinter_str_index_of(sinter_string hay, sinter_string needle) {
+        if (!hay.data || !needle.data) return -1;
+        if (needle.len == 0) return 0;
+        if (needle.len > hay.len) return -1;
+        for (int64_t i = 0; i + needle.len <= hay.len; ++i) {
+            if (memcmp(hay.data + i, needle.data, (std_str_size_t)needle.len) == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    static int64_t sinter_str_index_of_from(sinter_string hay, sinter_string needle, int64_t from) {
+        if (!hay.data || !needle.data || from < 0 || from > hay.len) return -1;
+        sinter_string tail;
+        tail.data = hay.data + from;
+        tail.len = hay.len - from;
+        tail.cap = tail.len;
+        tail.owned = 0;
+        const int64_t r = sinter_str_index_of(tail, needle);
+        return r < 0 ? -1 : r + from;
+    }
+
+    /// Search from the end: `"a.b.c".lastIndexOf(".")` -> 3
+    static int64_t sinter_str_last_index_of(sinter_string hay, sinter_string needle) {
+        if (!hay.data || !needle.data) return -1;
+        if (needle.len == 0) return hay.len;
+        if (needle.len > hay.len) return -1;
+        for (int64_t i = hay.len - needle.len; i >= 0; --i) {
+            if (memcmp(hay.data + i, needle.data, (std_str_size_t)needle.len) == 0)
+                return i;
+        }
+        return -1;
+    }
+
+    static uint8_t sinter_str_contains(sinter_string hay, sinter_string needle) {
+        return (uint8_t)(sinter_str_index_of(hay, needle) >= 0);
+    }
+
+    static uint8_t sinter_str_starts_with(sinter_string s, sinter_string prefix) {
+        if (!s.data || !prefix.data || prefix.len > s.len) return 0;
+        if (prefix.len == 0) return 1;
+        return (uint8_t)(memcmp(s.data, prefix.data, (std_str_size_t)prefix.len) == 0);
+    }
+
+    static uint8_t sinter_str_ends_with(sinter_string s, sinter_string suffix) {
+        if (!s.data || !suffix.data || suffix.len > s.len) return 0;
+        if (suffix.len == 0) return 1;
+        return (uint8_t)(memcmp(s.data + s.len - suffix.len, suffix.data,
+                                (std_str_size_t)suffix.len) == 0);
+    }
+
+    static sinter_string sinter_str_to_upper(sinter_string s) {
+        sinter_string r = sinter_string_from_buf(s.data ? s.data : "", s.len);
+        for (int64_t i = 0; i < r.len; ++i) {
+            unsigned char c = (unsigned char)r.data[i];
+            if (c >= 'a' && c <= 'z') r.data[i] = (char)(c - 32);
+        }
+        return r;
+    }
+
+    static sinter_string sinter_str_to_lower(sinter_string s) {
+        sinter_string r = sinter_string_from_buf(s.data ? s.data : "", s.len);
+        for (int64_t i = 0; i < r.len; ++i) {
+            unsigned char c = (unsigned char)r.data[i];
+            if (c >= 'A' && c <= 'Z') r.data[i] = (char)(c + 32);
+        }
+        return r;
+    }
+
+    static uint8_t sinter_str_is_space(unsigned char c) {
+        return (uint8_t)(c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+                         c == '\v' || c == '\f');
+    }
+
+    static sinter_string sinter_str_trim(sinter_string s) {
+        if (!s.data) return sinter_string_from_buf("", 0);
+        int64_t start = 0, end = s.len;
+        while (start < end && sinter_str_is_space((unsigned char)s.data[start])) ++start;
+        while (end > start && sinter_str_is_space((unsigned char)s.data[end - 1])) --end;
+        return sinter_string_from_buf(s.data + start, end - start);
+    }
+
+    static sinter_string sinter_str_repeat(sinter_string s, int64_t n) {
+        if (n <= 0 || s.len <= 0 || !s.data) return sinter_string_from_buf("", 0);
+        if (n > 1000000) return sinter_string_from_buf("", 0);   /* defensive limit */
+        const int64_t total = s.len * n;
+        char* buf = (char*)malloc((std_str_size_t)total);
+        if (!buf) return sinter_string_from_buf("", 0);
+        for (int64_t i = 0; i < n; ++i)
+            memcpy(buf + i * s.len, s.data, (std_str_size_t)s.len);
+        sinter_string r = sinter_string_from_buf(buf, total);
+        free(buf);
+        return r;
+    }
+
+    static sinter_string sinter_str_replace(sinter_string s, sinter_string from,
+                                            sinter_string to) {
+        if (!s.data || !from.data || from.len <= 0)
+            return sinter_string_from_buf(s.data ? s.data : "", s.len);
+        int64_t count = 0;
+        for (int64_t i = 0; i + from.len <= s.len; ) {
+            if (memcmp(s.data + i, from.data, (std_str_size_t)from.len) == 0) {
+                ++count;
+                i += from.len;
+            } else {
+                ++i;
+            }
+        }
+        if (count == 0) return sinter_string_from_buf(s.data, s.len);
+
+        const int64_t new_len = s.len + count * (to.len - from.len);
+        if (new_len < 0) return sinter_string_from_buf("", 0);
+        char* buf = (char*)malloc((std_str_size_t)new_len);
+        if (!buf) return sinter_string_from_buf("", 0);
+        int64_t si = 0, di = 0;
+        while (si < s.len) {
+            if (si + from.len <= s.len &&
+                memcmp(s.data + si, from.data, (std_str_size_t)from.len) == 0) {
+                if (to.len > 0) memcpy(buf + di, to.data, (std_str_size_t)to.len);
+                di += to.len;
+                si += from.len;
+            } else {
+                buf[di++] = s.data[si++];
+            }
+        }
+        sinter_string r = sinter_string_from_buf(buf, new_len);
+        free(buf);
+        return r;
+    }
+
+    static sinter_string sinter_str_from_int(int64_t v) {
+        return sinter_string_from_int(v);
+    }
+
+    static sinter_string sinter_str_from_float(double v) {
+        return sinter_string_from_num(v);
+    }
+
+    static sinter_string sinter_str_from_bool(uint8_t v) {
+        return sinter_string_from_literal(v ? "true" : "false", v ? 4 : 5);
+    }
+
+    static int64_t sinter_str_to_int(sinter_string s) {
+        if (!s.data) return 0;
+        return (int64_t)strtoll(s.data, 0, 10);
+    }
+
+    static double sinter_str_to_float(sinter_string s) {
+        if (!s.data) return 0.0;
+        return strtod(s.data, 0);
+    }
+
+    static inline const char* sinter_str_to_cstr(sinter_string s) {
+        return sinter_string_to_cstr(s);
+    }
+
+    static inline sinter_string sinter_str_from_cstr(const char* s) {
+        return sinter_string_from_cstr(s);
+    }
+
+    static int64_t sinter_cstr_len(const char* s) {
+        return s ? (int64_t)strlen(s) : 0;
+    }
+
+    static uint8_t sinter_cstr_eq(const char* a, const char* b) {
+        if (!a || !b) return (uint8_t)(a == b);
+        return (uint8_t)(strcmp(a, b) == 0);
+    }
+
+    /* ---- Field accessors for String class ---- */
+    static int64_t sinter_str_raw_len(sinter_string s) { return s.len; }
+
+    /* ---- Hash: FNV-1a 64-bit, shared with HashMap<str, V> ----
+       Used by `str.hashCode()`, `String.hashCode()`, and
+       `sinter_gen_hash_str` (generic dispatch). */
+    static uint64_t sinter_str_hash(sinter_string s) {
+        uint64_t h = 1469598103934665603ULL;   /* FNV offset basis */
+        if (!s.data) return h;
+        for (int64_t i = 0; i < s.len; ++i) {
+            h ^= (uint64_t)(unsigned char)s.data[i];
+            h *= 1099511628211ULL;             /* FNV prime */
+        }
+        return h;
+    }
+
+    /* 32-bit string hash using the common 31*h + c recurrence.
+       Only used when external protocol compatibility is required. */
+    static int64_t sinter_str_hash_i32(sinter_string s) {
+        int32_t h = 0;
+        if (!s.data) return 0;
+        for (int64_t i = 0; i < s.len; ++i)
+            h = (int32_t)(31 * h + (int32_t)(unsigned char)s.data[i]);
+        return (int64_t)h;
+    }
+
+    /* Bucket slot: hash & mask (mask is power-of-two minus one).
+       Same scheme as container probing. */
+    static int64_t sinter_str_hash_slot(sinter_string s, int64_t mask) {
+        return (int64_t)(sinter_str_hash(s) & (uint64_t)mask);
+    }
+
+    /* Wrapper around `strtoll` for `String.toLong()`. */
+    static inline int64_t sinter_str_parse_i64(sinter_string s) {
+        return sinter_str_to_int(s);
+    }
+}
+
+// ============================================================================
+// String: modern string wrapper
+// ============================================================================
+/// A string wrapper providing method-based operations.
+/// Interoperable with native `str` literals, interpolation, and concatenation.
+/// Use `.raw` to extract the underlying `str`, and `String(...)` to wrap it.
+pub class String : Any {
+    var raw: str
+
+    String(v: str) {
+        self.raw = v
+    }
+
+    String() {
+        self.raw = ""
+    }
+
+    // ---- Any overrides ----
+    pub override fun toString(): str => self.raw
+    pub override fun typeLabel(): str => "String"
+
+    // ---- Query ----
+    pub fun length(): i64 => sinter_str_len_str(self.raw)
+    pub fun isEmpty(): bool => sinter_str_is_empty(self.raw)
+    pub fun get(index: i64): i64 => sinter_str_at(self.raw, index)
+    pub fun first(): i64 => sinter_str_at(self.raw, 0)
+    pub fun last(): i64 => sinter_str_at(self.raw, self.length() - 1)
+
+    // ---- Comparison / Search ----
+    pub fun compareTo(other: String): i64 => sinter_str_cmp_str(self.raw, other.raw)
+    pub fun equalsText(other: str): bool => sinter_str_eq_str(self.raw, other)
+    pub fun contains(needle: str): bool => sinter_str_contains(self.raw, needle)
+    pub fun startsWith(prefix: str): bool => sinter_str_starts_with(self.raw, prefix)
+    pub fun endsWith(suffix: str): bool => sinter_str_ends_with(self.raw, suffix)
+    pub fun indexOf(needle: str): i64 => sinter_str_index_of(self.raw, needle)
+    pub fun lastIndexOf(needle: str): i64 => sinter_str_last_index_of(self.raw, needle)
+
+    // ---- Transformation (returns new String) ----
+    pub fun substring(start: i64, end: i64): String => String(sinter_str_sub(self.raw, start, end))
+    pub fun uppercase(): String => String(sinter_str_to_upper(self.raw))
+    pub fun lowercase(): String => String(sinter_str_to_lower(self.raw))
+    pub fun trim(): String => String(sinter_str_trim(self.raw))
+    pub fun repeat(n: i64): String => String(sinter_str_repeat(self.raw, n))
+    pub fun replace(target: str, replacement: str): String =>
+        String(sinter_str_replace(self.raw, target, replacement))
+
+    // ---- Concatenation ----
+    pub fun plus(other: String): String => String(self.raw + other.raw)
+    pub fun plusText(other: str): String => String(self.raw + other)
+
+    // ---- Conversion ----
+    pub fun toInt(): i64 => sinter_str_to_int(self.raw)
+    pub fun toLong(): i64 => sinter_str_parse_i64(self.raw)
+    pub fun toFloat(): f64 => sinter_str_to_float(self.raw)
+    pub fun toCStr(): cstr => sinter_str_to_cstr(self.raw)
+
+    // ---- Hash (shared with HashMap<str, V>) ----
+    pub fun hashCode(): i64 => sinter_str_hash(self.raw)
+    pub fun hashCode[std_string_string_hash_code_i32](): i32 => sinter_str_hash_i32(self.raw)
+}
+
+// ============================================================================
+// Extension functions on primitive `str` type
+// ============================================================================
+pub {
+    ext fun str.length(): i64 => sinter_str_len_str(self)
+    ext fun str.isEmpty(): bool => sinter_str_is_empty(self)
+    ext fun str.at(index: i64): i64 => sinter_str_at(self, index)
+    ext fun str.compareTo(other: str): i64 => sinter_str_cmp_str(self, other)
+    ext fun str.equalsText(other: str): bool => sinter_str_eq_str(self, other)
+    ext fun str.contains(needle: str): bool => sinter_str_contains(self, needle)
+    ext fun str.startsWith(prefix: str): bool => sinter_str_starts_with(self, prefix)
+    ext fun str.endsWith(suffix: str): bool => sinter_str_ends_with(self, suffix)
+    ext fun str.indexOf(needle: str): i64 => sinter_str_index_of(self, needle)
+    ext fun str.indexOfFrom(needle: str, start: i64): i64 =>
+        sinter_str_index_of_from(self, needle, start)
+    ext fun str.lastIndexOf(needle: str): i64 => sinter_str_last_index_of(self, needle)
+    ext fun str.substring(start: i64, end: i64): str => sinter_str_sub(self, start, end)
+    ext fun str.uppercase(): str => sinter_str_to_upper(self)
+    ext fun str.lowercase(): str => sinter_str_to_lower(self)
+    ext fun str.trim(): str => sinter_str_trim(self)
+    ext fun str.repeat(n: i64): str => sinter_str_repeat(self, n)
+    ext fun str.replace(target: str, replacement: str): str =>
+        sinter_str_replace(self, target, replacement)
+    ext fun str.toInt(): i64 => sinter_str_to_int(self)
+    ext fun str.toLong(): i64 => sinter_str_parse_i64(self)
+    ext fun str.toFloat(): f64 => sinter_str_to_float(self)
+    ext fun str.toCStr[to_c_str_ext](): cstr => sinter_str_to_cstr(self)
+
+    ext fun str.hashCode(): i64 => sinter_str_hash(self)
+    ext fun str.javaHashCode(): i64 => sinter_str_hash_i32(self)
+    ext fun str.hashSlot(mask: i64): i64 => sinter_str_hash_slot(self, mask)
+
+    // ---- Factory functions returning primitive `str` ----
+    pub fun cloneText(s: str): str => sinter_string_clone(s)
+pub fun fromInt(v: i64): str => sinter_str_from_int(v)
+    pub fun fromFloat(v: f64): str => sinter_str_from_float(v)
+    pub fun fromBool(v: bool): str => sinter_str_from_bool(v)
+
+    // ---- C-string interop ----
+    pub fun toCStr(s: str): cstr => sinter_str_to_cstr(s)
+    pub fun fromCStr(s: cstr): str => sinter_str_from_cstr(s)
+    pub fun cstrLength(s: cstr): i64 => sinter_cstr_len(s)
+    pub fun cstrEquals(a: cstr, b: cstr): bool => sinter_cstr_eq(a, b)
+}
+

@@ -1,0 +1,10 @@
+hello, sinter
+42
+3.14159
+sqrt(16) = 4
+upper = SINTER
+names = 2
+ada
+grace
+ada = 100
+grace = 99

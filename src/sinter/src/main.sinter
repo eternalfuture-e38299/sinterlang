@@ -1,0 +1,1441 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted `sinter` build frontend.  It reads sinter.toml, resolves local
+// and installed dependencies, invokes the Sinter compiler to emit per-module C
+// sources and headers, then hands them to the host C compiler.
+module main
+
+import std
+import std.file
+import std.string
+import std.list
+import std.io
+import std.text
+import sfmt
+import sver
+
+bind C fun snt_getenv(name: cstr): cstr
+bind C fun snt_system(cmd: cstr): i32
+
+embed C {
+#include <stdlib.h>
+
+const char* snt_getenv(const char* name) { return getenv(name); }
+int snt_system(const char* cmd) { return system(cmd); }
+}
+
+fun version(): str => sver.text()
+
+class Dep {
+    var name: str
+    var version: str
+    var source: str
+    var target: str
+    var cond: str
+
+    Dep(n: str) {
+        self.name = n
+        self.version = "*"
+        self.source = ""
+        self.target = ""
+        self.cond = ""
+    }
+}
+
+class Manifest {
+    var name: str
+    var version: str
+    var entry: str
+    var artifact: str
+    var target: str
+    var description: str
+    var opt: str
+    var cstd: str
+    var libs: List<str>
+    var includes: List<str>
+    var defs: List<str>
+    var subdirs: List<str>
+    var options: List<str>
+    var deps: List<Dep>
+    var conds: List<str>
+    var condBlobs: List<str>
+
+    Manifest() {
+        self.name = ""
+        self.version = projectVersion()
+        self.entry = "src/main.sinter"
+        self.artifact = "exe"
+        self.target = ""
+        self.description = ""
+        self.opt = ""
+        self.cstd = ""
+        self.libs = List<str>()
+        self.includes = List<str>()
+        self.defs = List<str>()
+        self.subdirs = List<str>()
+        self.options = List<str>()
+        self.deps = List<Dep>()
+        self.conds = List<str>()
+        self.condBlobs = List<str>()
+    }
+}
+
+fun envOr(name: str, fallback: str): str {
+    val p = snt_getenv(toCStr(name))
+    if p == null { ret fallback }
+    ret fromCStr(p)
+}
+
+fun repoRoot(): str {
+    var p = cwdPath()
+    var i: i64 = 0
+    while i < 5 {
+        if std.file.exists(joinPath(p, "VERSION")) { ret p }
+        val slash = p.lastIndexOf("/")
+        if slash <= 0 { ret p }
+        if slash == 0 { p = "/" } else { p = p.substring(0, slash) }
+        i = i + 1
+    }
+    ret p
+}
+
+fun projectVersion(): str {
+    val f = joinPath(repoRoot(), "VERSION")
+    if std.file.exists(f) { ret trim(readText(f)) }
+    ret envOr("SINTER_VERSION", "")
+}
+
+fun cwdPath(): str {
+    val p = snt_getenv(toCStr("PWD"))
+    if p == null { ret "." }
+    ret fromCStr(p)
+}
+
+fun runCmd(cmd: str): i64 => snt_system(toCStr(cmd))
+
+fun shq(s: str): str {
+    var out = "'"
+    var i: i64 = 0
+    while i < s.length() {
+        if s.at(i) == 39 { out = out + "'\\''" } else { out = out + s.substring(i, i + 1) }
+        i = i + 1
+    }
+    ret out + "'"
+}
+
+fun trim(s: str): str {
+    var a: i64 = 0
+    var b: i64 = s.length()
+    while a < b && (s.at(a) == 32 || s.at(a) == 9 || s.at(a) == 10 || s.at(a) == 13) { a = a + 1 }
+    while b > a && (s.at(b - 1) == 32 || s.at(b - 1) == 9 || s.at(b - 1) == 10 || s.at(b - 1) == 13) { b = b - 1 }
+    ret s.substring(a, b)
+}
+
+fun unescape(s: str): str {
+    ret s.replace("\\\"", "\"")
+}
+
+fun unquote(s: str): str {
+    val t = trim(s)
+    if t.length() >= 2 {
+        if (t.at(0) == 34 && t.at(t.length() - 1) == 34) { ret unescape(t.substring(1, t.length() - 1)) }
+        if (t.at(0) == 39 && t.at(t.length() - 1) == 39) { ret unescape(t.substring(1, t.length() - 1)) }
+    }
+    ret t
+}
+
+fun joinPath(a: str, b: str): str {
+    if a.length() == 0 { ret b }
+    if a.endsWith("/") { ret a + b }
+    ret a + "/" + b
+}
+
+fun dirName(p: str): str {
+    val i = p.lastIndexOf("/")
+    if i < 0 { ret "." }
+    ret p.substring(0, i)
+}
+
+fun findKey(blob: str, key: str): str {
+    val marker = key + " ="
+    val at = blob.indexOf(marker)
+    if at < 0 { ret "" }
+    var i = at + marker.length()
+    while i < blob.length() && (blob.at(i) == 32 || blob.at(i) == 9) { i = i + 1 }
+    if i < blob.length() && blob.at(i) == 34 {
+        i = i + 1
+        val start = i
+        while i < blob.length() && blob.at(i) != 34 { i = i + 1 }
+        ret blob.substring(start, i)
+    }
+    val start = i
+    while i < blob.length() {
+        val c = blob.at(i)
+        if c == 10 || c == 13 || c == 44 || c == 125 || c == 93 { break }
+        i = i + 1
+    }
+    ret unquote(blob.substring(start, i))
+}
+
+fun tableText(text: str, name: str): str {
+    val want = "[" + name + "]"
+    val lines = split(text, "\n")
+    var inSec = false
+    var out = ""
+    var i: i64 = 0
+    while i < lines.size() {
+        val t = trim(lines.get(i))
+        if t.startsWith("[") {
+            if t == want { inSec = true }
+            else if inSec { break }
+        } else if inSec {
+            out = out + lines.get(i) + "\n"
+        }
+        i = i + 1
+    }
+    ret out
+}
+
+fun depFromInline(name: str, body: str): Dep {
+    val d = Dep(name)
+    d.version = findKey(body, "version")
+    if d.version.length() == 0 { d.version = "*" }
+    d.source = findKey(body, "source")
+    d.target = findKey(body, "target")
+    d.cond = findKey(body, "when")
+    if d.cond.length() == 0 { d.cond = findKey(body, "if") }
+    ret d
+}
+
+/// `version = "file:version.txt"` reads the version from a file next to the
+/// manifest (an absolute path also works).  Relative paths are manifest-rooted,
+/// so every package can point at the same version.txt.
+fun resolveVersion(v: str, dir: str): str {
+    if !v.startsWith("file:") { ret v }
+    val p0 = v.substring(5, v.length())
+    val p = p0.startsWith("/") ? p0 : joinPath(dir, p0)
+    if !std.file.exists(p) { ret "" }
+    ret trim(readText(p))
+}
+
+/// CMake source paths are always relative to the generated CMakeLists' own
+/// directory via ${CMAKE_CURRENT_LIST_DIR}; no custom root variable is emitted.
+fun pathParts(p: str): List<str> {
+    val out = List<str>()
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= p.length() {
+        if i == p.length() || p.at(i) == 47 {
+            val part = p.substring(start, i)
+            if part.length() > 0 && part != "." { out.add(part) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    ret out
+}
+
+fun trimTrailingSlash(s: str): str {
+    if s.length() > 1 && s.endsWith("/") { ret s.substring(0, s.length() - 1) }
+    ret cloneText(s)
+}
+
+fun relPath(from: str, to: str): str {
+    val a = pathParts(from)
+    val b = pathParts(to)
+    var common: i64 = 0
+    while common < a.size() && common < b.size() && a.get(common) == b.get(common) {
+        common = common + 1
+    }
+    var out = ""
+    var i = common
+    while i < a.size() { out = out + "../"; i = i + 1 }
+    i = common
+    while i < b.size() {
+        if out.length() > 0 && !out.endsWith("/") { out = out + "/" }
+        out = out + b.get(i)
+        i = i + 1
+    }
+    if out.length() == 0 { ret "." }
+    ret out
+}
+
+fun cmakeRel(base: str, root: str, p: str): str {
+    if p.length() == 0 { ret p }
+    if p.indexOf("$" + "{") >= 0 { ret p }
+    val abs = p.startsWith("/") ? p : joinPath(root, p)
+    val rel = trimTrailingSlash(relPath(base, abs))
+    if p.startsWith("/") && rel.startsWith("..") { ret p }
+    ret "$" + "{CMAKE_CURRENT_LIST_DIR}/" + rel
+}
+
+fun isCMakeDep(dir: str): bool => std.file.exists(joinPath(dir, "CMakeLists.txt"))
+
+fun stripBlock(target: str): str {
+    var s = "if(CMAKE_BUILD_TYPE STREQUAL \"Release\")\n"
+    s = s + "    if(CMAKE_SYSTEM_NAME STREQUAL \"Linux\" OR ANDROID)\n"
+    s = s + "        add_custom_command(TARGET " + target + " POST_BUILD\n"
+    val ec = "$" + "{CMAKE_COMMAND}"
+    val strip = "$" + "{CMAKE_STRIP}"
+    s = s + "                COMMAND " + ec + " -E echo \"Stripping symbols from " + target + "...\"\n"
+    s = s + "                COMMAND " + strip + " --strip-all $<TARGET_FILE:" + target + ">\n"
+    s = s + "                COMMENT \"Stripping symbols from " + target + " using strip command\"\n"
+    s = s + "                VERBATIM)\n"
+    s = s + "    elseif(CMAKE_SYSTEM_NAME STREQUAL \"Darwin\")\n"
+    s = s + "        add_custom_command(TARGET " + target + " POST_BUILD\n"
+    s = s + "                COMMAND " + ec + " -E echo \"Stripping symbols from " + target + "...\"\n"
+    s = s + "                COMMAND " + strip + " -S $<TARGET_FILE:" + target + ">\n"
+    s = s + "                COMMENT \"Stripping symbols from " + target + " using strip command\"\n"
+    s = s + "                VERBATIM)\n"
+    s = s + "    endif()\n"
+    s = s + "endif()\n"
+    ret s
+}
+
+fun platformLinkText(name: str): str {
+    var s = "if(DEFINED SINTER_TARGET AND NOT SINTER_TARGET STREQUAL \"\")\n"
+    s = s + "    if(SINTER_TARGET MATCHES \"windows|mingw\")\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE m ws2_32)\n"
+    s = s + "    elseif(SINTER_TARGET MATCHES \"darwin|macos\")\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE m)\n"
+    s = s + "    elseif(SINTER_TARGET MATCHES \"android\")\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE m dl)\n"
+    s = s + "    else()\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE m pthread)\n"
+    s = s + "    endif()\n"
+    s = s + "else()\n"
+    s = s + "    if(WIN32)\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE ws2_32)\n"
+    s = s + "    else()\n"
+    s = s + "        target_link_libraries(" + name + " PRIVATE m pthread)\n"
+    s = s + "    endif()\n"
+    s = s + "endif()\n"
+    ret s
+}
+
+@no_raii
+fun parseDeps(blob: str): List<Dep> {
+    val out = List<Dep>()
+    var rest = cloneText(blob)
+    val lines = split(rest, "\n")
+    var i: i64 = 0
+    while i < lines.size() {
+        var line = trim(lines.get(i))
+        if line.length() > 0 && line.at(0) != 35 {
+            val eq = line.indexOf("=")
+            if eq > 0 {
+                val name = unquote(line.substring(0, eq))
+                val value = trim(line.substring(eq + 1, line.length()))
+                if value.startsWith("{") {
+                    out.add(depFromInline(name, value))
+                } else {
+                    val d = Dep(name)
+                    d.version = unquote(value)
+                    out.add(d)
+                }
+            }
+        }
+        i = i + 1
+    }
+    ret out
+}
+
+fun parseArray(text: str, key: str): List<str> {
+    val out = List<str>()
+    val marker = key + " = ["
+    val at = text.indexOf(marker)
+    if at < 0 { ret out }
+    var i = at + marker.length()
+    var start = i
+    var quoted = false
+    while i < text.length() && text.at(i) != 93 {
+        val ch = text.at(i)
+        if ch == 34 { quoted = !quoted }
+        if ch == 44 && !quoted {
+            val v = unquote(text.substring(start, i))
+            if v.length() > 0 { out.add(v) }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    val last = unquote(text.substring(start, i))
+    if last.length() > 0 { out.add(last) }
+    ret out
+}
+
+fun parseAllArrays(text: str, key: str): List<str> {
+    val out = List<str>()
+    val marker = key + " = ["
+    var scan_from: i64 = 0
+    while scan_from < text.length() {
+        val at = text.indexOf(marker)
+        if at < 0 { break }
+        // indexOf always starts at 0; scan manually from scan_from
+        var pos = scan_from
+        var hit = -1
+        while pos + marker.length() <= text.length() {
+            if text.substring(pos, pos + marker.length()) == marker { hit = pos; break }
+            pos = pos + 1
+        }
+        if hit < 0 { break }
+        var i = hit + marker.length()
+        var start = i
+        var quoted = false
+        while i < text.length() && text.at(i) != 93 {
+            val ch = text.at(i)
+            if ch == 34 { quoted = !quoted }
+            if ch == 44 && !quoted {
+                val v = unquote(text.substring(start, i))
+                if v.length() > 0 { out.add(v) }
+                start = i + 1
+            }
+            i = i + 1
+        }
+        val last = unquote(text.substring(start, i))
+        if last.length() > 0 { out.add(last) }
+        scan_from = i + 1
+    }
+    ret out
+}
+
+fun addDef(xs: List<str>, v: str): void {
+    val eq = v.indexOf("=")
+    val nm = eq > 0 ? v.substring(0, eq) : v
+    var i: i64 = 0
+    while i < xs.size() {
+        val e = xs.get(i).indexOf("=")
+        val old = e > 0 ? xs.get(i).substring(0, e) : xs.get(i)
+        if old == nm { xs.set(i, v); ret }
+        i = i + 1
+    }
+    xs.add(v)
+}
+
+/// C++ 宿主包管理器的平台快捷名，返回原样写进 CMake if(...) 的表达式。
+fun platformCond(name: str): str {
+    val n = name.lowercase()
+    if n == "android" { ret "ANDROID" }
+    if n == "windows" || n == "win32" { ret "WIN32" }
+    if n == "mingw" { ret "MINGW" }
+    if n == "linux" { ret "CMAKE_SYSTEM_NAME STREQUAL \"Linux\" AND NOT ANDROID" }
+    if n == "macos" || n == "macosx" || n == "osx" || n == "apple" { ret "APPLE" }
+    if n == "unix" { ret "UNIX" }
+    if n == "msvc" { ret "MSVC" }
+    if n == "gcc" { ret "CMAKE_C_COMPILER_ID STREQUAL \"GNU\"" }
+    if n == "clang" { ret "CMAKE_C_COMPILER_ID MATCHES \"Clang\"" }
+    ret ""
+}
+
+/// 条件块的原始 TOML 文本先存起来，发射时再解析，避免自举后端处理嵌套列表。
+fun addCondBlock(m: Manifest, cond: str, blob: str): void {
+    if cond.length() == 0 { ret }
+    if blob.length() == 0 { ret }
+    m.conds.add(cond)
+    m.condBlobs.add(blob)
+}
+
+fun condDefs(blob: str): List<str> {
+    val out = List<str>()
+    val all = parseAllArrays(blob, "defs")
+    var i: i64 = 0
+    while i < all.size() { addDef(out, all.get(i)); i = i + 1 }
+    ret out
+}
+
+/// 解析 [[link.condition]] 与 [link.android] 等条件块，保持出现顺序。
+fun parseLinkConditions(text: str, m: Manifest): void {
+    val lines = split(text, "\n")
+    var blob = ""
+    var hint = ""
+    var active = false
+    var i: i64 = 0
+    while i < lines.size() {
+        val t = trim(lines.get(i))
+        if t.startsWith("[[") && t.endsWith("]]") {
+            if active { addCondBlock(m, hint, blob) }
+            blob = ""
+            hint = ""
+            active = false
+            val raw = trim(t.substring(2, t.length() - 2))
+            if raw == "link.condition" { active = true }
+            i = i + 1
+            continue
+        }
+        if t.startsWith("[") && t.endsWith("]") {
+            if active { addCondBlock(m, hint, blob) }
+            blob = ""
+            hint = ""
+            active = false
+            val raw = trim(t.substring(1, t.length() - 1))
+            if raw.startsWith("link.") {
+                val c = platformCond(raw.substring(5, raw.length()))
+                if c.length() > 0 { active = true; hint = c }
+            }
+            i = i + 1
+            continue
+        }
+        if active && t.length() > 0 && t.at(0) != 35 {
+            val eq = t.indexOf("=")
+            if eq > 0 {
+                val key = trim(t.substring(0, eq))
+                val value = t.substring(eq + 1, t.length())
+                if key == "if" || key == "when" { hint = unquote(value) }
+                else if key == "platform" { hint = platformCond(unquote(value)) }
+                else { blob = blob + t + "\n" }
+            }
+        }
+        i = i + 1
+    }
+    if active { addCondBlock(m, hint, blob) }
+}
+
+fun loadManifest(path: str): Manifest {
+    val m = Manifest()
+    if !std.file.exists(path) { ret m }
+    val text = readText(path)
+    val pkg = tableText(text, "package")
+    m.name = findKey(pkg, "name")
+    m.version = findKey(pkg, "version")
+    m.entry = findKey(pkg, "entry")
+    m.artifact = findKey(pkg, "artifact")
+    m.target = findKey(pkg, "target")
+    m.description = findKey(pkg, "description")
+    m.opt = findKey(tableText(text, "build"), "opt")
+    m.cstd = findKey(tableText(text, "build"), "cstd")
+    val lk = tableText(text, "link")
+    m.libs = parseArray(lk, "libs")
+    m.includes = parseArray(lk, "includes")
+    m.subdirs = parseArray(lk, "subdirs")
+    m.options = List<str>()
+    val linkOpts = parseAllArrays(lk, "options")
+    var oi: i64 = 0
+    while oi < linkOpts.size() { m.options.add(linkOpts.get(oi)); oi = oi + 1 }
+    m.defs = List<str>()
+    val linkDefs = parseAllArrays(lk, "defs")
+    var di: i64 = 0
+    while di < linkDefs.size() { addDef(m.defs, linkDefs.get(di)); di = di + 1 }
+    if m.name.length() == 0 { m.name = "program" }
+    if m.entry.length() == 0 { m.entry = "src/main.sinter" }
+    if m.artifact.length() == 0 { m.artifact = "exe" }
+    m.deps = parseDeps(tableText(text, "dependencies"))
+    parseLinkConditions(text, m)
+    val base = dirName(path)
+    m.version = resolveVersion(m.version, base)
+    if m.version.length() == 0 { m.version = projectVersion() }
+    ret m
+}
+
+fun sinterHome(): str {
+    val h = envOr("SINTER_HOME", "")
+    if h.length() > 0 { ret h }
+    ret joinPath(envOr("HOME", "."), ".sinter")
+}
+
+fun installedVersion(name: str, want: str): str {
+    val base = joinPath(joinPath(sinterHome(), "packages"), name)
+    if !std.file.exists(base) { ret "" }
+    if want.length() > 0 && want != "*" { ret want }
+    val entries = listDir(base)
+    var best = ""
+    var i: i64 = 0
+    while i < entries.size {
+        val e = entries.get(i)
+        if e.length() > 0 && e.at(0) != 46 {
+            if best.length() == 0 || e.compareTo(best) > 0 { best = e }
+        }
+        i = i + 1
+    }
+    ret best
+}
+
+fun depRoot(d: Dep, projectRoot: str): str {
+    if d.source.startsWith("path:") {
+        val p = d.source.substring(5, d.source.length())
+        if p.startsWith("/") { ret p }
+        ret joinPath(projectRoot, p)
+    }
+    val v = installedVersion(d.name, d.version)
+    if v.length() == 0 { ret "" }
+    ret joinPath(joinPath(joinPath(sinterHome(), "packages"), d.name), v)
+}
+
+fun addInclude(out: List<str>, p: str): void {
+    if p.length() == 0 { ret }
+    val src = joinPath(p, "src")
+    if out.indexOf(src) < 0 { out.add(src) }
+    if out.indexOf(p) < 0 { out.add(p) }
+}
+
+fun collectIncludes(m: Manifest, root: str, out: List<str>): void {
+    var i: i64 = 0
+    while i < m.deps.size() {
+        val p = depRoot(m.deps.get(i), root)
+        addInclude(out, p)
+        if p.length() > 0 {
+            val dm = loadManifest(joinPath(p, "sinter.toml"))
+            if dm.deps.size() > 0 {
+                var k: i64 = 0
+                while k < dm.deps.size() {
+                    addInclude(out, depRoot(dm.deps.get(k), p))
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+
+fun repeatSpaces(n: i64): str {
+    var out = ""
+    var i: i64 = 0
+    while i < n { out = out + "  "; i = i + 1 }
+    ret out
+}
+
+@no_raii
+fun treeInto(m: Manifest, root: str, depth: i64, seen: List<str>): void {
+    var i: i64 = 0
+    while i < m.deps.size() {
+        val d = m.deps.get(i)
+        if seen.indexOf(d.name) < 0 {
+            writeLine(repeatSpaces(depth) + d.name + " " + d.version)
+            seen.add(d.name)
+            val p = depRoot(d, root)
+            if p.length() > 0 {
+                val dm = loadManifest(joinPath(p, "sinter.toml"))
+                if dm.deps.size() > 0 { treeInto(dm, p, depth + 1, seen) }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fun cmdTree(): i64 {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    writeLine(m.name + " " + m.version)
+    val seen = List<str>()
+    seen.add(m.name)
+    treeInto(m, root, 1, seen)
+    ret 0
+}
+
+fun writeLock(): i64 {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    var out = "# generated by sinter; do not edit\n"
+    out = out + "[package]\nname = \"" + m.name + "\"\nversion = \"" + m.version + "\"\n\n[dependencies]\n"
+    var i: i64 = 0
+    while i < m.deps.size() {
+        out = out + m.deps.get(i).name + " = \"" + installedVersion(m.deps.get(i).name, m.deps.get(i).version) + "\"\n"
+        i = i + 1
+    }
+    writeText(joinPath(root, "sinter.lock"), out)
+    writeLine("wrote sinter.lock")
+    ret 0
+}
+
+fun depLineName(line: str): str {
+    val t = trim(line)
+    val eq = t.indexOf("=")
+    if eq <= 0 { ret "" }
+    ret unquote(t.substring(0, eq))
+}
+
+fun cmdAdd(arg: str): i64 {
+    var name = cloneText(arg)
+    var ver = "*"
+    val at = name.indexOf("@")
+    if at > 0 {
+        ver = name.substring(at + 1, name.length())
+        name = name.substring(0, at)
+    }
+    val root = cwdPath()
+    val path = joinPath(root, "sinter.toml")
+    if !std.file.exists(path) { writeErrLine("sinter: sinter.toml not found"); ret 1 }
+    var text = readText(path)
+    if text.indexOf(name + " =") >= 0 { writeLine("dependency already present: " + name); ret 0 }
+    val hdr = text.indexOf("[dependencies]")
+    if hdr < 0 {
+        text = text + "\n[dependencies]\n" + name + " = \"" + ver + "\"\n"
+    } else {
+        var e = hdr + 14
+        while e < text.length() && text.at(e) != 10 { e = e + 1 }
+        if e < text.length() { e = e + 1 }
+        text = text.substring(0, e) + name + " = \"" + ver + "\"\n" + text.substring(e, text.length())
+    }
+    writeText(path, text)
+    writeLine("added " + name + " " + ver)
+    ret 0
+}
+
+fun cmdRemove(name: str): i64 {
+    val root = cwdPath()
+    val path = joinPath(root, "sinter.toml")
+    if !std.file.exists(path) { writeErrLine("sinter: sinter.toml not found"); ret 1 }
+    val lines = split(readText(path), "\n")
+    var out = ""
+    var inDeps = false
+    var i: i64 = 0
+    while i < lines.size() {
+        val t = trim(lines.get(i))
+        if t.startsWith("[") { inDeps = t == "[dependencies]" }
+        if !(inDeps && depLineName(t) == name) {
+            out = out + lines.get(i)
+            if i + 1 < lines.size() { out = out + "\n" }
+        }
+        i = i + 1
+    }
+    writeText(path, out)
+    writeLine("removed " + name)
+    ret 0
+}
+
+fun cmdList(): i64 {
+    val base = joinPath(sinterHome(), "packages")
+    val names = listDir(base)
+    var i: i64 = 0
+    while i < names.size {
+        val n = names.get(i)
+        if n.length() > 0 && n.at(0) != 46 {
+            val vs = listDir(joinPath(base, n))
+            writeLine(n + " " + vs.size)
+        }
+        i = i + 1
+    }
+    ret 0
+}
+
+fun cmdSearch(key: str): i64 {
+    val base = joinPath(sinterHome(), "packages")
+    val names = listDir(base)
+    var i: i64 = 0
+    while i < names.size {
+        val n = names.get(i)
+        if n.indexOf(key) >= 0 { writeLine(n) }
+        i = i + 1
+    }
+    ret 0
+}
+
+fun cmdFormat(args: List<str>): i64 {
+    if args.size() < 2 {
+        writeErrLine("usage: sinter fmt <file>...")
+        ret 1
+    }
+    var i: i64 = 1
+    while i < args.size() {
+        val path = args.get(i)
+        if !exists(path) || !isFile(path) {
+            writeErrLine("sinter: no such file: " + path)
+            ret 1
+        }
+        val text = readText(path)
+        if !writeText(path, formatSinter(text)) {
+            writeErrLine("sinter: cannot write " + path)
+            ret 1
+        }
+        i = i + 1
+    }
+    ret 0
+}
+
+fun usage(): void {
+    writeLine("sinter " + version() + " - Sinter package manager")
+    writeLine("")
+    writeLine("usage: sinter <command> [args]")
+    writeLine("  init [name]                 create sinter.toml and src/main.sinter")
+    writeLine("  build [--run] [--debug|--release] [--opt 0..3|s|z] [-j[N]] [--cstd <std>]")
+    writeLine("  emit-c [dir]                emit per-module C sources and headers")
+    writeLine("  emit-cmake [dir]            emit a CMakeLists.txt for those sources")
+    writeLine("  tree                        print the dependency tree")
+    writeLine("  install                     resolve dependencies and write sinter.lock")
+    writeLine("  add <package>[@version]     add a dependency")
+    writeLine("  remove <package>            remove a dependency")
+    writeLine("  list                        list installed packages")
+    writeLine("  search <keyword>            search installed packages")
+    writeLine("  info                        print the resolved manifest")
+    writeLine("  clean                       remove build/")
+    writeLine("  fmt <file>...               format Sinter sources in place")
+    writeLine("  --version | --help")
+    writeLine("")
+    writeLine("environment: SINTERC, CC, SINTER_CMAKE, SINTER_TARGET, SINTER_ZIG")
+    writeLine("            SINTER_BUILD_DIR, SINTER_HOME, SINTER_CSTD, SINTER_OPT, SINTER_JOBS")
+}
+
+fun optFlag(opt: str): str {
+    if opt == "0" { ret "-O0" }
+    if opt == "1" { ret "-O1" }
+    if opt == "3" { ret "-O3" }
+    if opt == "s" { ret "-Os" }
+    if opt == "z" { ret "-Oz" }
+    if opt == "g" { ret "-Og" }
+    ret "-O2"
+}
+
+fun cstd(): str {
+    val v = envOr("SINTER_CSTD", "c99")
+    ret v
+}
+
+fun compiler(): str => envOr("SINTERC", "sinterc")
+fun targetTriple(): str => envOr("SINTER_TARGET", "")
+fun isWindowsTarget(t: str): bool => t.indexOf("windows") >= 0 || t.indexOf("mingw") >= 0
+fun isAppleTarget(t: str): bool => t.indexOf("darwin") >= 0 || t.indexOf("macos") >= 0
+
+fun cmakeWorks(cmd: str): bool {
+    val probe = "/tmp/sinter-cmake-probe.txt"
+    if runCmd(shq(cmd) + " --version > " + shq(probe) + " 2>&1") != 0 { ret false }
+    if !std.file.exists(probe) { ret false }
+    val text = readText(probe)
+    if text.indexOf("CMake Error") >= 0 { ret false }
+    if text.indexOf("CMAKE_ROOT") >= 0 { ret false }
+    val lines = split(text, "\n")
+    if lines.size() == 0 { ret false }
+    ret trim(lines.get(0)).startsWith("cmake version")
+}
+
+fun cmakeCommand(): str {
+    val override = envOr("SINTER_CMAKE", "")
+    if override.length() > 0 && cmakeWorks(override) { ret override }
+    val home = envOr("HOME", "")
+    if home.length() > 0 {
+        val local = joinPath(joinPath(home, ".local"), "bin/cmake")
+        if cmakeWorks(local) { ret local }
+        val clion = home + "/.local/share/JetBrains/Toolbox/apps/clion/bin/cmake/linux/x64/bin/cmake"
+        if cmakeWorks(clion) { ret clion }
+    }
+    if cmakeWorks("/usr/local/bin/cmake") { ret "/usr/local/bin/cmake" }
+    if cmakeWorks("cmake") { ret "cmake" }
+    ret ""
+}
+
+fun cCompilerPath(): str {
+    if targetTriple().length() > 0 { ret envOr("SINTER_ZIG", "zig") }
+    ret envOr("CC", "cc")
+}
+
+fun cCompilerFlags(): str {
+    val t = targetTriple()
+    if t.length() > 0 { ret "-target " + shq(t) }
+    ret ""
+}
+
+fun parseJobs(s: str): i64 {
+    var n: i64 = 0
+    var i: i64 = 0
+    while i < s.length() {
+        val c = s.at(i)
+        if c < 48 || c > 57 { ret 0 }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    ret n
+}
+
+fun artifactName(name: str): str {
+    if isWindowsTarget(targetTriple()) { ret name + ".exe" }
+    ret name
+}
+
+fun buildDir(root: str): str {
+    val d = envOr("SINTER_BUILD_DIR", "build/cmake")
+    if d.startsWith("/") { ret d }
+    ret joinPath(root, d)
+}
+fun genDir(root: str): str => joinPath(buildDir(root), "gen")
+
+fun safeName(m: str): str {
+    var out = ""
+    var i: i64 = 0
+    while i < m.length() {
+        if m.at(i) == 46 { out = out + "_" } else { out = out + m.substring(i, i + 1) }
+        i = i + 1
+    }
+    ret out
+}
+
+fun generatedC(dir: str, name: str): str {
+    val sm = joinPath(dir, "sources.cmake")
+    if std.file.exists(sm) {
+        val lines = split(readText(sm), "\n")
+        var li: i64 = 0
+        while li < lines.size() {
+            val line = lines.get(li)
+            if line.indexOf(".c\"") >= 0 && line.indexOf("sinter_runtime.c") < 0 {
+                val a = line.indexOf("\"")
+                if a >= 0 { ret line.substring(a + 1, line.lastIndexOf("\"")) }
+            }
+            li = li + 1
+        }
+    }
+    val cand = joinPath(dir, "sinter_" + safeName(name) + ".c")
+    if std.file.exists(cand) { ret cand }
+    val fs = listDir(dir)
+    var i: i64 = 0
+    while i < fs.size {
+        val f = fs.get(i)
+        if f.startsWith("sinter_") && f.endsWith(".c") && f != "sinter_runtime.c" { ret joinPath(dir, f) }
+        i = i + 1
+    }
+    ret cand
+}
+
+fun writeTextIfChanged(path: str, text: str): void {
+    if std.file.exists(path) && readText(path) == text { ret }
+    writeText(path, text)
+}
+
+fun resolveGeneratedSource(dir: str, p: str): str {
+    if p.startsWith("/") { ret p }
+    val marker = "$" + "{CMAKE_CURRENT_LIST_DIR}/"
+    if p.startsWith(marker) { ret joinPath(dir, p.substring(marker.length(), p.length())) }
+    ret joinPath(dir, p)
+}
+
+fun generatedSources(dir: str): List<str> {
+    val out = List<str>()
+    val sm = joinPath(dir, "sources.cmake")
+    if std.file.exists(sm) {
+        val lines = split(readText(sm), "\n")
+        var li: i64 = 0
+        while li < lines.size() {
+            val line = lines.get(li)
+            if line.indexOf(".c\"") >= 0 {
+                val a = line.indexOf("\"")
+                val b = line.lastIndexOf("\"")
+                if a >= 0 && b > a {
+                    val p = resolveGeneratedSource(dir, line.substring(a + 1, b))
+                    if std.file.exists(p) && out.indexOf(p) < 0 { out.add(p) }
+                }
+            }
+            li = li + 1
+        }
+    }
+    if out.size() == 0 {
+        val cand = generatedC(dir, "")
+        if std.file.exists(cand) { out.add(cand) }
+    }
+    ret out
+}
+
+fun collectSinterFiles(dir: str, out: List<str>): void {
+    if !std.file.exists(dir) || !std.file.isDir(dir) { ret }
+    val count = std.file.countEntries(dir)
+    var i: i64 = 0
+    while i < count {
+        val e = std.file.sortedEntryAt(dir, i)
+        if e.length() > 0 {
+            val p = joinPath(dir, e)
+            if std.file.isDir(p) {
+                if e != "build" && e != ".git" { collectSinterFiles(p, out) }
+            } else if p.endsWith(".sinter") {
+                if out.indexOf(p) < 0 { out.add(cloneText(p)) }
+            }
+        }
+        i = i + 1
+    }
+}
+
+fun cacheSignature(root: str, m: Manifest, debug: bool, stdName: str, incs: List<str>): str {
+    var sig = "sinter-cache-v1\n"
+    sig = sig + "compiler=" + compiler() + "\n"
+    sig = sig + "compiler-mtime=" + fromInt(std.file.modifiedAt(compiler())) + "\n"
+    sig = sig + "entry=" + joinPath(root, m.entry) + "\n"
+    sig = sig + "manifest=" + fromInt(std.file.modifiedAt(joinPath(root, "sinter.toml"))) + "\n"
+    sig = sig + "version=" + m.version + "\n"
+    sig = sig + "artifact=" + m.artifact + "\n"
+    sig = sig + "debug=" + (debug ? "1" : "0") + "\n"
+    sig = sig + "cstd=" + stdName + "\n"
+    sig = sig + "target=" + targetTriple() + "\n"
+    var i: i64 = 0
+    while i < incs.size() {
+        sig = sig + "inc=" + incs.get(i) + "\n"
+        i = i + 1
+    }
+    val files = List<str>()
+    collectSinterFiles(root, files)
+    i = 0
+    while i < incs.size() {
+        val inc = incs.get(i)
+        if inc.startsWith("/") && inc != root { collectSinterFiles(inc, files) }
+        i = i + 1
+    }
+    i = 0
+    while i < files.size() {
+        val p = files.get(i)
+        sig = sig + "src=" + p + ":" + fromInt(std.file.modifiedAt(p))
+        sig = sig + ":" + fromInt(std.file.sizeOf(p)) + "\n"
+        i = i + 1
+    }
+    ret sig
+}
+
+fun cacheUpToDate(dir: str, sig: str, srcs: List<str>): bool {
+    val cf = joinPath(dir, "compile-cache.txt")
+    if !std.file.exists(cf) { ret false }
+    if readText(cf) != sig { ret false }
+    if srcs.size() == 0 { ret false }
+    var i: i64 = 0
+    while i < srcs.size() {
+        if !std.file.exists(srcs.get(i)) { ret false }
+        i = i + 1
+    }
+    ret true
+}
+
+fun cmakeSources(base: str, srcs: List<str>): str {
+    var out = ""
+    var i: i64 = 0
+    while i < srcs.size() {
+        out = out + " \"" + "$" + "{CMAKE_CURRENT_LIST_DIR}/" + relPath(base, srcs.get(i)) + "\""
+        i = i + 1
+    }
+    ret out
+}
+
+fun inputsUpToDate(artifact: str, inputs: List<str>): bool {
+    if !std.file.exists(artifact) { ret false }
+    val art = std.file.modifiedAt(artifact)
+    var i: i64 = 0
+    while i < inputs.size() {
+        val p = inputs.get(i)
+        if std.file.exists(p) {
+            if std.file.modifiedAt(p) > art { ret false }
+        }
+        i = i + 1
+    }
+    ret true
+}
+
+fun compileEntry(root: str, m: Manifest, outDir: str, debug: bool, stdName: str, incs: List<str>): i64 {
+    std.file.mkdirs(outDir)
+    var cmd = shq(compiler()) + " " + shq(joinPath(root, m.entry)) + " -o " + shq(outDir) + " --emit-sources-list " + shq(joinPath(outDir, "sources.cmake"))
+    var i: i64 = 0
+    while i < incs.size() {
+        cmd = cmd + " -I " + shq(incs.get(i))
+        i = i + 1
+    }
+    ret runCmd(cmd)
+}
+
+fun cstdNumber(s: str): str {
+    if s == "c99" || s == "gnu99" { ret "99" }
+    if s == "c11" || s == "gnu11" { ret "11" }
+    if s == "c17" || s == "gnu17" { ret "17" }
+    if s == "c23" || s == "gnu23" { ret "23" }
+    ret "99"
+}
+
+/// 无条件或条件块里的 link 设置，统一发射到真实工程 target。
+fun linkSpecText(name: str, subs: List<str>, libs: List<str>, incs: List<str>, defs: List<str>, opts: List<str>, root: str, base: str, tag: str): str {
+    var out = ""
+    val csDir = "$" + "{CMAKE_CURRENT_SOURCE_DIR}"
+    val cbDir = "$" + "{CMAKE_CURRENT_BINARY_DIR}"
+    val cmakeListDir = "$" + "{CMAKE_CURRENT_LIST_DIR}"
+    val rootPrefix = cmakeListDir + "/" + trimTrailingSlash(relPath(base, root))
+    var i: i64 = 0
+    while i < subs.size() {
+        out = out + "add_subdirectory(" + cmakeRel(base, root, subs.get(i)) + " "
+        out = out + "$" + "{CMAKE_CURRENT_BINARY_DIR}/deps/" + tag + "_" + i + ")\n"
+        i = i + 1
+    }
+    i = 0
+    while i < incs.size() {
+        var inc = incs.get(i)
+        inc = inc.replace(csDir, rootPrefix)
+        inc = inc.replace(cbDir, cmakeListDir)
+        if inc.indexOf("$" + "{") < 0 { inc = cmakeRel(base, root, inc) }
+        out = out + "target_include_directories(" + name + " PUBLIC " + inc + ")\n"
+        i = i + 1
+    }
+    i = 0
+    while i < libs.size() {
+        out = out + "target_link_libraries(" + name + " PUBLIC " + libs.get(i) + ")\n"
+        i = i + 1
+    }
+    i = 0
+    while i < defs.size() {
+        out = out + "target_compile_definitions(" + name + " PRIVATE " + defs.get(i) + ")\n"
+        i = i + 1
+    }
+    i = 0
+    while i < opts.size() {
+        out = out + "target_link_options(" + name + " PRIVATE " + opts.get(i) + ")\n"
+        i = i + 1
+    }
+    ret out
+}
+
+fun writeCMake(bd: str, name: str, srcs: List<str>, stdName: str, opt: str, m: Manifest, root: str): void {
+    var cm = "cmake_minimum_required(VERSION 3.20)\n"
+    cm = cm + "project(" + name + " VERSION " + m.version + " LANGUAGES C)\n"
+    cm = cm + "add_compile_definitions(SINTER_VERSION_STRING=\\\"" + m.version + "\\\")\n"
+    cm = cm + "set(CMAKE_C_STANDARD " + cstdNumber(stdName) + ")\n"
+    cm = cm + "set(CMAKE_C_STANDARD_REQUIRED ON)\n"
+    cm = cm + "set(CMAKE_C_EXTENSIONS OFF)\n"
+    cm = cm + "set(CMAKE_C_FLAGS_RELEASE \"" + (opt == "0" ? "-O0" : optFlag(opt) + " -DNDEBUG") + "\")\n"
+    cm = cm + "add_executable(" + name
+    var si: i64 = 0
+    while si < srcs.size() {
+        cm = cm + " \"" + "$" + "{CMAKE_CURRENT_LIST_DIR}/" + relPath(bd, srcs.get(si)) + "\""
+        si = si + 1
+    }
+    cm = cm + ")\n"
+
+    cm = cm + linkSpecText(name, m.subdirs, m.libs, m.includes, m.defs, m.options, root, bd, "link")
+    var ci: i64 = 0
+    while ci < m.conds.size() {
+        val ce = m.conds.get(ci)
+        val cb = m.condBlobs.get(ci)
+        cm = cm + "if(" + ce + ")\n"
+        cm = cm + linkSpecText(name, parseArray(cb, "subdirs"), parseArray(cb, "libs"),
+                               parseArray(cb, "includes"), condDefs(cb),
+                               parseAllArrays(cb, "options"), root, bd, "cond" + ci)
+        cm = cm + "endif()\n"
+        ci = ci + 1
+    }
+    var li: i64 = 0
+    while li < m.deps.size() {
+        val d = m.deps.get(li)
+        if d.source.startsWith("path:") {
+            val p = d.source.substring(5, d.source.length())
+            val dp = p.startsWith("/") ? p : joinPath(root, p)
+            if isCMakeDep(dp) {
+                val tgt = d.target.length() > 0 ? d.target : d.name
+                val depSrc = cmakeRel(bd, root, p)
+                val depCond = d.cond
+                if depCond.length() > 0 { cm = cm + "if(" + depCond + ")\n" }
+                cm = cm + "if(NOT TARGET " + tgt + ")\n"
+                cm = cm + "    add_subdirectory(" + depSrc + " "
+                cm = cm + "$" + "{CMAKE_CURRENT_BINARY_DIR}/deps/" + d.name + ")\n"
+                cm = cm + "endif()\n"
+                cm = cm + "target_link_libraries(" + name + " PUBLIC " + tgt + ")\n"
+                if depCond.length() > 0 { cm = cm + "endif()\n" }
+            }
+        }
+        li = li + 1
+    }
+    if m.artifact != "header" {
+        cm = cm + platformLinkText(name)
+        if targetTriple().length() == 0 { cm = cm + stripBlock(name) }
+    }
+    writeTextIfChanged(joinPath(bd, "CMakeLists.txt"), cm)
+}
+
+fun buildProject(runAfter: bool, debug: bool, stdName: str, opt: str, incs: List<str>, jobs: i64): i64 {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    val version = m.version.length() > 0 ? m.version : projectVersion()
+    if version.length() == 0 {
+        writeErrLine("sinter: version is empty (use version = \"file:version.txt\" or SINTER_VERSION)")
+        ret 1
+    }
+    if !std.file.exists(joinPath(root, m.entry)) {
+        writeErrLine("sinter: entry not found: " + m.entry)
+        ret 1
+    }
+    val gd = genDir(root)
+    std.file.mkdirs(gd)
+    writeLine("[sinter] " + m.name + " " + m.version)
+    val sig = cacheSignature(root, m, debug, stdName, incs)
+    if !cacheUpToDate(gd, sig, generatedSources(gd)) {
+        if compileEntry(root, m, gd, debug, stdName, incs) != 0 {
+            writeErrLine("sinter: sinterc failed")
+            ret 1
+        }
+        writeTextIfChanged(joinPath(gd, "compile-cache.txt"), sig)
+    } else {
+        writeLine("  (compile cache hit)")
+    }
+    val srcs = generatedSources(gd)
+    if srcs.size() == 0 {
+        writeErrLine("sinter: no generated C sources")
+        ret 1
+    }
+    val bd = buildDir(root)
+    std.file.mkdirs(bd)
+    writeCMake(bd, m.name, srcs, stdName, opt, m, root)
+    val inputs = List<str>()
+    var i: i64 = 0
+    while i < srcs.size() {
+        inputs.add(srcs.get(i))
+        i = i + 1
+    }
+    inputs.add(joinPath(bd, "CMakeLists.txt"))
+    inputs.add(joinPath(root, "sinter.toml"))
+
+    val cm = cmakeCommand()
+    if cm.length() == 0 {
+        writeErrLine("sinter: no working cmake found (set SINTER_CMAKE)")
+        ret 1
+    }
+
+    var stamp = "cmake=" + cm + "\ncc=" + cCompilerPath() + "\nflags=" + cCompilerFlags()
+    stamp = stamp + "\nstd=" + stdName + "\nopt=" + opt
+    stamp = stamp + "\ndebug=" + (debug ? "1" : "0") + "\nversion=" + version
+    stamp = stamp + "\ntarget=" + targetTriple() + "\ngen=" + shq(gd) + "\n"
+    i = 0
+    while i < m.includes.size() { stamp = stamp + "inc=" + m.includes.get(i) + "\n"; i = i + 1 }
+    i = 0
+    while i < m.defs.size() { stamp = stamp + "def=" + m.defs.get(i) + "\n"; i = i + 1 }
+    val stampPath = joinPath(bd, "build-options.txt")
+    writeTextIfChanged(stampPath, stamp)
+    inputs.add(stampPath)
+
+    if m.artifact == "header" {
+        writeLine("header package: nothing to build")
+        ret 0
+    }
+
+    var artifact = joinPath(bd, "lib" + m.name + ".a")
+    if m.artifact != "static" { artifact = joinPath(bd, artifactName(m.name)) }
+    if inputsUpToDate(artifact, inputs) {
+        writeLine("up to date: " + artifact)
+        if runAfter && m.artifact != "static" {
+            writeLine("---- run ----")
+            ret runCmd(shq(artifact))
+        }
+        ret 0
+    }
+
+    var cfg = shq(cm) + " -S " + shq(bd) + " -B " + shq(bd)
+    cfg = cfg + " -DCMAKE_BUILD_TYPE=" + (debug ? "Debug" : "Release")
+    cfg = cfg + " -DCMAKE_C_COMPILER=" + shq(cCompilerPath())
+    cfg = cfg + " -DCMAKE_C_FLAGS_DEBUG=" + shq("-g -O0")
+    val cflags = cCompilerFlags()
+    if cflags.length() > 0 { cfg = cfg + " -DCMAKE_C_FLAGS=" + shq(cflags) }
+    val t = targetTriple()
+    if t.length() > 0 {
+        cfg = cfg + " -DSINTER_TARGET=" + shq(t)
+        cfg = cfg + " -DCMAKE_C_COMPILER_ARG1=cc"
+        var sys = "Linux"
+        if isWindowsTarget(t) { sys = "Windows" }
+        else if isAppleTarget(t) { sys = "Darwin" }
+        cfg = cfg + " -DCMAKE_SYSTEM_NAME=" + shq(sys)
+        val dash = t.indexOf("-")
+        if dash > 0 { cfg = cfg + " -DCMAKE_SYSTEM_PROCESSOR=" + shq(t.substring(0, dash)) }
+    }
+    if runCmd(cfg) != 0 {
+        writeErrLine("sinter: cmake configure failed")
+        ret 1
+    }
+
+    var buildCmd = shq(cm) + " --build " + shq(bd)
+    if jobs > 0 { buildCmd = buildCmd + " --parallel " + fromInt(jobs) }
+    if runCmd(buildCmd) != 0 {
+        writeErrLine("sinter: cmake build failed")
+        ret 1
+    }
+
+    if !std.file.exists(artifact) && artifactName(m.name).endsWith(".exe") {
+        val alt = joinPath(bd, m.name)
+        if std.file.exists(alt) { artifact = alt }
+    }
+    writeLine("generated " + artifact)
+    if runAfter && m.artifact != "static" {
+        writeLine("---- run ----")
+        ret runCmd(shq(artifact))
+    }
+    ret 0
+}
+
+fun emitC(outDir: str, debug: bool, stdName: str, incs: List<str>): i64 {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    var d = outDir
+    if d.length() == 0 { d = buildDir(root) }
+    if !d.startsWith("/") { d = joinPath(root, d) }
+    std.file.mkdirs(d)
+    val sig = cacheSignature(root, m, debug, stdName, incs)
+    if !cacheUpToDate(d, sig, generatedSources(d)) {
+        if compileEntry(root, m, d, debug, stdName, incs) != 0 { ret 1 }
+        writeTextIfChanged(joinPath(d, "compile-cache.txt"), sig)
+    } else {
+        writeLine("  (compile cache hit)")
+    }
+    writeLine("wrote " + joinPath(d, "sources.cmake"))
+    ret 0
+}
+
+fun emitCMake(outDir: str, stdName: str, opt: str, incs: List<str>): i64 {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    var d = outDir
+    if d.length() == 0 { d = buildDir(root) }
+    if !d.startsWith("/") { d = joinPath(root, d) }
+    std.file.mkdirs(d)
+    val sig = cacheSignature(root, m, false, stdName, incs)
+    if !cacheUpToDate(d, sig, generatedSources(d)) {
+        if compileEngine(root, m, d, incs) != 0 { ret 1 }
+        writeTextIfChanged(joinPath(d, "compile-cache.txt"), sig)
+    } else {
+        writeLine("  (compile cache hit)")
+    }
+    val srcs = generatedSources(d)
+    if srcs.size() == 0 {
+        writeErrLine("sinter: no generated C sources")
+        ret 1
+    }
+    val sourceText = cmakeSources(d, srcs)
+    var cm = "cmake_minimum_required(VERSION 3.20)\n"
+    cm = cm + "project(" + m.name + " VERSION " + m.version + " LANGUAGES C)\n"
+    cm = cm + "add_compile_definitions(SINTER_VERSION_STRING=\\\"" + m.version + "\\\")\n"
+    cm = cm + "set(CMAKE_C_STANDARD " + cstdNumber(stdName) + ")\n"
+    cm = cm + "set(CMAKE_C_STANDARD_REQUIRED ON)\n"
+    cm = cm + "set(CMAKE_C_EXTENSIONS OFF)\n"
+    cm = cm + "set(CMAKE_C_FLAGS_RELEASE \"" + (opt == "0" ? "-O0" : optFlag(opt) + " -DNDEBUG") + "\")\n"
+    cm = cm + "set(SINTER_GENERATED_SOURCES" + sourceText + ")\n"
+    if m.artifact == "static" {
+        cm = cm + "add_library(" + m.name + " STATIC " + "$" + "{SINTER_GENERATED_SOURCES})\n"
+    } else if m.artifact != "header" {
+        cm = cm + "add_executable(" + m.name + " " + "$" + "{SINTER_GENERATED_SOURCES})\n"
+    }
+    cm = cm + linkSpecText(m.name, m.subdirs, m.libs, m.includes, m.defs, m.options, root, d, "link")
+    var ei: i64 = 0
+    while ei < m.conds.size() {
+        val ce = m.conds.get(ei)
+        val cb = m.condBlobs.get(ei)
+        cm = cm + "if(" + ce + ")\n"
+        cm = cm + linkSpecText(m.name, parseArray(cb, "subdirs"), parseArray(cb, "libs"),
+                               parseArray(cb, "includes"), condDefs(cb),
+                               parseAllArrays(cb, "options"), root, d, "cond" + ei)
+        cm = cm + "endif()\n"
+        ei = ei + 1
+    }
+    if m.artifact != "header" {
+        cm = cm + platformLinkText(m.name)
+        if targetTriple().length() == 0 { cm = cm + stripBlock(m.name) }
+    }
+    writeTextIfChanged(joinPath(d, "CMakeLists.txt"), cm)
+    writeLine("wrote " + joinPath(d, "CMakeLists.txt"))
+    ret 0
+}
+
+fun compileEngine(root: str, m: Manifest, outC: str, incs: List<str>): i64 {
+    ret compileEntry(root, m, outC, false, cstd(), incs)
+}
+
+fun printInfo(): void {
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    val incs = List<str>()
+    collectIncludes(m, root, incs)
+    writeLine("name: " + m.name)
+    writeLine("version: " + m.version)
+    writeLine("entry: " + m.entry)
+    writeLine("artifact: " + m.artifact)
+    if m.cstd.length() > 0 { writeLine("cstd: " + m.cstd) }
+    if m.opt.length() > 0 { writeLine("opt: " + m.opt) }
+    if m.target.length() > 0 { writeLine("target: " + m.target) }
+    writeLine("dependencies: " + fromInt(m.deps.size()))
+    var i: i64 = 0
+    while i < m.deps.size() {
+        writeLine("  " + m.deps.get(i).name + " " + m.deps.get(i).version + " " + m.deps.get(i).source)
+        i = i + 1
+    }
+    i = 0
+    while i < incs.size() {
+        writeLine("include: " + incs.get(i))
+        i = i + 1
+    }
+}
+
+fun cleanBuild(): i64 {
+    val root = cwdPath()
+    ret runCmd("rm -rf " + shq(joinPath(root, "build")))
+}
+
+fun initProject(name: str): i64 {
+    var dir = name
+    if dir.length() == 0 { dir = "myapp" }
+    val root = cwdPath()
+    val base = joinPath(root, dir)
+    var ver = projectVersion()
+    if ver.length() == 0 { ver = "0.1.0" }
+    std.file.mkdirs(joinPath(base, "src"))
+    val toml = "[package]\nname = \"" + dir + "\"\nversion = \"file:version.txt\"\nentry = \"src/main.sinter\"\nartifact = \"exe\"\n\n[dependencies]\nstd = \"*\"\n"
+    writeText(joinPath(base, "sinter.toml"), toml)
+    writeText(joinPath(base, "version.txt"), ver + "\n")
+    writeText(joinPath(base, "src/main.sinter"), "module main\n\nimport std\n\nfun main(): void {\n    println(\"hello, sinter\")\n}\n")
+    writeLine("created " + dir)
+    ret 0
+}
+
+fun main(argc: i32, argv: **u8): i32 {
+    val args = List<str>()
+    var i: i32 = 1
+    while i < argc {
+        args.add(fromCStr(argv[i]))
+        i = i + 1
+    }
+    if args.size() == 0 { usage(); ret 1 }
+    val cmd = args.get(0)
+    if cmd == "--version" || cmd == "-V" { writeLine("sinter " + version()); ret 0 }
+    if cmd == "--help" || cmd == "-h" || cmd == "help" { usage(); ret 0 }
+    if cmd == "init" { ret initProject(args.size() > 1 ? args.get(1) : "") as i32 }
+    if cmd == "clean" { ret cleanBuild() as i32 }
+    if cmd == "fmt" || cmd == "format" { ret cmdFormat(args) as i32 }
+    if cmd == "info" { printInfo(); ret 0 }
+    if cmd == "tree" { ret cmdTree() as i32 }
+    if cmd == "install" { ret writeLock() as i32 }
+    if cmd == "add" {
+        if args.size() < 2 { writeErrLine("usage: sinter add <package>[@version]"); ret 1 }
+        ret cmdAdd(args.get(1)) as i32
+    }
+    if cmd == "remove" {
+        if args.size() < 2 { writeErrLine("usage: sinter remove <package>"); ret 1 }
+        ret cmdRemove(args.get(1)) as i32
+    }
+    if cmd == "list" { ret cmdList() as i32 }
+    if cmd == "search" {
+        if args.size() < 2 { writeErrLine("usage: sinter search <keyword>"); ret 1 }
+        ret cmdSearch(args.get(1)) as i32
+    }
+
+    val root = cwdPath()
+    val m = loadManifest(joinPath(root, "sinter.toml"))
+    val incs = List<str>()
+    collectIncludes(m, root, incs)
+
+    if cmd == "build" {
+        var runAfter = false
+        var debug = false
+        var stdName = cstd()
+        var opt = m.opt
+        var jobs = parseJobs(envOr("SINTER_JOBS", "0"))
+        if opt.length() == 0 { opt = envOr("SINTER_OPT", "2") }
+        if m.cstd.length() > 0 { stdName = m.cstd }
+        var k: i64 = 1
+        while k < args.size() {
+            val a = args.get(k)
+            if a == "--run" { runAfter = true }
+            else if a == "--debug" { debug = true; opt = "0" }
+            else if a == "--release" { debug = false; opt = "3" }
+            else if a == "--opt" && k + 1 < args.size() { opt = args.get(k + 1); k = k + 1 }
+            else if a.startsWith("--opt=") { opt = a.substring(6, a.length()) }
+            else if a == "--cstd" && k + 1 < args.size() { stdName = args.get(k + 1); k = k + 1 }
+            else if a == "-j" && k + 1 < args.size() { jobs = parseJobs(args.get(k + 1)); k = k + 1 }
+            else if a.startsWith("-j") { jobs = parseJobs(a.substring(2, a.length())) }
+            else if a == "--jobs" && k + 1 < args.size() { jobs = parseJobs(args.get(k + 1)); k = k + 1 }
+            else if a.startsWith("--jobs=") { jobs = parseJobs(a.substring(7, a.length())) }
+            k = k + 1
+        }
+        ret buildProject(runAfter, debug, stdName, opt, incs, jobs) as i32
+    }
+    if cmd == "emit-c" {
+        var outDir = ""
+        if args.size() > 1 { outDir = args.get(1) }
+        ret emitC(outDir, false, cstd(), incs) as i32
+    }
+    if cmd == "emit-cmake" {
+        var outDir = ""
+        if args.size() > 1 { outDir = args.get(1) }
+        ret emitCMake(outDir, cstd(), m.opt.length() > 0 ? m.opt : envOr("SINTER_OPT", "2"), incs) as i32
+    }
+    writeErrLine("sinter: unknown command '" + cmd + "'")
+    usage()
+    ret 1
+}

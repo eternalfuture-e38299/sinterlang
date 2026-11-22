@@ -1,0 +1,71 @@
+module ziplib
+import std
+import zip
+
+fun main(): void {
+    val z = readText("fixture.zip")
+    println(zipCount(z))
+    println(zipNames(z))
+    println(zipGet(z, "hello.txt"))
+    println(zipContains(z, "hello.txt"))
+
+    val w = ZipWriter()
+    w.add("a.txt", "alpha")
+    w.add("b.txt", "beta\n")
+    val out = w.finish()
+    writeText("out.zip", out)
+    println(zipGet(out, "a.txt"))
+    println(zipCount(out))
+
+    val sw = ZipWriter()
+    println(sw.begin("stream.zip"))
+    sw.add("x.txt", "streamed")
+    sw.add("y.txt", "second")
+    println(sw.finishTo())
+
+    val er = ZipReader()
+    println(er.open(readText("stream.zip")))
+    while er.next() {
+        println(er.name())
+        println(er.bytes())
+    }
+
+    val fr = ZipReader()
+    println(fr.openFile("fixture.zip"))
+    while fr.next() {
+        println(fr.name())
+        println(fr.size())
+    }
+    fr.close()
+
+    val big = "Sinter ".repeat(2000)
+    val cw = ZipWriter()
+    cw.add("big.txt", big)
+    val cz = cw.finish()
+    println(zipGet(cz, "big.txt") == big)
+
+    val z64 = readText("fixture64.zip")
+    println(zipCount(z64))
+    println(zipGet(z64, "hello.txt") == readText("fixture.txt"))
+    val r64 = ZipReader()
+    println(r64.openFile("fixture64.zip"))
+    println(r64.next())
+    println(r64.name())
+    r64.close()
+
+    val ez = readText("enc.zip")
+    println(zipGetPassword(ez, "enc.txt", "secret"))
+    val er2 = ZipReader()
+    println(er2.openPassword(ez, "secret"))
+    println(er2.next())
+    println(er2.bytes())
+    er2.close()
+
+    println(zipGet(readText("bz2.zip"), "bz.txt") == readText("bz.txt"))
+    println(zipGet(readText("zstd.zip"), "zstd.txt") == readText("zstd.txt"))
+
+    val zw = ZipWriter()
+    zw.setPassword("pw")
+    zw.add("s.txt", "secret stream")
+    println(zipGetPassword(zw.finish(), "s.txt", "pw"))
+}

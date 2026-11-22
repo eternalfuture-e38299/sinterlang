@@ -1,0 +1,591 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+//
+// Self-hosted Sinter source formatter.  Port of src/format/sinter_format.cpp:
+// only whitespace and line breaks are rewritten; every non-whitespace byte,
+// including strings, comments and `embed C` bodies, is preserved verbatim.
+module sfmt
+
+import std
+import std.list
+
+fun isWordChar(c: i64): bool {
+    if c >= 97 && c <= 122 { ret true }
+    if c >= 65 && c <= 90 { ret true }
+    if c >= 48 && c <= 57 { ret true }
+    ret c == 95
+}
+
+fun isDigit(c: i64): bool => c >= 48 && c <= 57
+
+fun isSuffixChar(c: i64): bool {
+    if c == 102 || c == 70 { ret true }
+    if c == 117 || c == 85 { ret true }
+    if c == 108 || c == 76 { ret true }
+    ret false
+}
+
+fun isRadixPrefix(c: i64): bool {
+    if c == 120 || c == 88 || c == 98 || c == 66 { ret true }
+    ret c == 111 || c == 79
+}
+
+fun isSingleOp(c: i64): bool {
+    if c == 61 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 { ret true }
+    if c == 60 || c == 62 || c == 38 || c == 124 { ret true }
+    ret c == 94 || c == 33 || c == 63 || c == 126
+}
+
+fun isBlank(c: i64): bool => c == 32 || c == 9
+
+fun indentOf(level: i64, width: i64): str {
+    var n = level * width
+    if n < 0 { n = 0 }
+    var out = ""
+    var i: i64 = 0
+    while i < n {
+        out = out + " "
+        i = i + 1
+    }
+    ret out
+}
+
+fun lastOf(s: str): i64 {
+    if s.length() == 0 { ret 0 }
+    ret s.at(s.length() - 1)
+}
+
+fun trailingWord(s: str): str {
+    var end = s.length()
+    while end > 0 && isBlank(s.at(end - 1)) { end = end - 1 }
+    var start = end
+    while start > 0 && isWordChar(s.at(start - 1)) { start = start - 1 }
+    ret s.substring(start, end)
+}
+
+fun expressionStartChar(c: i64): bool {
+    if c == 0 || c == 10 { ret true }
+    if c == 40 || c == 91 || c == 123 || c == 44 || c == 59 || c == 58 { ret true }
+    if c == 61 || c == 43 || c == 45 || c == 42 || c == 47 || c == 37 { ret true }
+    if c == 60 || c == 62 || c == 38 || c == 124 || c == 94 || c == 63 { ret true }
+    if c == 33 || c == 126 { ret true }
+    ret false
+}
+
+fun expressionStartWord(w: str): bool {
+    if w == "ret" || w == "return" || w == "if" || w == "else" { ret true }
+    if w == "while" || w == "for" || w == "when" || w == "in" || w == "is" { ret true }
+    if w == "case" || w == "default" || w == "val" || w == "var" || w == "const" { ret true }
+    if w == "del" || w == "copy" || w == "move" || w == "not" || w == "must" { ret true }
+    if w == "and" || w == "or" { ret true }
+    ret false
+}
+
+fun startsAt(src: str, i: i64, op: str): bool {
+    if i + op.length() > src.length() { ret false }
+    ret src.substring(i, i + op.length()) == op
+}
+
+fun lineHead(s: str): str {
+    var k = s.length()
+    while k > 0 && s.at(k - 1) != 10 { k = k - 1 }
+    ret s.substring(k, s.length())
+}
+
+fun tokenHead(s: str): str {
+    var k = s.length()
+    while k > 0 && s.at(k - 1) != 10 && s.at(k - 1) != 32 { k = k - 1 }
+    ret s.substring(k, s.length())
+}
+
+fun isEmbedHead(head: str): bool {
+    if head.indexOf("embed") < 0 { ret false }
+    ret head.indexOf(" C") >= 0 || head.indexOf("\tC") >= 0
+}
+
+class LineWriter {
+    var out: str
+    var indent_level: i64
+    var indent_size: i64
+    var line_started: bool
+    var want_space: bool
+    var blank_run: i64
+    var blocks: List<i64>
+
+    LineWriter(width: i64) {
+        self.out = ""
+        self.indent_level = 0
+        self.indent_size = width > 0 ? width : 4
+        self.line_started = false
+        self.want_space = false
+        self.blank_run = 0
+        self.blocks = List<i64>()
+    }
+
+    fun lastChar(): i64 => lastOf(self.out)
+
+    fun newline(): void {
+        var i: i64 = 0
+        while i < self.blocks.size() {
+            self.blocks.set(i, 1)
+            i = i + 1
+        }
+        if self.line_started {
+            self.out = self.out + "\n"
+            self.line_started = false
+        } else if self.blank_run < 1 {
+            self.out = self.out + "\n"
+            self.blank_run = self.blank_run + 1
+        }
+        self.want_space = false
+    }
+
+    fun space(): void {
+        if self.line_started { self.want_space = true }
+    }
+
+    fun noSpace(): void {
+        self.want_space = false
+    }
+
+    fun emitIndent(): void {
+        if !self.line_started {
+            self.out = self.out + indentOf(self.indent_level, self.indent_size)
+            self.line_started = true
+            self.blank_run = 0
+            self.want_space = false
+        } else if self.want_space {
+            self.out = self.out + " "
+            self.want_space = false
+        }
+    }
+
+    fun put(text: str): void {
+        if text.length() == 0 { ret }
+        self.emitIndent()
+        self.out = self.out + text
+    }
+
+    fun putRaw(text: str): void {
+        self.put(text)
+    }
+
+    fun finish(): str {
+        var r = self.out
+        while r.length() > 0 {
+            val c = r.at(r.length() - 1)
+            if c == 10 || c == 32 || c == 9 {
+                r = r.substring(0, r.length() - 1)
+            } else {
+                break
+            }
+        }
+        if r.length() > 0 { r = r + "\n" }
+        ret r
+    }
+}
+
+fun boundaryBetweenWords(w: LineWriter): void {
+    val pc = w.lastChar()
+    if pc == 0 || pc == 10 || pc == 32 || pc == 9 { ret }
+    if isWordChar(pc) || pc == 41 || pc == 93 || pc == 34 || pc == 39 { w.space() }
+}
+
+fun isKwBeforeParen(w: str): bool {
+    ret w == "if" || w == "for" || w == "while" || w == "when" || w == "switch" || w == "catch"
+}
+
+fun embedClose(src: str, start: i64): i64 {
+    val n = src.length()
+    var j = start
+    var depth: i64 = 1
+    var in_str = false
+    var in_chr = false
+    var in_lc = false
+    var in_bc = false
+    while j < n && depth > 0 {
+        val d = src.at(j)
+        if in_lc {
+            if d == 10 { in_lc = false }
+            j = j + 1
+            continue
+        }
+        if in_bc {
+            if d == 42 && j + 1 < n && src.at(j + 1) == 47 {
+                in_bc = false
+                j = j + 2
+                continue
+            }
+            j = j + 1
+            continue
+        }
+        if in_str {
+            if d == 92 && j + 1 < n {
+                j = j + 2
+                continue
+            }
+            if d == 34 { in_str = false }
+            j = j + 1
+            continue
+        }
+        if in_chr {
+            if d == 92 && j + 1 < n {
+                j = j + 2
+                continue
+            }
+            if d == 39 { in_chr = false }
+            j = j + 1
+            continue
+        }
+        if d == 47 && j + 1 < n && src.at(j + 1) == 47 {
+            in_lc = true
+            j = j + 2
+            continue
+        }
+        if d == 47 && j + 1 < n && src.at(j + 1) == 42 {
+            in_bc = true
+            j = j + 2
+            continue
+        }
+        if d == 34 {
+            in_str = true
+            j = j + 1
+            continue
+        }
+        if d == 39 {
+            in_chr = true
+            j = j + 1
+            continue
+        }
+        if d == 123 {
+            depth = depth + 1
+            j = j + 1
+            continue
+        }
+        if d == 125 {
+            depth = depth - 1
+            if depth == 0 { break }
+        }
+        j = j + 1
+    }
+    ret j
+}
+
+pub fun formatSinter(src: str): str => formatSinterWith(src, 4)
+
+pub fun formatSinterWith(src: str, tab_size: i64): str {
+    val w = LineWriter(tab_size)
+    val n = src.length()
+    var i: i64 = 0
+    var prev_is_close = false
+    var word_gap = false
+
+    while i < n {
+        val c = src.at(i)
+
+        if c == 10 {
+            w.newline()
+            prev_is_close = false
+            word_gap = false
+            i = i + 1
+            continue
+        }
+        if c == 13 {
+            i = i + 1
+            continue
+        }
+        if c == 32 || c == 9 {
+            word_gap = true
+            i = i + 1
+            continue
+        }
+
+        if c == 47 && i + 1 < n && src.at(i + 1) == 47 {
+            var j = i
+            while j < n && src.at(j) != 10 { j = j + 1 }
+            w.space()
+            w.putRaw(src.substring(i, j))
+            i = j
+            prev_is_close = false
+            continue
+        }
+
+        if c == 47 && i + 1 < n && src.at(i + 1) == 42 {
+            var j = i + 2
+            while j + 1 < n && !(src.at(j) == 42 && src.at(j + 1) == 47) { j = j + 1 }
+            if j + 1 < n { j = j + 2 } else { j = n }
+            val block = src.substring(i, j)
+            w.space()
+            w.putRaw(block)
+            if block.indexOf("\n") >= 0 { w.newline() }
+            prev_is_close = false
+            i = j
+            continue
+        }
+
+        if c == 34 || c == 39 {
+            var j = i + 1
+            while j < n {
+                val d = src.at(j)
+                if d == 92 && j + 1 < n {
+                    j = j + 2
+                    continue
+                }
+                if d == c {
+                    j = j + 1
+                    break
+                }
+                if d == 10 { break }
+                j = j + 1
+            }
+            boundaryBetweenWords(w)
+            w.putRaw(src.substring(i, j))
+            i = j
+            prev_is_close = true
+            word_gap = false
+            continue
+        }
+
+        if c == 123 {
+            val is_embed = isEmbedHead(lineHead(w.out))
+            boundaryBetweenWords(w)
+            w.space()
+            w.put("{")
+            w.indent_level = w.indent_level + 1
+            w.blocks.add(0)
+            i = i + 1
+            prev_is_close = false
+
+            if is_embed {
+                val body_start = i
+                val j = embedClose(src, i)
+                var body = src.substring(body_start, j)
+                if body.length() > 0 && body.at(0) == 10 {
+                    body = body.substring(1, body.length())
+                }
+                while body.length() > 0 {
+                    val b = body.at(body.length() - 1)
+                    if b == 10 || b == 13 {
+                        body = body.substring(0, body.length() - 1)
+                    } else {
+                        break
+                    }
+                }
+                w.newline()
+                if body.length() > 0 {
+                    w.out = w.out + body
+                    w.out = w.out + "\n"
+                }
+                w.line_started = false
+                w.want_space = false
+                if w.indent_level > 0 { w.indent_level = w.indent_level - 1 }
+                i = j
+                w.indent_level = w.indent_level + 1
+                continue
+            }
+            continue
+        }
+
+        if c == 125 {
+            var compact = false
+            if w.blocks.size() > 0 {
+                compact = w.blocks.get(w.blocks.size() - 1) == 0
+                w.blocks.removeLast()
+            }
+            if w.indent_level > 0 { w.indent_level = w.indent_level - 1 }
+            if !compact {
+                if w.line_started { w.newline() }
+                w.noSpace()
+            } else if w.lastChar() == 123 {
+                w.noSpace()
+            } else {
+                w.space()
+            }
+            w.put("}")
+            i = i + 1
+            prev_is_close = true
+
+            var k = i
+            while k < n && isBlank(src.at(k)) { k = k + 1 }
+            var stops = false
+            if k < n {
+                val kc = src.at(k)
+                if kc == 10 || kc == 59 || kc == 44 || kc == 41 || kc == 125 || kc == 46 {
+                    stops = true
+                }
+            }
+            if k < n && (startsAt(src, k, "else") || startsAt(src, k, "while")) {
+                w.space()
+            } else if k < n && !stops {
+                w.space()
+            }
+            continue
+        }
+
+        if c == 59 {
+            w.noSpace()
+            w.put(";")
+            i = i + 1
+            prev_is_close = false
+            w.space()
+            continue
+        }
+
+        if c == 44 {
+            w.noSpace()
+            w.put(",")
+            i = i + 1
+            prev_is_close = false
+            w.space()
+            continue
+        }
+
+        if c == 40 {
+            if isKwBeforeParen(tokenHead(w.out)) { w.space() } else { w.noSpace() }
+            w.put("(")
+            word_gap = false
+            i = i + 1
+            prev_is_close = false
+            continue
+        }
+
+        if c == 41 || c == 93 {
+            w.noSpace()
+            w.put(src.substring(i, i + 1))
+            word_gap = false
+            i = i + 1
+            prev_is_close = true
+            continue
+        }
+
+        if isDigit(c) && !isWordChar(w.lastChar()) {
+            var j = i
+            if c == 48 && j + 1 < n && isRadixPrefix(src.at(j + 1)) {
+                j = j + 2
+                while j < n && (isWordChar(src.at(j)) || src.at(j) == 39) { j = j + 1 }
+            } else {
+                while j < n && (isDigit(src.at(j)) || src.at(j) == 95 || src.at(j) == 39) {
+                    j = j + 1
+                }
+                if j < n && src.at(j) == 46 {
+                    j = j + 1
+                    while j < n && (isDigit(src.at(j)) || src.at(j) == 95 || src.at(j) == 39) {
+                        j = j + 1
+                    }
+                }
+                if j < n && (src.at(j) == 101 || src.at(j) == 69) {
+                    j = j + 1
+                    if j < n && (src.at(j) == 43 || src.at(j) == 45) { j = j + 1 }
+                    while j < n && isDigit(src.at(j)) { j = j + 1 }
+                }
+            }
+            while j < n && isSuffixChar(src.at(j)) { j = j + 1 }
+            boundaryBetweenWords(w)
+            w.putRaw(src.substring(i, j))
+            i = j
+            prev_is_close = true
+            word_gap = false
+            continue
+        }
+
+        var tight: str = ""
+        if startsAt(src, i, "?.") { tight = "?." }
+        else if startsAt(src, i, "::") { tight = "::" }
+        if tight.length() > 0 {
+            w.noSpace()
+            w.putRaw(tight)
+            w.noSpace()
+            word_gap = false
+            i = i + tight.length()
+            prev_is_close = false
+            continue
+        }
+
+        var spaced: str = ""
+        if startsAt(src, i, "==") { spaced = "==" }
+        else if startsAt(src, i, "!=") { spaced = "!=" }
+        else if startsAt(src, i, "<=") { spaced = "<=" }
+        else if startsAt(src, i, ">=") { spaced = ">=" }
+        else if startsAt(src, i, "&&") { spaced = "&&" }
+        else if startsAt(src, i, "||") { spaced = "||" }
+        else if startsAt(src, i, "=>") { spaced = "=>" }
+        else if startsAt(src, i, "->") { spaced = "->" }
+        else if startsAt(src, i, "+=") { spaced = "+=" }
+        else if startsAt(src, i, "-=") { spaced = "-=" }
+        else if startsAt(src, i, "*=") { spaced = "*=" }
+        else if startsAt(src, i, "/=") { spaced = "/=" }
+        else if startsAt(src, i, "%=") { spaced = "%=" }
+        else if startsAt(src, i, "&=") { spaced = "&=" }
+        else if startsAt(src, i, "|=") { spaced = "|=" }
+        else if startsAt(src, i, "^=") { spaced = "^=" }
+        else if startsAt(src, i, "<<") { spaced = "<<" }
+        else if startsAt(src, i, ">>") { spaced = ">>" }
+        else if startsAt(src, i, "??") { spaced = "??" }
+        else if startsAt(src, i, "|>") { spaced = "|>" }
+        else if startsAt(src, i, "..<") { spaced = "..<" }
+        else if startsAt(src, i, "..") { spaced = ".." }
+        if spaced.length() > 0 {
+            w.space()
+            w.putRaw(spaced)
+            w.space()
+            word_gap = false
+            i = i + spaced.length()
+            prev_is_close = false
+            continue
+        }
+
+        if isSingleOp(c) {
+            if c == 45 || c == 43 || c == 33 || c == 126 {
+                val pc = w.lastChar()
+                var unary = c == 33 || c == 126 || expressionStartChar(pc)
+                if expressionStartWord(trailingWord(w.out)) { unary = true }
+                if unary {
+                    if pc != 40 && pc != 91 && pc != 46 { w.space() }
+                    w.put(src.substring(i, i + 1))
+                    w.noSpace()
+                } else {
+                    w.space()
+                    w.put(src.substring(i, i + 1))
+                    w.space()
+                }
+            } else {
+                w.space()
+                w.put(src.substring(i, i + 1))
+                w.space()
+            }
+            word_gap = false
+            i = i + 1
+            prev_is_close = false
+            continue
+        }
+
+        if c == 46 || c == 58 || c == 64 {
+            if c == 58 {
+                if word_gap { w.space() } else { w.noSpace() }
+            } else {
+                w.noSpace()
+            }
+            w.put(src.substring(i, i + 1))
+            if c == 58 { w.space() } else { w.noSpace() }
+            word_gap = false
+            i = i + 1
+            prev_is_close = false
+            continue
+        }
+
+        if isWordChar(c) {
+            if word_gap || prev_is_close || w.want_space { w.space() } else { w.noSpace() }
+            w.put(src.substring(i, i + 1))
+            prev_is_close = false
+            word_gap = false
+            i = i + 1
+            continue
+        }
+
+        w.put(src.substring(i, i + 1))
+        prev_is_close = false
+        i = i + 1
+    }
+
+    ret w.finish()
+}

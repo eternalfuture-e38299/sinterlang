@@ -1,0 +1,662 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// Sinter ZIP library, implemented in-tree (no third-party dependency).
+//
+// ZIP structure, names, CRC checks and the stored writer are written in
+// Cinder. The raw DEFLATE inflater and CRC-32 primitive live in `std.binary`
+// so this package does not embed C itself.
+//
+//     import zip
+//
+//     val data = readText("assets.zip")
+//     println(zipNames(data))
+//     println(zipGet(data, "readme.txt"))
+//
+//     val w = ZipWriter()
+//     w.add("a.txt", "alpha")
+//     writeText("out.zip", w.finish())
+module zip
+
+import std
+import std.string
+import std.text
+import std.list
+import std.binary
+import std.stream
+
+// Little-endian helpers over `str` bytes.
+fun byteAt(s: str, i: i64): i64 {
+    if i < 0 || i >= s.length() { ret 0 }
+    ret s.at(i)
+}
+
+fun u16At(s: str, i: i64): i64 => byteAt(s, i) + byteAt(s, i + 1) * 256
+
+fun u32At(s: str, i: i64): i64 {
+    ret byteAt(s, i) + byteAt(s, i + 1) * 256 + byteAt(s, i + 2) * 65536 + byteAt(s, i + 3) * 16777216
+}
+
+fun u64At(s: str, i: i64): i64 => u32At(s, i) + u32At(s, i + 4) * 4294967296
+
+// ZIP64 EOCD record: 0x06064b50, locator: 0x07064b50.
+// `base` is the absolute file offset of `zip[0]`; a tail buffer passes the
+// tail start so the locator's absolute record offset can be rebased.
+fun eocd64AtBase(zip: str, eocd: i64, base: i64): i64 {
+    if eocd < 20 { ret -1 }
+    if u32At(zip, eocd - 20) != 117853008 { ret -1 }
+    val off = u64At(zip, eocd - 12)
+    val rel = off - base
+    if rel < 0 || rel + 56 > zip.length() { ret -1 }
+    if u32At(zip, rel) != 101075792 { ret -1 }
+    ret rel
+}
+
+fun dirCountBase(zip: str, eocd: i64, base: i64): i64 {
+    val z = eocd64AtBase(zip, eocd, base)
+    if z >= 0 { ret u64At(zip, z + 32) }
+    ret u16At(zip, eocd + 10)
+}
+
+fun dirOffsetBase(zip: str, eocd: i64, base: i64): i64 {
+    val z = eocd64AtBase(zip, eocd, base)
+    if z >= 0 { ret u64At(zip, z + 48) }
+    ret u32At(zip, eocd + 16)
+}
+
+fun dirSizeBase(zip: str, eocd: i64, base: i64): i64 {
+    val z = eocd64AtBase(zip, eocd, base)
+    if z >= 0 { ret u64At(zip, z + 40) }
+    ret u32At(zip, eocd + 12)
+}
+
+fun dirCount(zip: str, eocd: i64): i64 => dirCountBase(zip, eocd, 0)
+fun dirOffset(zip: str, eocd: i64): i64 => dirOffsetBase(zip, eocd, 0)
+fun dirSize(zip: str, eocd: i64): i64 => dirSizeBase(zip, eocd, 0)
+
+// out: method, crc, compressed size, uncompressed size, local offset, flags
+fun metaAt(zip: str, p: i64, out: *i64): void {
+    var method = u16At(zip, p + 10)
+    var flags = u16At(zip, p + 8)
+    var crc = u32At(zip, p + 16)
+    var csize = u32At(zip, p + 20)
+    var usize = u32At(zip, p + 24)
+    var lho = u32At(zip, p + 42)
+    val nlen = u16At(zip, p + 28)
+    val xlen = u16At(zip, p + 30)
+    if csize == 4294967295 || usize == 4294967295 || lho == 4294967295 {
+        var q = p + 46 + nlen
+        val end = q + xlen
+        while q + 4 <= end {
+            val id = u16At(zip, q)
+            val sz = u16At(zip, q + 2)
+            if id == 1 {
+                var r = q + 4
+                if usize == 4294967295 { usize = u64At(zip, r); r = r + 8 }
+                if csize == 4294967295 { csize = u64At(zip, r); r = r + 8 }
+                if lho == 4294967295 { lho = u64At(zip, r) }
+                break
+            }
+            q = q + 4 + sz
+        }
+    }
+    out[0] = method
+    out[1] = crc
+    out[2] = csize
+    out[3] = usize
+    out[4] = lho
+    out[5] = flags
+}
+
+// End of central directory: 0x06054b50.
+fun eocdOffset(zip: str): i64 {
+    val n = zip.length()
+    if n < 22 { ret -1 }
+    var i = n - 22
+    val stop = n - 22 - 65535
+    while i >= 0 && i >= stop {
+        if u32At(zip, i) == 101010256 { ret i }
+        i = i - 1
+    }
+    ret -1
+}
+
+// Central directory header: 0x02014b50.
+fun findEntry(zip: str, name: str): i64 {
+    val eocd = eocdOffset(zip)
+    if eocd < 0 { ret -1 }
+    val count = dirCount(zip, eocd)
+    var p = dirOffset(zip, eocd)
+    var i: i64 = 0
+    while i < count {
+        if u32At(zip, p) != 33639248 { ret -1 }
+        val nlen = u16At(zip, p + 28)
+        val xlen = u16At(zip, p + 30)
+        val clen = u16At(zip, p + 32)
+        if p + 46 + nlen > zip.length() { ret -1 }
+        if zip.substring(p + 46, p + 46 + nlen).equalsText(name) { ret p }
+        p = p + 46 + nlen + xlen + clen
+        i = i + 1
+    }
+    ret -1
+}
+
+/// Entry names, one per line. Returns "" when the archive cannot be parsed.
+pub fun zipNames(zip: str): str {
+    val eocd = eocdOffset(zip)
+    if eocd < 0 { ret "" }
+    val count = dirCount(zip, eocd)
+    var p = dirOffset(zip, eocd)
+    val sb = StringBuilder()
+    var i: i64 = 0
+    while i < count {
+        if u32At(zip, p) != 33639248 { ret "" }
+        val nlen = u16At(zip, p + 28)
+        val xlen = u16At(zip, p + 30)
+        val clen = u16At(zip, p + 32)
+        if p + 46 + nlen > zip.length() { ret "" }
+        if i > 0 { sb.appendByte(10u8) }
+        sb.append(zip.substring(p + 46, p + 46 + nlen))
+        p = p + 46 + nlen + xlen + clen
+        i = i + 1
+    }
+    ret sb.toString()
+}
+
+/// Entry count; 0 for an unreadable archive.
+pub fun zipCount(zip: str): i64 {
+    val eocd = eocdOffset(zip)
+    if eocd < 0 { ret 0 }
+    ret dirCount(zip, eocd)
+}
+
+pub fun zipContains(zip: str, name: str): bool => findEntry(zip, name) >= 0
+
+fun extractEntry(zip: str, p: i64, password: str): str {
+    if p < 0 { ret "" }
+    val meta = intArray(6, 0)
+    metaAt(zip, p, meta.data)
+    val method = meta.get(0)
+    val crc = meta.get(1)
+    val csize = meta.get(2)
+    val usize = meta.get(3)
+    val lho = meta.get(4)
+    val flags = meta.get(5)
+    if u32At(zip, lho) != 67324752 { ret "" }
+    val lnlen = u16At(zip, lho + 26)
+    val lxlen = u16At(zip, lho + 28)
+    val off = lho + 30 + lnlen + lxlen
+    if off + csize > zip.length() { ret "" }
+
+    var raw = zip.substring(off, off + csize)
+    if flags % 2 == 1 {
+        if password.length() == 0 { ret "" }
+        raw = std.binary.zipCryptDecrypt(raw, password, crc)
+    }
+    var data: str = ""
+    if method == 0 {
+        data = cloneText(raw)
+    } else if method == 8 {
+        data = std.binary.inflate(raw)
+    } else if method == 12 {
+        data = std.binary.bunzip2(raw)
+    } else if method == 93 {
+        data = std.binary.unzstd(raw)
+    } else {
+        ret ""
+    }
+    if data.length() != usize { ret "" }
+    if std.binary.crc32(data) != crc { ret "" }
+    ret data
+}
+
+/// Extract one entry (stored or DEFLATE). Returns "" when missing/corrupt.
+pub fun zipGet(zip: str, name: str): str => extractEntry(zip, findEntry(zip, name), "")
+
+/// Extract an encrypted entry (traditional ZipCrypto).
+pub fun zipGetPassword(zip: str, name: str, password: str): str =>
+    extractEntry(zip, findEntry(zip, name), password)
+
+// ---- stored ZIP writer -----------------------------------------------------
+
+fun put16(sb: StringBuilder, v: i64): void {
+    sb.appendByte((v % 256) as u8)
+    sb.appendByte(((v / 256) % 256) as u8)
+}
+
+fun put32(sb: StringBuilder, v: i64): void {
+    sb.appendByte((v % 256) as u8)
+    sb.appendByte(((v / 256) % 256) as u8)
+    sb.appendByte(((v / 65536) % 256) as u8)
+    sb.appendByte(((v / 16777216) % 256) as u8)
+}
+
+fun put64(sb: StringBuilder, v: i64): void {
+    put32(sb, v % 4294967296)
+    put32(sb, v / 4294967296)
+}
+
+const ZIP64_MAX: i64 = 4294967295
+
+fun zip64Count(csize: i64, usize: i64, lho: i64): i64 {
+    var n: i64 = 0
+    if usize >= ZIP64_MAX { n = n + 1 }
+    if csize >= ZIP64_MAX { n = n + 1 }
+    if lho >= ZIP64_MAX { n = n + 1 }
+    ret n
+}
+
+fun localExtraLen(csize: i64, usize: i64): i64 {
+    val n = zip64Count(csize, usize, 0)
+    ret n == 0 ? 0 : 4 + n * 8
+}
+
+fun putLocalHeader(sb: StringBuilder, name: str, method: i64, flags: i64, crc: i64,
+                   csize: i64, usize: i64): void {
+    val xlen = localExtraLen(csize, usize)
+    put32(sb, 67324752)
+    put16(sb, xlen > 0 ? 45 : 20)
+    put16(sb, flags)
+    put16(sb, method)
+    put16(sb, 0)
+    put16(sb, 33)
+    put32(sb, crc)
+    put32(sb, csize >= ZIP64_MAX ? ZIP64_MAX : csize)
+    put32(sb, usize >= ZIP64_MAX ? ZIP64_MAX : usize)
+    put16(sb, name.length())
+    put16(sb, xlen)
+    sb.append(name)
+    if xlen > 0 {
+        put16(sb, 1)
+        put16(sb, xlen - 4)
+        if usize >= ZIP64_MAX { put64(sb, usize) }
+        if csize >= ZIP64_MAX { put64(sb, csize) }
+    }
+}
+
+fun putCentralHeader(sb: StringBuilder, name: str, method: i64, flags: i64, crc: i64,
+                     csize: i64, usize: i64, lho: i64): void {
+    val n = zip64Count(csize, usize, lho)
+    val xlen = n == 0 ? 0 : 4 + n * 8
+    put32(sb, 33639248)
+    put16(sb, xlen > 0 ? 45 : 20)
+    put16(sb, 20)
+    put16(sb, flags)
+    put16(sb, method)
+    put16(sb, 0)
+    put16(sb, 33)
+    put32(sb, crc)
+    put32(sb, csize >= ZIP64_MAX ? ZIP64_MAX : csize)
+    put32(sb, usize >= ZIP64_MAX ? ZIP64_MAX : usize)
+    put16(sb, name.length())
+    put16(sb, xlen)
+    put16(sb, 0)
+    put16(sb, 0)
+    put16(sb, 0)
+    put32(sb, 0)
+    put32(sb, lho >= ZIP64_MAX ? ZIP64_MAX : lho)
+    sb.append(name)
+    if xlen > 0 {
+        put16(sb, 1)
+        put16(sb, xlen - 4)
+        if usize >= ZIP64_MAX { put64(sb, usize) }
+        if csize >= ZIP64_MAX { put64(sb, csize) }
+        if lho >= ZIP64_MAX { put64(sb, lho) }
+    }
+}
+
+fun sealPayload(base: str, password: str, flags: i64, crc: i64): str {
+    if flags == 1 { ret std.binary.zipCryptEncrypt(base, password, crc) }
+    ret cloneText(base)
+}
+
+fun putEnd(sb: StringBuilder, count: i64, cdStart: i64, cdSize: i64): void {
+    if count >= 65535 || cdStart >= ZIP64_MAX || cdSize >= ZIP64_MAX {
+        val recOff = cdStart + cdSize
+        put32(sb, 101075792)
+        put64(sb, 44)
+        put16(sb, 45)
+        put16(sb, 45)
+        put32(sb, 0)
+        put32(sb, 0)
+        put64(sb, count)
+        put64(sb, count)
+        put64(sb, cdSize)
+        put64(sb, cdStart)
+        put32(sb, 117853008)
+        put32(sb, 0)
+        put64(sb, recOff)
+        put32(sb, 1)
+    }
+    put32(sb, 101010256)
+    put16(sb, 0)
+    put16(sb, 0)
+    put16(sb, count >= 65535 ? 65535 : count)
+    put16(sb, count >= 65535 ? 65535 : count)
+    put32(sb, cdSize >= ZIP64_MAX ? ZIP64_MAX : cdSize)
+    put32(sb, cdStart >= ZIP64_MAX ? ZIP64_MAX : cdStart)
+    put16(sb, 0)
+}
+
+/// Lazy reader over a ZIP archive. It can read from memory or from a file
+/// with on-demand seeks; `bytes()` only decompresses the current entry.
+pub class ZipReader {
+    var data: str
+    var cddata: str
+    var file: FileInputStream
+    var fromfile: bool
+    var count: i64
+    var cd: i64
+    var index: i64
+    var curname: str
+    var cursize: i64
+    var curmethod: i64
+    var curcsize: i64
+    var curcrc: i64
+    var curoff: i64
+    var curflags: i64
+    var password: str
+
+    ZipReader() {
+        self.data = ""
+        self.cddata = ""
+        self.file = null
+        self.fromfile = false
+        self.count = 0
+        self.cd = 0
+        self.index = 0
+        self.curname = ""
+        self.cursize = 0
+        self.curmethod = 0
+        self.curcsize = 0
+        self.curcrc = 0
+        self.curoff = 0
+        self.curflags = 0
+        self.password = ""
+    }
+
+    ~ZipReader() { self.close() }
+
+    /// Open from an in-memory ZIP.
+    pub fun open(zip: str): bool {
+        val eocd = eocdOffset(zip)
+        if eocd < 0 { ret false }
+        self.data = cloneText(zip)
+        self.cddata = self.data
+        self.fromfile = false
+        self.count = dirCount(zip, eocd)
+        self.cd = dirOffset(zip, eocd)
+        self.index = 0
+        self.password = ""
+        ret true
+    }
+
+    /// Open an encrypted archive from memory.
+    pub fun openPassword(zip: str, password: str): bool {
+        if !self.open(zip) { ret false }
+        self.password = password
+        ret true
+    }
+
+    /// Open from a file. Only the central directory is read eagerly; entry
+    /// payloads are read with `readAt` when `bytes()` is called.
+    pub fun openFile(path: str): bool {
+        self.close()
+        self.file = FileInputStream(path)
+        if !self.file.isOpen() { self.file = null; ret false }
+        val size = self.file.size()
+        if size < 22 { self.close(); ret false }
+        val start = size > 65557 ? size - 65557 : 0
+        val tail = self.file.readAt(start, size - start)
+        val eocd = eocdOffset(tail)
+        if eocd < 0 { self.close(); ret false }
+        val count = dirCountBase(tail, eocd, start)
+        val cdSize = dirSizeBase(tail, eocd, start)
+        val cdOff = dirOffsetBase(tail, eocd, start)
+        if cdOff <= 0 || cdSize <= 0 { self.close(); ret false }
+        self.cddata = cloneText(self.file.readAt(cdOff, cdSize))
+        if self.cddata.length() != cdSize { self.close(); ret false }
+        self.fromfile = true
+        self.count = count
+        self.cd = 0
+        self.index = 0
+        self.password = ""
+        ret true
+    }
+
+    /// Open an encrypted archive from a file.
+    pub fun openFilePassword(path: str, password: str): bool {
+        if !self.openFile(path) { ret false }
+        self.password = password
+        ret true
+    }
+
+    pub fun close(): void {
+        if self.file != null {
+            self.file.close()
+            self.file = null
+        }
+        self.data = ""
+        self.cddata = ""
+        self.fromfile = false
+        self.count = 0
+        self.index = 0
+        self.curname = ""
+        self.curflags = 0
+        self.password = ""
+    }
+
+    pub fun reset(): void => self.index = 0
+    pub fun count(): i64 => self.count
+    pub fun name(): str => self.curname
+    pub fun size(): i64 => self.cursize
+    pub fun isDirectory(): bool => self.curname.endsWith("/")
+
+    fun sourceAt(offset: i64, count: i64): str {
+        if count <= 0 { ret "" }
+        if self.fromfile {
+            if self.file == null { ret "" }
+            ret self.file.readAt(offset, count)
+        }
+        if offset < 0 || offset + count > self.data.length() { ret "" }
+        ret self.data.substring(offset, offset + count)
+    }
+
+    /// Advance to the next entry. Returns false at the end.
+    pub fun next(): bool {
+        if self.index >= self.count { ret false }
+        val p = self.cd
+        if u32At(self.cddata, p) != 33639248 { ret false }
+        val nlen = u16At(self.cddata, p + 28)
+        val xlen = u16At(self.cddata, p + 30)
+        val clen = u16At(self.cddata, p + 32)
+        if p + 46 + nlen > self.cddata.length() { ret false }
+        self.curname = cloneText(self.cddata.substring(p + 46, p + 46 + nlen))
+        val meta = intArray(6, 0)
+        metaAt(self.cddata, p, meta.data)
+        self.curmethod = meta.get(0)
+        self.curcrc = meta.get(1)
+        self.curcsize = meta.get(2)
+        self.cursize = meta.get(3)
+        self.curoff = meta.get(4)
+        self.curflags = meta.get(5)
+        self.cd = p + 46 + nlen + xlen + clen
+        self.index = self.index + 1
+        ret true
+    }
+
+    /// Read/decompress the current entry. Returns "" on error.
+    pub fun bytes(): str {
+        if self.curoff < 0 { ret "" }
+        val hdr = self.sourceAt(self.curoff, 30)
+        if hdr.length() < 30 { ret "" }
+        if u32At(hdr, 0) != 67324752 { ret "" }
+        val lnlen = u16At(hdr, 26)
+        val lxlen = u16At(hdr, 28)
+        val off = self.curoff + 30 + lnlen + lxlen
+        var raw = self.sourceAt(off, self.curcsize)
+        if raw.length() != self.curcsize { ret "" }
+        if self.curflags % 2 == 1 {
+            if self.password.length() == 0 { ret "" }
+            raw = std.binary.zipCryptDecrypt(raw, self.password, self.curcrc)
+        }
+        if self.curmethod == 0 {
+            if raw.length() != self.cursize { ret "" }
+            if std.binary.crc32(raw) != self.curcrc { ret "" }
+            ret cloneText(raw)
+        }
+        var out = ""
+        if self.curmethod == 8 { out = std.binary.inflate(raw) }
+        else if self.curmethod == 12 { out = std.binary.bunzip2(raw) }
+        else if self.curmethod == 93 { out = std.binary.unzstd(raw) }
+        else { ret "" }
+        if out.length() != self.cursize { ret "" }
+        if std.binary.crc32(out) != self.curcrc { ret "" }
+        ret out
+    }
+
+    pub fun text(): str => self.bytes()
+}
+
+/// ZIP writer. Entries are stored or DEFLATE-compressed, optionally encrypted
+/// with traditional PKZIP (ZipCrypto).
+///
+/// - `add` + `finish` builds the archive in memory and returns a `str`.
+/// - `begin(path)` + `add` + `finishTo()` writes entries to a file immediately;
+///   only headers/offsets are buffered, so large archives do not need to fit in
+///   memory.
+pub class ZipWriter {
+    var names: List<str>
+    var datas: List<str>
+    var crcs: List<i64>
+    var sizes: List<i64>
+    var csizes: List<i64>
+    var methods: List<i64>
+    var payloads: List<str>
+    var offsets: List<i64>
+    var out: FileOutputStream
+    var streaming: bool
+    var offset: i64
+    var password: str
+
+    ZipWriter() {
+        self.names = List<str>()
+        self.datas = List<str>()
+        self.crcs = List<i64>()
+        self.sizes = List<i64>()
+        self.csizes = List<i64>()
+        self.methods = List<i64>()
+        self.payloads = List<str>()
+        self.offsets = List<i64>()
+        self.out = null
+        self.streaming = false
+        self.offset = 0
+        self.password = ""
+    }
+
+    ~ZipWriter() {
+        if self.out != null { std.stream.closeOutputStream(self.out) }
+        self.out = null
+    }
+
+    /// Encrypt every subsequent entry with traditional PKZIP (ZipCrypto).
+    pub fun setPassword(password: str): void => self.password = cloneText(password)
+
+    /// Start streaming to `path`. Must be called before `add`.
+    pub fun begin(path: str): bool {
+        if self.streaming { ret false }
+        self.out = FileOutputStream(path, false)
+        if !std.stream.isOutputStreamOpen(self.out) { self.out = null; ret false }
+        self.streaming = true
+        self.offset = 0
+        ret true
+    }
+
+    pub fun add(name: str, data: str): void {
+        val crc = std.binary.crc32(data)
+        val packed = data.length() > 64 ? std.binary.deflate(data) : ""
+        val usePacked = packed.length() > 0 && packed.length() < data.length()
+        val method: i64 = usePacked ? 8 : 0
+        val base = usePacked ? cloneText(packed) : cloneText(data)
+        val flags: i64 = self.password.length() > 0 ? 1 : 0
+        val payload = sealPayload(base, self.password, flags, crc)
+        self.names.add(name)
+        self.crcs.add(crc)
+        self.sizes.add(data.length())
+        self.csizes.add(payload.length())
+        self.methods.add(method)
+        if self.streaming {
+            self.datas.add("")
+            self.payloads.add("")
+            self.offsets.add(self.offset)
+            val sb = StringBuilder()
+            putLocalHeader(sb, name, method, flags, crc, payload.length(), data.length())
+            std.stream.writeStringTo(self.out, sb.toString())
+            std.stream.writeStringTo(self.out, payload)
+            self.offset = self.offset + 30 + name.length() + localExtraLen(payload.length(), data.length()) + payload.length()
+        } else {
+            self.datas.add(data)
+            self.payloads.add(payload)
+            self.offsets.add(0)
+        }
+    }
+
+    pub fun count(): i64 => self.names.size()
+
+    /// Finish a streaming archive started with `begin`.
+    pub fun finishTo(): bool {
+        if !self.streaming || self.out == null { ret false }
+        val cdStart = self.offset
+        val flags: i64 = self.password.length() > 0 ? 1 : 0
+        val sb = StringBuilder()
+        var i: i64 = 0
+        while i < self.names.size() {
+            putCentralHeader(sb, self.names.get(i), self.methods.get(i), flags,
+                             self.crcs.get(i), self.csizes.get(i), self.sizes.get(i),
+                             self.offsets.get(i))
+            i = i + 1
+        }
+        val cdSize = sb.toString().length()
+        std.stream.writeStringTo(self.out, sb.toString())
+        val e = StringBuilder()
+        putEnd(e, self.names.size(), cdStart, cdSize)
+        std.stream.writeStringTo(self.out, e.toString())
+        std.stream.closeOutputStream(self.out)
+        self.out = null
+        self.streaming = false
+        ret true
+    }
+
+    /// Build the archive in memory. For streaming use `begin` + `finishTo`.
+    pub fun finish(): str {
+        if self.streaming { ret "" }
+        val sb = StringBuilder()
+        val localOffsets = List<i64>()
+        val flags: i64 = self.password.length() > 0 ? 1 : 0
+        var offset: i64 = 0
+        var i: i64 = 0
+        while i < self.names.size() {
+            val name = self.names.get(i)
+            val data = self.datas.get(i)
+            val base = self.methods.get(i) == 8 ? std.binary.deflate(data) : cloneText(data)
+            val payload = sealPayload(base, self.password, flags, self.crcs.get(i))
+            localOffsets.add(offset)
+            putLocalHeader(sb, name, self.methods.get(i), flags, self.crcs.get(i),
+                           payload.length(), data.length())
+            sb.append(payload)
+            offset = offset + 30 + name.length() + localExtraLen(payload.length(), data.length()) + payload.length()
+            i = i + 1
+        }
+        val cdStart = offset
+        i = 0
+        while i < self.names.size() {
+            putCentralHeader(sb, self.names.get(i), self.methods.get(i), flags,
+                             self.crcs.get(i), self.csizes.get(i), self.sizes.get(i),
+                             localOffsets.get(i))
+            i = i + 1
+        }
+        val total = sb.toString().length()
+        putEnd(sb, self.names.size(), cdStart, total - cdStart)
+        ret sb.toString()
+    }
+}

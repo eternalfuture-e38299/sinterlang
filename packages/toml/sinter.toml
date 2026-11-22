@@ -1,0 +1,13 @@
+[package]
+name = "toml"
+version = "1.1.0"
+entry = "toml.sinter"
+description = "Independent Sinter TOML library: parser/serializer with structured date-times and comment-preserving round trips"
+authors = ["sinter"]
+license = "MIT"
+
+artifact = "static"
+target = "toml_lib"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../std" }

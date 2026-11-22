@@ -1,0 +1,1586 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Sinter contributors
+
+// Sinter binary primitives used by independent codecs such as zip.
+// Deflate inflate and CRC-32 live here; ZIP structure stays in the zip package.
+module std.binary
+
+import std
+import std.text
+import std.string
+
+embed C {
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+    /* CRC-32 (IEEE 802.3)                                                 */
+    /* ------------------------------------------------------------------ */
+    static uint32_t sinter_bin_crc32(const uint8_t* data, int64_t n) {
+        static uint32_t table[256];
+        static int init = 0;
+        if (!init) {
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t c = i;
+                for (int k = 0; k < 8; ++k)
+                    c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+                table[i] = c;
+            }
+            init = 1;
+        }
+        uint32_t c = 0xFFFFFFFFu;
+        for (int64_t i = 0; i < n; ++i)
+            c = table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* traditional PKZIP encryption (ZipCrypto)                            */
+    /* ------------------------------------------------------------------ */
+    static uint32_t sinter_bin_zc_table[256];
+    static int sinter_bin_zc_init_table = 0;
+    static uint32_t sinter_bin_zc_crc(uint32_t c, uint8_t b) {
+        if (!sinter_bin_zc_init_table) {
+            for (uint32_t i = 0; i < 256; ++i) {
+                uint32_t v = i;
+                for (int k = 0; k < 8; ++k)
+                    v = (v & 1) ? (0xEDB88320u ^ (v >> 1)) : (v >> 1);
+                sinter_bin_zc_table[i] = v;
+            }
+            sinter_bin_zc_init_table = 1;
+        }
+        return sinter_bin_zc_table[(c ^ b) & 0xffu] ^ (c >> 8);
+    }
+    typedef struct { uint32_t k0, k1, k2; } sinter_bin_zc;
+    static void sinter_bin_zc_init(sinter_bin_zc* z, const char* pw, int64_t n) {
+        z->k0 = 0x12345678u; z->k1 = 0x23456789u; z->k2 = 0x34567890u;
+        for (int64_t i = 0; i < n; ++i) {
+            z->k0 = sinter_bin_zc_crc(z->k0, (uint8_t)pw[i]);
+            z->k1 = (z->k1 + (z->k0 & 0xffu)) * 134775813u + 1u;
+            z->k2 = sinter_bin_zc_crc(z->k2, (uint8_t)(z->k1 >> 24));
+        }
+    }
+    static uint8_t sinter_bin_zc_byte(sinter_bin_zc* z) {
+        uint32_t t = (z->k2 | 2u);
+        return (uint8_t)((t * (t ^ 1u)) >> 8);
+    }
+    static void sinter_bin_zc_update(sinter_bin_zc* z, uint8_t plain) {
+        z->k0 = sinter_bin_zc_crc(z->k0, plain);
+        z->k1 = (z->k1 + (z->k0 & 0xffu)) * 134775813u + 1u;
+        z->k2 = sinter_bin_zc_crc(z->k2, (uint8_t)(z->k1 >> 24));
+    }
+    /* Encryption updates the key with the plaintext, decryption with the
+       recovered plaintext; both XOR against the same keystream byte. */
+    static uint8_t sinter_bin_zc_encrypt_byte(sinter_bin_zc* z, uint8_t c) {
+        uint8_t out = (uint8_t)(c ^ sinter_bin_zc_byte(z));
+        sinter_bin_zc_update(z, c);
+        return out;
+    }
+    static uint8_t sinter_bin_zc_decrypt_byte(sinter_bin_zc* z, uint8_t c) {
+        uint8_t p = (uint8_t)(c ^ sinter_bin_zc_byte(z));
+        sinter_bin_zc_update(z, p);
+        return p;
+    }
+    static sinter_string sinter_bin_zipcrypt_encrypt(sinter_string data, sinter_string password, int64_t crc) {
+        if (password.len <= 0) return sinter_string_from_literal("", 0);
+        const int64_t n = data.len + 12;
+        uint8_t* out = (uint8_t*)malloc((size_t)n);
+        if (!out) return sinter_string_from_literal("", 0);
+        sinter_bin_zc z;
+        sinter_bin_zc_init(&z, password.data, password.len);
+        for (int i = 0; i < 12; ++i) {
+            uint8_t h = (uint8_t)(i == 11 ? ((uint32_t)crc >> 24) : (uint8_t)(i * 17 + 31));
+            out[i] = sinter_bin_zc_encrypt_byte(&z, h);
+        }
+        for (int64_t i = 0; i < data.len; ++i)
+            out[12 + i] = sinter_bin_zc_encrypt_byte(&z, (uint8_t)data.data[i]);
+        sinter_string r = sinter_string_from_buf((const char*)out, n);
+        free(out);
+        return r;
+    }
+    static sinter_string sinter_bin_zipcrypt_decrypt(sinter_string data, sinter_string password, int64_t crc) {
+        if (password.len <= 0 || data.len < 12) return sinter_string_from_literal("", 0);
+        sinter_bin_zc z;
+        sinter_bin_zc_init(&z, password.data, password.len);
+        /* The 12-byte header is decrypted only to advance the key. Its check
+           byte is CRC-based normally but time-based when general-purpose bit 3
+           is set, so callers validate the payload CRC instead. */
+        for (int i = 0; i < 12; ++i) (void)sinter_bin_zc_decrypt_byte(&z, (uint8_t)data.data[i]);
+        uint8_t* out = (uint8_t*)malloc((size_t)(data.len - 12));
+        if (!out) return sinter_string_from_literal("", 0);
+        for (int64_t i = 12; i < data.len; ++i)
+            out[i - 12] = sinter_bin_zc_decrypt_byte(&z, (uint8_t)data.data[i]);
+        sinter_string r = sinter_string_from_buf((const char*)out, data.len - 12);
+        free(out);
+        return r;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* raw DEFLATE decoder                                                 */
+    /* ------------------------------------------------------------------ */
+    typedef struct {
+        const uint8_t* in;
+        int64_t len, pos;
+        uint32_t bits;
+        int count;
+        int error;
+    } sinter_bin_bits;
+
+    static int sinter_bin_bit(sinter_bin_bits* b) {
+        if (b->count == 0) {
+            if (b->pos >= b->len) { b->error = 1; return 0; }
+            b->bits = b->in[b->pos++];
+            b->count = 8;
+        }
+        int v = (int)(b->bits & 1u);
+        b->bits >>= 1;
+        b->count--;
+        return v;
+    }
+
+    static uint32_t sinter_bin_bits_n(sinter_bin_bits* b, int n) {
+        uint32_t v = 0;
+        for (int i = 0; i < n; ++i) v |= (uint32_t)sinter_bin_bit(b) << i;
+        return v;
+    }
+
+    typedef struct { int count[16]; int symbol[288]; } sinter_bin_huff;
+
+    static void sinter_bin_huff_build(sinter_bin_huff* h, const uint8_t* lens, int n) {
+        memset(h->count, 0, sizeof(h->count));
+        for (int i = 0; i < n; ++i) h->count[lens[i]]++;
+        h->count[0] = 0;
+        int offs[16];
+        offs[1] = 0;
+        for (int len = 1; len < 15; ++len) offs[len + 1] = offs[len] + h->count[len];
+        for (int i = 0; i < n; ++i)
+            if (lens[i]) h->symbol[offs[lens[i]]++] = i;
+    }
+
+    static int sinter_bin_huff_decode(sinter_bin_bits* b, const sinter_bin_huff* h) {
+        int code = 0, first = 0, index = 0;
+        for (int len = 1; len <= 15; ++len) {
+            code |= sinter_bin_bit(b);
+            int count = h->count[len];
+            if (code - first < count) return h->symbol[index + (code - first)];
+            index += count;
+            first = (first + count) << 1;
+            code <<= 1;
+        }
+        b->error = 1;
+        return -1;
+    }
+
+    static const int sinter_bin_len_base[29] = {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
+    };
+    static const int sinter_bin_len_extra[29] = {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0
+    };
+    static const int sinter_bin_dist_base[30] = {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+        1025,1537,2049,3073,4097,6145,8193,12289,16385,24577
+    };
+    static const int sinter_bin_dist_extra[30] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13
+    };
+
+    static int sinter_bin_inflate_block(sinter_bin_bits* b, uint8_t** out,
+                                        int64_t* olen, int64_t* ocap) {
+        int final = sinter_bin_bit(b);
+        int type = (int)sinter_bin_bits_n(b, 2);
+        if (b->error) return 0;
+
+        if (type == 0) {
+            b->bits = 0;
+            b->count = 0;
+            if (b->pos + 4 > b->len) return 0;
+            int64_t n = b->in[b->pos] | (b->in[b->pos + 1] << 8);
+            b->pos += 4;
+            if (b->pos + n > b->len) return 0;
+            if (*olen + n > *ocap) {
+                int64_t cap = *ocap ? *ocap : 4096;
+                while (cap < *olen + n) cap *= 2;
+                uint8_t* p = (uint8_t*)realloc(*out, (size_t)cap);
+                if (!p) return 0;
+                *out = p;
+                *ocap = cap;
+            }
+            memcpy(*out + *olen, b->in + b->pos, (size_t)n);
+            *olen += n;
+            b->pos += n;
+            return final ? 2 : 1;
+        }
+
+        sinter_bin_huff lit, dist;
+        if (type == 1) {
+            uint8_t ll[288], dd[32];
+            int i;
+            for (i = 0; i < 144; ++i) ll[i] = 8;
+            for (; i < 256; ++i) ll[i] = 9;
+            for (; i < 280; ++i) ll[i] = 7;
+            for (; i < 288; ++i) ll[i] = 8;
+            for (i = 0; i < 32; ++i) dd[i] = 5;
+            sinter_bin_huff_build(&lit, ll, 288);
+            sinter_bin_huff_build(&dist, dd, 32);
+        } else if (type == 2) {
+            int hlit = (int)sinter_bin_bits_n(b, 5) + 257;
+            int hdist = (int)sinter_bin_bits_n(b, 5) + 1;
+            int hclen = (int)sinter_bin_bits_n(b, 4) + 4;
+            static const int order[19] = {
+                16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
+            };
+            uint8_t cl[19];
+            memset(cl, 0, sizeof(cl));
+            for (int i = 0; i < hclen; ++i) cl[order[i]] = (uint8_t)sinter_bin_bits_n(b, 3);
+            sinter_bin_huff clh;
+            sinter_bin_huff_build(&clh, cl, 19);
+            uint8_t lens[320];
+            int n = hlit + hdist;
+            int i = 0;
+            while (i < n) {
+                int sym = sinter_bin_huff_decode(b, &clh);
+                if (sym < 0) return 0;
+                if (sym < 16) lens[i++] = (uint8_t)sym;
+                else if (sym == 16) {
+                    if (i == 0) return 0;
+                    int rep = 3 + (int)sinter_bin_bits_n(b, 2);
+                    uint8_t v = lens[i - 1];
+                    while (rep-- && i < n) lens[i++] = v;
+                } else if (sym == 17) {
+                    int rep = 3 + (int)sinter_bin_bits_n(b, 3);
+                    while (rep-- && i < n) lens[i++] = 0;
+                } else {
+                    int rep = 11 + (int)sinter_bin_bits_n(b, 7);
+                    while (rep-- && i < n) lens[i++] = 0;
+                }
+            }
+            if (b->error) return 0;
+            sinter_bin_huff_build(&lit, lens, hlit);
+            sinter_bin_huff_build(&dist, lens + hlit, hdist);
+        } else {
+            return 0;
+        }
+
+        for (;;) {
+            int sym = sinter_bin_huff_decode(b, &lit);
+            if (sym < 0) return 0;
+            if (sym < 256) {
+                if (*olen + 1 > *ocap) {
+                    int64_t cap = *ocap ? *ocap * 2 : 4096;
+                    uint8_t* p = (uint8_t*)realloc(*out, (size_t)cap);
+                    if (!p) return 0;
+                    *out = p;
+                    *ocap = cap;
+                }
+                (*out)[(*olen)++] = (uint8_t)sym;
+            } else if (sym == 256) {
+                return final ? 2 : 1;
+            } else {
+                if (sym < 257 || sym > 285) return 0;
+                int li = sym - 257;
+                int length = sinter_bin_len_base[li] +
+                             (int)sinter_bin_bits_n(b, sinter_bin_len_extra[li]);
+                int dsym = sinter_bin_huff_decode(b, &dist);
+                if (dsym < 0 || dsym > 29) return 0;
+                int distance = sinter_bin_dist_base[dsym] +
+                               (int)sinter_bin_bits_n(b, sinter_bin_dist_extra[dsym]);
+                if (distance <= 0 || (int64_t)distance > *olen) return 0;
+                if (*olen + length > *ocap) {
+                    int64_t cap = *ocap ? *ocap : 4096;
+                    while (cap < *olen + length) cap *= 2;
+                    uint8_t* p = (uint8_t*)realloc(*out, (size_t)cap);
+                    if (!p) return 0;
+                    *out = p;
+                    *ocap = cap;
+                }
+                for (int k = 0; k < length; ++k) {
+                    (*out)[*olen] = (*out)[*olen - distance];
+                    (*olen)++;
+                }
+            }
+            if (b->error) return 0;
+        }
+    }
+
+    static uint8_t* sinter_bin_inflate(const uint8_t* in, int64_t n, int64_t* out_len) {
+        sinter_bin_bits b;
+        b.in = in; b.len = n; b.pos = 0; b.bits = 0; b.count = 0; b.error = 0;
+        uint8_t* out = NULL;
+        int64_t olen = 0, ocap = 0;
+        for (;;) {
+            int r = sinter_bin_inflate_block(&b, &out, &olen, &ocap);
+            if (r == 0 || b.error) { free(out); return NULL; }
+            if (r == 2) break;
+        }
+        if (!out) { out = (uint8_t*)malloc(1); if (!out) return NULL; }
+        *out_len = olen;
+        return out;
+    }
+
+
+    /* ------------------------------------------------------------------ */
+    /* fixed-Huffman DEFLATE encoder (LZ77, no dynamic trees)              */
+    /* ------------------------------------------------------------------ */
+    typedef struct {
+        uint8_t* p;
+        int64_t n, cap;
+        uint32_t bits;
+        int nbits;
+    } sinter_bin_bw;
+
+    static void sinter_bin_bw_byte(sinter_bin_bw* b, uint8_t v) {
+        if (b->n == b->cap) {
+            int64_t nc = b->cap ? b->cap * 2 : 4096;
+            uint8_t* np = (uint8_t*)realloc(b->p, (size_t)nc);
+            if (!np) { b->n = -1; return; }
+            b->p = np; b->cap = nc;
+        }
+        b->p[b->n++] = v;
+    }
+    static void sinter_bin_bw_put(sinter_bin_bw* b, uint32_t v, int n) {
+        if (b->n < 0) return;
+        b->bits |= v << b->nbits;
+        b->nbits += n;
+        while (b->nbits >= 8) {
+            sinter_bin_bw_byte(b, (uint8_t)(b->bits & 0xffu));
+            b->bits >>= 8;
+            b->nbits -= 8;
+        }
+    }
+    static uint32_t sinter_bin_rev(uint32_t v, int n) {
+        uint32_t r = 0;
+        while (n-- > 0) { r = (r << 1) | (v & 1u); v >>= 1; }
+        return r;
+    }
+    static void sinter_bin_put_lit(sinter_bin_bw* b, int sym) {
+        if (sym <= 143) sinter_bin_bw_put(b, sinter_bin_rev(0x30u + (uint32_t)sym, 8), 8);
+        else if (sym <= 255) sinter_bin_bw_put(b, sinter_bin_rev(0x190u + (uint32_t)(sym - 144), 9), 9);
+        else if (sym <= 279) sinter_bin_bw_put(b, sinter_bin_rev((uint32_t)(sym - 256), 7), 7);
+        else sinter_bin_bw_put(b, sinter_bin_rev(0xC0u + (uint32_t)(sym - 280), 8), 8);
+    }
+    static const int sinter_bin_len_base2[29] = {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
+    };
+    static const int sinter_bin_len_extra2[29] = {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0
+    };
+    static const int sinter_bin_dist_base2[30] = {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+        1025,1537,2049,3073,4097,6145,8193,12289,16385,24577
+    };
+    static const int sinter_bin_dist_extra2[30] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13
+    };
+    static void sinter_bin_put_match(sinter_bin_bw* b, int len, int dist) {
+        int li = 0;
+        while (li < 28 && len >= sinter_bin_len_base2[li + 1]) ++li;
+        sinter_bin_put_lit(b, 257 + li);
+        int le = sinter_bin_len_extra2[li];
+        if (le) sinter_bin_bw_put(b, (uint32_t)(len - sinter_bin_len_base2[li]), le);
+        int di = 0;
+        while (di < 29 && dist >= sinter_bin_dist_base2[di + 1]) ++di;
+        sinter_bin_bw_put(b, sinter_bin_rev((uint32_t)di, 5), 5);
+        int de = sinter_bin_dist_extra2[di];
+        if (de) sinter_bin_bw_put(b, (uint32_t)(dist - sinter_bin_dist_base2[di]), de);
+    }
+    static uint32_t sinter_bin_hash3(const uint8_t* p, int64_t i) {
+        return (((uint32_t)p[i] * 251u + (uint32_t)p[i + 1]) * 251u + (uint32_t)p[i + 2]) & 0xffffu;
+    }
+    static sinter_string sinter_bin_deflate_str(sinter_string data) {
+        const uint8_t* in = (const uint8_t*)data.data;
+        int64_t n = data.len;
+        sinter_bin_bw b;
+        b.p = NULL; b.n = 0; b.cap = 0; b.bits = 0; b.nbits = 0;
+        sinter_bin_bw_put(&b, 1, 1);   /* BFINAL */
+        sinter_bin_bw_put(&b, 1, 2);   /* BTYPE=01 fixed Huffman */
+        int32_t* head = (int32_t*)malloc(65536 * sizeof(int32_t));
+        int32_t* prev = (int32_t*)malloc((size_t)(n > 0 ? n : 1) * sizeof(int32_t));
+        if (!head || !prev) { free(head); free(prev); free(b.p); return sinter_string_from_literal("", 0); }
+        for (int i = 0; i < 65536; ++i) head[i] = -1;
+        int64_t i = 0;
+        while (i < n) {
+            int best_len = 0, best_dist = 0;
+            if (i + 2 < n) {
+                uint32_t h = sinter_bin_hash3(in, i);
+                int32_t cand = head[h];
+                int chain = 0;
+                while (cand >= 0 && chain++ < 32) {
+                    int64_t dist = i - cand;
+                    if (dist > 32768) break;
+                    int max = (int)(n - i);
+                    if (max > 258) max = 258;
+                    int len = 0;
+                    while (len < max && in[cand + len] == in[i + len]) ++len;
+                    if (len > best_len) { best_len = len; best_dist = (int)dist; if (len == 258) break; }
+                    cand = prev[cand];
+                }
+            }
+            if (best_len >= 3) {
+                sinter_bin_put_match(&b, best_len, best_dist);
+                for (int k = 0; k < best_len; ++k) {
+                    if (i + k + 2 < n) {
+                        uint32_t h = sinter_bin_hash3(in, i + k);
+                        prev[i + k] = head[h];
+                        head[h] = (int32_t)(i + k);
+                    }
+                }
+                i += best_len;
+            } else {
+                sinter_bin_put_lit(&b, in[i]);
+                if (i + 2 < n) {
+                    uint32_t h = sinter_bin_hash3(in, i);
+                    prev[i] = head[h];
+                    head[h] = (int32_t)i;
+                }
+                ++i;
+            }
+        }
+        sinter_bin_put_lit(&b, 256);
+        if (b.nbits > 0) sinter_bin_bw_byte(&b, (uint8_t)(b.bits & 0xffu));
+        free(head); free(prev);
+        if (b.n < 0 || !b.p) { free(b.p); return sinter_string_from_literal("", 0); }
+        sinter_string out = sinter_string_from_buf((const char*)b.p, b.n);
+        free(b.p);
+        return out;
+    }
+
+    static sinter_string sinter_bin_inflate_str(sinter_string data) {
+        int64_t n = 0;
+        uint8_t* p = sinter_bin_inflate((const uint8_t*)data.data, data.len, &n);
+        if (!p) return sinter_string_from_literal("", 0);
+        sinter_string out = sinter_string_from_buf((const char*)p, n);
+        free(p);
+        return out;
+    }
+    static int64_t sinter_bin_crc32_str(sinter_string data) {
+        return (int64_t)sinter_bin_crc32((const uint8_t*)data.data, data.len);
+    }
+    /* ------------------------------------------------------------------ */
+    /* zstd decompressor (ZIP method 93)                                   */
+    /* ------------------------------------------------------------------ */
+    typedef struct { const uint8_t* p; int64_t n; int64_t bit; } z_fwd;
+    typedef struct { const uint8_t* p; int64_t k; } z_back;
+
+    static int z_highbit(uint32_t v) { int r = -1; while (v) { v >>= 1; r++; } return r; }
+
+    static uint32_t z_fread(z_fwd* b, int n) {
+        uint32_t v = 0;
+        for (int i = 0; i < n; ++i) {
+            if (b->bit < b->n * 8) {
+                v |= (uint32_t)((b->p[b->bit >> 3] >> (b->bit & 7)) & 1) << i;
+                b->bit++;
+            }
+        }
+        return v;
+    }
+    static uint32_t z_fpeek(z_fwd* b, int n) {
+        z_fwd t = *b;
+        return z_fread(&t, n);
+    }
+    static int64_t z_fbytes(z_fwd* b) { return (b->bit + 7) / 8; }
+
+    static int z_binit(z_back* b, const uint8_t* p, int64_t n) {
+        b->p = p;
+        b->k = -1;
+        if (n <= 0) return 0;
+        int last = p[n - 1];
+        if (!last) return 0;
+        int hb = 7;
+        while (hb > 0 && !((last >> hb) & 1)) hb--;
+        b->k = (n - 1) * 8 + hb - 1;
+        return 1;
+    }
+    static uint32_t z_bpeek(z_back* b, int n) {
+        uint32_t v = 0;
+        int64_t k = b->k;
+        for (int i = 0; i < n; ++i) {
+            v <<= 1;
+            if (k >= 0) v |= (uint32_t)((b->p[k >> 3] >> (k & 7)) & 1);
+            k--;
+        }
+        return v;
+    }
+    static uint32_t z_bread(z_back* b, int n) {
+        uint32_t v = z_bpeek(b, n);
+        b->k -= n;
+        return v;
+    }
+
+    /* Exact zstd BIT_DStream emulation for the FSE-compressed Huffman weight
+       stream: its end condition depends on zero-filled container bits. */
+    typedef struct {
+        const uint8_t* start;
+        int64_t size;
+        int64_t ptr;
+        uint64_t container;
+        uint32_t consumed;
+    } z_bitd;
+
+    static uint64_t z_load_le(const uint8_t* p, int64_t n) {
+        uint64_t v = 0;
+        for (int64_t i = 0; i < n; ++i) v |= (uint64_t)p[i] << (8 * i);
+        return v;
+    }
+    static int z_bitd_init(z_bitd* b, const uint8_t* p, int64_t n) {
+        if (n < 1) return 0;
+        b->start = p;
+        b->size = n;
+        int last = p[n - 1];
+        if (!last) return 0;
+        int hb = 7;
+        while (hb > 0 && !((last >> hb) & 1)) hb--;
+        if (n >= 8) {
+            b->ptr = n - 8;
+            b->container = z_load_le(p + b->ptr, 8);
+            b->consumed = (uint32_t)(8 - hb);
+        } else {
+            b->ptr = 0;
+            b->container = z_load_le(p, n);
+            b->consumed = (uint32_t)(8 - hb) + (uint32_t)(8 - n) * 8;
+        }
+        return 1;
+    }
+    static uint32_t z_bitd_read(z_bitd* b, int n) {
+        if (n <= 0) return 0;
+        if (b->consumed >= 64) { b->consumed += (uint32_t)n; return 0; }
+        uint32_t v = (uint32_t)((b->container << b->consumed) >> (64 - n));
+        b->consumed += (uint32_t)n;
+        return v;
+    }
+    static int z_bitd_reload(z_bitd* b) {
+        if (b->consumed > 64) return 0;
+        if (b->ptr >= 8) {
+            b->ptr -= b->consumed >> 3;
+            b->consumed &= 7;
+            int64_t n = b->size - b->ptr;
+            if (n > 8) n = 8;
+            b->container = z_load_le(b->start + b->ptr, n);
+            return 1;
+        }
+        if (b->ptr == 0) return 1;
+        int64_t nb = b->consumed >> 3;
+        if (nb > b->ptr) nb = b->ptr;
+        b->ptr -= nb;
+        b->consumed -= (uint32_t)(nb * 8);
+        int64_t n = b->size - b->ptr;
+        if (n > 8) n = 8;
+        b->container = z_load_le(b->start + b->ptr, n);
+        return 1;
+    }
+
+    typedef struct { uint8_t sym; uint8_t nb; uint16_t base; } z_fse_cell;
+    typedef struct { int log; int size; int have; z_fse_cell t[512]; } z_fse;
+
+    static int z_fse_build(z_fse* d, const int* norm, int n, int log) {
+        if (log < 0 || log > 9) return 0;
+        int size = 1 << log;
+        int next[256];
+        d->log = log;
+        d->size = size;
+        d->have = 1;
+        int high = size - 1;
+        for (int s = 0; s < n; ++s) {
+            if (norm[s] == -1) {
+                d->t[high].sym = (uint8_t)s;
+                high--;
+                next[s] = 1;
+            } else {
+                next[s] = norm[s];
+            }
+        }
+        int pos = 0;
+        int step = (size >> 1) + (size >> 3) + 3;
+        for (int s = 0; s < n; ++s) {
+            for (int i = 0; i < norm[s]; ++i) {
+                d->t[pos].sym = (uint8_t)s;
+                pos = (pos + step) & (size - 1);
+                while (pos > high) pos = (pos + step) & (size - 1);
+            }
+        }
+        for (int u = 0; u < size; ++u) {
+            int s = d->t[u].sym;
+            int ns = next[s]++;
+            int nb = log - z_highbit((uint32_t)ns);
+            d->t[u].nb = (uint8_t)nb;
+            d->t[u].base = (uint16_t)((ns << nb) - size);
+        }
+        return 1;
+    }
+
+    static int z_fse_rle(z_fse* d, int sym) {
+        d->log = 0;
+        d->size = 1;
+        d->have = 1;
+        d->t[0].sym = (uint8_t)sym;
+        d->t[0].nb = 0;
+        d->t[0].base = 0;
+        return 1;
+    }
+
+    static int z_fse_read(z_fwd* b, z_fse* d, int maxLog) {
+        int norm[256];
+        for (int i = 0; i < 256; ++i) norm[i] = 0;
+        int log = (int)z_fread(b, 4) + 5;
+        if (log > maxLog) return 0;
+        int remaining = (1 << log) + 1;
+        int threshold = 1 << log;
+        int nbBits = log + 1;
+        int sym = 0;
+        int prev0 = 0;
+        while (remaining > 1) {
+            if (sym >= 256) return 0;
+            if (prev0) {
+                int n0 = sym;
+                for (;;) {
+                    int rep = (int)z_fread(b, 2);
+                    n0 += rep;
+                    if (rep != 3) break;
+                }
+                while (sym < n0 && sym < 256) norm[sym++] = 0;
+            }
+            int maxv = (2 * threshold - 1) - remaining;
+            int count;
+            uint32_t low = z_fpeek(b, nbBits - 1);
+            if ((int)low < maxv) {
+                z_fread(b, nbBits - 1);
+                count = (int)low;
+            } else {
+                uint32_t v = z_fpeek(b, nbBits);
+                z_fread(b, nbBits);
+                count = (int)v;
+                if (count >= threshold) count -= maxv;
+            }
+            count--;
+            remaining -= (count < 0) ? -count : count;
+            norm[sym++] = count;
+            prev0 = (count == 0);
+            while (remaining < threshold) {
+                nbBits--;
+                threshold >>= 1;
+            }
+        }
+        if (remaining != 1) return 0;
+        return z_fse_build(d, norm, sym, log);
+    }
+
+    static const int z_ll_default[36] = {
+        4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1
+    };
+    static const int z_ml_default[53] = {
+        1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+        1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1
+    };
+    static const int z_of_default[29] = {
+        1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1
+    };
+
+    typedef struct {
+        int maxBits;
+        uint8_t table[2048];
+        uint8_t len[256];
+    } z_huff;
+
+    static int z_huff_read(const uint8_t* p, int64_t n, z_huff* h) {
+        if (n <= 0) return 0;
+        int header = p[0];
+        int weights[256];
+        int nw = 0;
+        if (header >= 128) {
+            int ns = header - 127;
+            int bytes = (ns + 1) / 2;
+            if (1 + bytes > n) return 0;
+            for (int i = 0; i < ns; ++i) {
+                int byte = p[1 + i / 2];
+                weights[nw++] = (i & 1) ? (byte & 15) : (byte >> 4);
+            }
+            h->maxBits = 0;
+            h->maxBits = 0;
+            h->maxBits = 0;
+            /* maxBits is derived below */
+            int consumed = 1 + bytes;
+            int total = 0;
+            for (int i = 0; i < nw; ++i) if (weights[i]) total += 1 << (weights[i] - 1);
+            if (total <= 0) return 0;
+            int target = 1;
+            while (target <= total) target <<= 1;
+            int missing = target - total;
+            if (missing & (missing - 1)) return 0;
+            int mb = 0;
+            while ((1 << mb) < target) mb++;
+            int lw = 1;
+            while ((1 << (lw - 1)) < missing) lw++;
+            weights[nw++] = lw;
+            h->maxBits = mb;
+            for (int s = 0; s < 256; ++s) h->len[s] = 0;
+            for (int s = 0; s < nw; ++s) {
+                if (weights[s] > 0) h->len[s] = (uint8_t)(mb + 1 - weights[s]);
+            }
+            int pos = 0;
+            for (int w = 1; w <= mb; ++w) {
+                for (int s = 0; s < nw; ++s) {
+                    if (weights[s] == w) {
+                        int cnt = 1 << (w - 1);
+                        for (int j = 0; j < cnt; ++j) h->table[pos++] = (uint8_t)s;
+                    }
+                }
+            }
+            h->table[0] = h->table[0]; /* no-op, keeps pos checked below */
+            if (pos != (1 << mb)) return 0;
+            return consumed;
+        }
+        int size = header;
+        if (size <= 0 || 1 + size > n) return 0;
+        z_fwd f;
+        f.p = p + 1;
+        f.n = size;
+        f.bit = 0;
+        z_fse fs;
+        if (!z_fse_read(&f, &fs, 6)) return 0;
+        int used = (int)z_fbytes(&f);
+        if (used >= size) return 0;
+        z_bitd b;
+        if (!z_bitd_init(&b, p + 1 + used, size - used)) return 0;
+        int s1 = (int)z_bitd_read(&b, fs.log);
+        if (!z_bitd_reload(&b)) return 0;
+        int s2 = (int)z_bitd_read(&b, fs.log);
+        if (!z_bitd_reload(&b)) return 0;
+        if (s1 >= fs.size || s2 >= fs.size) return 0;
+        for (;;) {
+            if (nw >= 255) break;
+            weights[nw++] = fs.t[s1].sym;
+            s1 = fs.t[s1].base + (int)z_bitd_read(&b, fs.t[s1].nb);
+            if (s1 < 0 || s1 >= fs.size) return 0;
+            if (!z_bitd_reload(&b)) {
+                weights[nw++] = fs.t[s2].sym;
+                break;
+            }
+            if (nw >= 255) break;
+            weights[nw++] = fs.t[s2].sym;
+            s2 = fs.t[s2].base + (int)z_bitd_read(&b, fs.t[s2].nb);
+            if (s2 < 0 || s2 >= fs.size) return 0;
+            if (!z_bitd_reload(&b)) {
+                weights[nw++] = fs.t[s1].sym;
+                break;
+            }
+        }
+        int total = 0;
+        for (int i = 0; i < nw; ++i) {
+            if (weights[i] > 12) return 0;
+            if (weights[i]) total += 1 << (weights[i] - 1);
+        }
+        if (total <= 0) return 0;
+        int target = 1;
+        while (target <= total) target <<= 1;
+        int missing = target - total;
+        if (missing & (missing - 1)) return 0;
+        int mb = 0;
+        while ((1 << mb) < target) mb++;
+        int lw = 1;
+        while ((1 << (lw - 1)) < missing) lw++;
+        weights[nw++] = lw;
+        h->maxBits = mb;
+        for (int s = 0; s < 256; ++s) h->len[s] = 0;
+        for (int s = 0; s < nw; ++s) if (weights[s] > 0) h->len[s] = (uint8_t)(mb + 1 - weights[s]);
+        int pos = 0;
+        for (int w = 1; w <= mb; ++w) {
+            for (int s = 0; s < nw; ++s) {
+                if (weights[s] == w) {
+                    int cnt = 1 << (w - 1);
+                    for (int j = 0; j < cnt; ++j) h->table[pos++] = (uint8_t)s;
+                }
+            }
+        }
+        if (pos != (1 << mb)) return 0;
+        return 1 + size;
+    }
+
+    static int z_huff_decode(const z_huff* h, z_back* b, uint8_t* out, int64_t n) {
+        for (int64_t i = 0; i < n; ++i) {
+            uint32_t idx = z_bpeek(b, h->maxBits);
+            uint8_t s = h->table[idx & ((1u << h->maxBits) - 1)];
+            int len = h->len[s];
+            if (len <= 0) return 0;
+            out[i] = s;
+            b->k -= len;
+        }
+        return 1;
+    }
+
+    static const int z_ll_base[36] = {
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        16,18,20,22,24,28,32,40,48,64,128,256,512,1024,2048,4096,8192,16384,32768,65536
+    };
+    static const int z_ll_bits[36] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        1,1,1,1,2,2,3,3,4,6,7,8,9,10,11,12,13,14,15,16
+    };
+    static const int z_ml_base[53] = {
+        3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,
+        35,37,39,41,43,47,51,59,67,83,99,131,259,515,1027,2051,4099,8195,16387,32771,65539
+    };
+    static const int z_ml_bits[53] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        1,1,1,1,2,2,3,3,4,4,5,7,8,9,10,11,12,13,14,15,16
+    };
+
+    typedef struct { uint8_t* p; int64_t len; int64_t cap; } z_buf;
+
+    static int z_reserve(z_buf* b, int64_t extra) {
+        if (b->len + extra <= b->cap) return 1;
+        int64_t cap = b->cap ? b->cap : 65536;
+        while (cap < b->len + extra) cap *= 2;
+        uint8_t* p = (uint8_t*)realloc(b->p, (size_t)cap);
+        if (!p) return 0;
+        b->p = p;
+        b->cap = cap;
+        return 1;
+    }
+
+    static int z_copy_match(z_buf* out, int64_t offset, int64_t len) {
+        if (offset <= 0 || offset > out->len) return 0;
+        if (!z_reserve(out, len)) return 0;
+        int64_t src = out->len - offset;
+        for (int64_t i = 0; i < len; ++i) out->p[out->len++] = out->p[src + i];
+        return 1;
+    }
+
+    typedef struct {
+        z_fse ll, of, ml;
+        z_huff huff;
+        int huffHave;
+        int64_t rep[3];
+    } z_frame;
+
+    static int z_read_literals(const uint8_t* p, const uint8_t* end,
+                               uint8_t** lits, int64_t* litLen, z_frame* fr) {
+        if (p >= end) return 0;
+        int type = p[0] & 3;
+        int sf = (p[0] >> 2) & 3;
+        int64_t regen = 0, comp = 0;
+        int headerLen = 0;
+        if (type == 0 || type == 1) {
+            if (sf == 1) {
+                if (p + 2 > end) return 0;
+                regen = (p[0] >> 4) | ((int64_t)p[1] << 4);
+                headerLen = 2;
+            } else if (sf == 3) {
+                if (p + 3 > end) return 0;
+                regen = (p[0] >> 4) | ((int64_t)p[1] << 4) | ((int64_t)p[2] << 12);
+                headerLen = 3;
+            } else {
+                regen = p[0] >> 3;
+                headerLen = 1;
+            }
+            if (type == 0) {
+                if (p + headerLen + regen > end) return 0;
+                *lits = (uint8_t*)malloc((size_t)(regen ? regen : 1));
+                if (!*lits) return 0;
+                memcpy(*lits, p + headerLen, (size_t)regen);
+                *litLen = regen;
+                return headerLen + (int)regen;
+            }
+            if (p + headerLen >= end) return 0;
+            *lits = (uint8_t*)malloc((size_t)(regen ? regen : 1));
+            if (!*lits) return 0;
+            memset(*lits, p[headerLen], (size_t)regen);
+            *litLen = regen;
+            return headerLen + 1;
+        }
+
+        /* compressed / treeless */
+        int regenBits, compBits;
+        if (sf == 0 || sf == 1) { headerLen = 3; regenBits = 10; compBits = 10; }
+        else if (sf == 2) { headerLen = 4; regenBits = 14; compBits = 14; }
+        else { headerLen = 5; regenBits = 18; compBits = 18; }
+        if (p + headerLen > end) return 0;
+        uint64_t v = 0;
+        for (int i = 0; i < headerLen; ++i) v |= (uint64_t)p[i] << (8 * i);
+        regen = (int64_t)((v >> 4) & (((uint64_t)1 << regenBits) - 1));
+        comp = (int64_t)((v >> (4 + regenBits)) & (((uint64_t)1 << compBits) - 1));
+        if (p + headerLen + comp > end) return 0;
+        const uint8_t* cp = p + headerLen;
+        const uint8_t* cpend = cp + comp;
+        int treeLen = 0;
+        if (type == 2) {
+            treeLen = z_huff_read(cp, comp, &fr->huff);
+            if (treeLen <= 0) return 0;
+            fr->huffHave = 1;
+        } else if (!fr->huffHave) {
+            return 0;
+        }
+        cp += treeLen;
+        *lits = (uint8_t*)malloc((size_t)(regen ? regen : 1));
+        if (!*lits) return 0;
+        int streams = (sf == 0) ? 1 : 4;
+        if (streams == 1) {
+            z_back b;
+            if (!z_binit(&b, cp, cpend - cp)) { free(*lits); return 0; }
+            if (!z_huff_decode(&fr->huff, &b, *lits, regen)) { free(*lits); return 0; }
+        } else {
+            if (cp + 6 > cpend) { free(*lits); return 0; }
+            int s1 = cp[0] | (cp[1] << 8);
+            int s2 = cp[2] | (cp[3] << 8);
+            int s3 = cp[4] | (cp[5] << 8);
+            int total = (int)(cpend - (cp + 6));
+            int s4 = total - s1 - s2 - s3;
+            if (s1 < 0 || s2 < 0 || s3 < 0 || s4 < 0) { free(*lits); return 0; }
+            int64_t chunk = (regen + 3) / 4;
+            const uint8_t* sp = cp + 6;
+            int sizes[4] = { s1, s2, s3, s4 };
+            int64_t pos = 0;
+            for (int i = 0; i < 4; ++i) {
+                int64_t want = (i < 3) ? chunk : regen - pos;
+                if (want < 0 || want > chunk) { free(*lits); return 0; }
+                z_back b;
+                if (!z_binit(&b, sp, sizes[i])) { free(*lits); return 0; }
+                if (!z_huff_decode(&fr->huff, &b, *lits + pos, want)) { free(*lits); return 0; }
+                pos += want;
+                sp += sizes[i];
+            }
+            if (pos != regen) { free(*lits); return 0; }
+        }
+        *litLen = regen;
+        return headerLen + (int)comp;
+    }
+
+    static int z_sequences(const uint8_t* p, const uint8_t* end,
+                           const uint8_t* lits, int64_t litLen,
+                           z_buf* out, z_frame* fr) {
+        if (p >= end) return 0;
+        int64_t nseq = 0;
+        if (p[0] == 0) { p++; nseq = 0; }
+        else if (p[0] < 128) { nseq = p[0]; p++; }
+        else if (p[0] < 255) {
+            if (p + 2 > end) return 0;
+            nseq = ((int64_t)(p[0] - 128) << 8) + p[1];
+            p += 2;
+        } else {
+            if (p + 3 > end) return 0;
+            nseq = (int64_t)p[1] + ((int64_t)p[2] << 8) + 0x7F00;
+            p += 3;
+        }
+        if (nseq <= 0) {
+            if (!z_reserve(out, litLen)) return 0;
+            memcpy(out->p + out->len, lits, (size_t)litLen);
+            out->len += litLen;
+            return 1;
+        }
+        if (p >= end) return 0;
+        int modes = *p++;
+        int llMode = (modes >> 6) & 3;
+        int ofMode = (modes >> 4) & 3;
+        int mlMode = (modes >> 2) & 3;
+        if ((modes & 3) != 0) return 0;
+
+        z_fse *tables[3] = { &fr->ll, &fr->of, &fr->ml };
+        int modes3[3] = { llMode, ofMode, mlMode };
+        int maxLogs[3] = { 9, 8, 9 };
+        for (int i = 0; i < 3; ++i) {
+            int mode = modes3[i];
+            if (mode == 0) {
+                const int* def = (i == 0) ? z_ll_default : (i == 1 ? z_of_default : z_ml_default);
+                int n = (i == 0) ? 36 : (i == 1 ? 29 : 53);
+                int log = (i == 0) ? 6 : (i == 1 ? 5 : 6);
+                if (!z_fse_build(tables[i], def, n, log)) return 0;
+            } else if (mode == 1) {
+                if (p >= end) return 0;
+                if (!z_fse_rle(tables[i], *p++)) return 0;
+            } else if (mode == 2) {
+                z_fwd f;
+                f.p = p;
+                f.n = end - p;
+                f.bit = 0;
+                if (!z_fse_read(&f, tables[i], maxLogs[i])) return 0;
+                p += z_fbytes(&f);
+            } else {
+                if (!tables[i]->have) return 0;
+            }
+        }
+        if (p >= end) return 0;
+        z_back b;
+        if (!z_binit(&b, p, end - p)) return 0;
+        int llState = tables[0]->log ? (int)z_bread(&b, tables[0]->log) : 0;
+        int ofState = tables[1]->log ? (int)z_bread(&b, tables[1]->log) : 0;
+        int mlState = tables[2]->log ? (int)z_bread(&b, tables[2]->log) : 0;
+        if (llState >= tables[0]->size || ofState >= tables[1]->size || mlState >= tables[2]->size) return 0;
+
+        int64_t litPos = 0;
+        for (int64_t s = 0; s < nseq; ++s) {
+            int llCode = tables[0]->t[llState].sym;
+            int ofCode = tables[1]->t[ofState].sym;
+            int mlCode = tables[2]->t[mlState].sym;
+            if (llCode > 35 || mlCode > 52 || ofCode > 31) return 0;
+            int64_t offValue = ((int64_t)1 << ofCode) + (int64_t)z_bread(&b, ofCode);
+            int64_t mlen = z_ml_base[mlCode] + (int64_t)z_bread(&b, z_ml_bits[mlCode]);
+            int64_t llen = z_ll_base[llCode] + (int64_t)z_bread(&b, z_ll_bits[llCode]);
+
+            int64_t offset;
+            if (offValue > 3) {
+                offset = offValue - 3;
+                fr->rep[2] = fr->rep[1];
+                fr->rep[1] = fr->rep[0];
+                fr->rep[0] = offset;
+            } else {
+                int idx = (int)offValue;
+                if (llen == 0) idx++;
+                if (idx == 1) {
+                    offset = fr->rep[0];
+                } else if (idx == 2) {
+                    offset = fr->rep[1];
+                    fr->rep[1] = fr->rep[0];
+                    fr->rep[0] = offset;
+                } else if (idx == 3) {
+                    offset = fr->rep[2];
+                    fr->rep[2] = fr->rep[1];
+                    fr->rep[1] = fr->rep[0];
+                    fr->rep[0] = offset;
+                } else {
+                    offset = fr->rep[0] - 1;
+                    if (offset <= 0) return 0;
+                    fr->rep[2] = fr->rep[1];
+                    fr->rep[1] = fr->rep[0];
+                    fr->rep[0] = offset;
+                }
+            }
+
+            if (litPos + llen > litLen) return 0;
+            if (!z_reserve(out, llen)) return 0;
+            memcpy(out->p + out->len, lits + litPos, (size_t)llen);
+            out->len += llen;
+            litPos += llen;
+            if (!z_copy_match(out, offset, mlen)) return 0;
+
+            if (s + 1 < nseq) {
+                llState = tables[0]->t[llState].base + (int)z_bread(&b, tables[0]->t[llState].nb);
+                mlState = tables[2]->t[mlState].base + (int)z_bread(&b, tables[2]->t[mlState].nb);
+                ofState = tables[1]->t[ofState].base + (int)z_bread(&b, tables[1]->t[ofState].nb);
+                if (llState >= tables[0]->size || ofState >= tables[1]->size || mlState >= tables[2]->size) return 0;
+            }
+        }
+        if (litPos > litLen) return 0;
+        int64_t rest = litLen - litPos;
+        if (!z_reserve(out, rest)) return 0;
+        memcpy(out->p + out->len, lits + litPos, (size_t)rest);
+        out->len += rest;
+        return 1;
+    }
+
+    static int z_compressed_block(const uint8_t* p, const uint8_t* end,
+                                  z_buf* out, z_frame* fr) {
+        uint8_t* lits = 0;
+        int64_t litLen = 0;
+        int used = z_read_literals(p, end, &lits, &litLen, fr);
+        if (used <= 0) { free(lits); return 0; }
+        int ok = z_sequences(p + used, end, lits, litLen, out, fr);
+        free(lits);
+        return ok;
+    }
+
+    static int z_frame_decode(const uint8_t* p, int64_t n, z_buf* out, int64_t* consumed) {
+        if (n < 6) return 0;
+        uint32_t magic = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+        if ((magic & 0xFFFFFFF0u) == 0x184D2A50u) {
+            if (n < 8) return 0;
+            uint32_t sz = (uint32_t)p[4] | ((uint32_t)p[5] << 8) | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+            if (8 + (int64_t)sz > n) return 0;
+            *consumed = 8 + (int64_t)sz;
+            return 1;
+        }
+        if (magic != 0xFD2FB528u) return 0;
+        int64_t pos = 4;
+        uint8_t fhd = p[pos++];
+        int fcsFlag = (fhd >> 6) & 3;
+        int single = (fhd >> 5) & 1;
+        int checksum = (fhd >> 2) & 1;
+        int didFlag = fhd & 3;
+        if ((fhd & 0x08) != 0) return 0;
+        if (!single) {
+            if (pos >= n) return 0;
+            pos++; /* window descriptor */
+        }
+        int didSize = (didFlag == 0) ? 0 : (didFlag == 1 ? 1 : (didFlag == 2 ? 2 : 4));
+        if (pos + didSize > n) return 0;
+        uint32_t did = 0;
+        for (int i = 0; i < didSize; ++i) did |= (uint32_t)p[pos + i] << (8 * i);
+        pos += didSize;
+        if (did != 0) return 0; /* dictionaries are not supported */
+        int fcsSize = (fcsFlag == 0) ? (single ? 1 : 0) : (fcsFlag == 1 ? 2 : (fcsFlag == 2 ? 4 : 8));
+        if (pos + fcsSize > n) return 0;
+        pos += fcsSize;
+
+        z_frame fr;
+        memset(&fr, 0, sizeof fr);
+        fr.rep[0] = 1;
+        fr.rep[1] = 4;
+        fr.rep[2] = 8;
+
+        for (;;) {
+            if (pos + 3 > n) return 0;
+            uint32_t h = (uint32_t)p[pos] | ((uint32_t)p[pos + 1] << 8) | ((uint32_t)p[pos + 2] << 16);
+            pos += 3;
+            int last = h & 1;
+            int type = (h >> 1) & 3;
+            int64_t size = (int64_t)(h >> 3);
+            if (type == 0) {
+                if (size < 0 || pos + size > n) return 0;
+                if (!z_reserve(out, size)) return 0;
+                memcpy(out->p + out->len, p + pos, (size_t)size);
+                out->len += size;
+                pos += size;
+            } else if (type == 1) {
+                if (pos >= n) return 0;
+                if (!z_reserve(out, size)) return 0;
+                memset(out->p + out->len, p[pos], (size_t)size);
+                out->len += size;
+                pos += 1;
+            } else if (type == 2) {
+                if (size < 0 || pos + size > n) return 0;
+                if (!z_compressed_block(p + pos, p + pos + size, out, &fr)) return 0;
+                pos += size;
+            } else {
+                return 0;
+            }
+            if (last) break;
+        }
+        if (checksum) {
+            if (pos + 4 > n) return 0;
+            pos += 4;
+        }
+        *consumed = pos;
+        return 1;
+    }
+
+    /* shortcut: no dictionary support and the optional xxHash64 content
+       checksum is skipped; upgrade if untrusted frames need integrity checks. */
+    static sinter_string sinter_bin_unzstd(sinter_string data) {
+        if (data.len <= 0) return sinter_string_from_literal("", 0);
+        z_buf out;
+        out.p = 0;
+        out.len = 0;
+        out.cap = 0;
+        int64_t pos = 0;
+        int ok = 1;
+        while (pos < data.len) {
+            int64_t used = 0;
+            if (!z_frame_decode((const uint8_t*)data.data + pos, data.len - pos, &out, &used)) {
+                ok = 0;
+                break;
+            }
+            if (used <= 0) { ok = 0; break; }
+            pos += used;
+        }
+        if (!ok) { free(out.p); return sinter_string_from_literal("", 0); }
+        sinter_string r = sinter_string_from_buf((const char*)out.p, out.len);
+        free(out.p);
+        return r;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* bzip2 decompressor (ZIP method 12)                                  */
+    /* ------------------------------------------------------------------ */
+    typedef struct { const uint8_t* p; int64_t n; int64_t bit; } sinter_bz_bits;
+
+    static int sinter_bz_bit(sinter_bz_bits* b) {
+        if (b->bit >= b->n * 8) return 0;
+        int v = (b->p[b->bit >> 3] >> (7 - (int)(b->bit & 7))) & 1;
+        b->bit++;
+        return v;
+    }
+    static uint64_t sinter_bz_bits_n(sinter_bz_bits* b, int n) {
+        uint64_t v = 0;
+        for (int i = 0; i < n; ++i) v = (v << 1) | (uint64_t)sinter_bz_bit(b);
+        return v;
+    }
+    static uint32_t sinter_bz_crc_tab[256];
+    static int sinter_bz_crc_ready = 0;
+    static void sinter_bz_crc_init(void) {
+        for (uint32_t i = 0; i < 256; ++i) {
+            uint32_t v = i << 24;
+            for (int k = 0; k < 8; ++k)
+                v = (v & 0x80000000u) ? ((v << 1) ^ 0x04C11DB7u) : (v << 1);
+            sinter_bz_crc_tab[i] = v;
+        }
+        sinter_bz_crc_ready = 1;
+    }
+    static uint32_t sinter_bz_crc(uint32_t c, uint8_t ch) {
+        if (!sinter_bz_crc_ready) sinter_bz_crc_init();
+        return (c << 8) ^ sinter_bz_crc_tab[((c >> 24) ^ ch) & 0xFFu];
+    }
+
+    typedef struct {
+        int count[24];
+        int first[24];
+        int start[24];
+        uint16_t syms[258];
+    } sinter_bz_huff;
+
+    static int sinter_bz_build(sinter_bz_huff* h, const int* lens, int n) {
+        memset(h->count, 0, sizeof h->count);
+        int maxLen = 0;
+        for (int i = 0; i < n; ++i) {
+            int l = lens[i];
+            if (l < 1 || l > 23) return 0;
+            h->count[l]++;
+            if (l > maxLen) maxLen = l;
+        }
+        int code = 0, idx = 0;
+        for (int l = 1; l <= maxLen; ++l) {
+            h->first[l] = code;
+            h->start[l] = idx;
+            code = (code + h->count[l]) << 1;
+            idx += h->count[l];
+        }
+        int pos[24];
+        for (int l = 0; l <= maxLen; ++l) pos[l] = h->start[l];
+        for (int s = 0; s < n; ++s) h->syms[pos[lens[s]]++] = (uint16_t)s;
+        return 1;
+    }
+
+    static int sinter_bz_decode(sinter_bz_huff* h, sinter_bz_bits* br) {
+        int code = 0;
+        for (int l = 1; l <= 23; ++l) {
+            code = (code << 1) | sinter_bz_bit(br);
+            int c = code - h->first[l];
+            if (c >= 0 && c < h->count[l]) return h->syms[h->start[l] + c];
+        }
+        return -1;
+    }
+
+    static int sinter_bz_mtf(int* mtf, int pos) {
+        int v = mtf[pos];
+        for (int i = pos; i > 0; --i) mtf[i] = mtf[i - 1];
+        mtf[0] = v;
+        return v;
+    }
+
+    typedef struct { uint8_t* p; int64_t len; int64_t cap; } sinter_bz_buf;
+
+    static int sinter_bz_reserve(sinter_bz_buf* b, int64_t extra) {
+        if (b->len + extra <= b->cap) return 1;
+        int64_t cap = b->cap ? b->cap : 65536;
+        while (cap < b->len + extra) cap = cap * 2;
+        uint8_t* p = (uint8_t*)realloc(b->p, (size_t)cap);
+        if (!p) return 0;
+        b->p = p;
+        b->cap = cap;
+        return 1;
+    }
+
+    /* Decode one block into out; returns 1 on success, 0 on error. */
+    static int sinter_bz_block(sinter_bz_bits* br, sinter_bz_buf* out, int64_t blockLimit) {
+        if (sinter_bz_bit(br)) return 0; /* randomized blocks are obsolete */
+        uint32_t origPtr = (uint32_t)sinter_bz_bits_n(br, 24);
+        uint32_t inUse16 = (uint32_t)sinter_bz_bits_n(br, 16);
+        int seqToUnseq[256];
+        int nInUse = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (inUse16 & (1u << (15 - i))) {
+                uint32_t bits = (uint32_t)sinter_bz_bits_n(br, 16);
+                for (int j = 0; j < 16; ++j)
+                    if (bits & (1u << (15 - j))) seqToUnseq[nInUse++] = i * 16 + j;
+            }
+        }
+        if (nInUse == 0) return 0;
+        int alphaSize = nInUse + 2;
+        int nGroups = (int)sinter_bz_bits_n(br, 3);
+        int nSelectors = (int)sinter_bz_bits_n(br, 15);
+        if (nGroups < 2 || nGroups > 6 || nSelectors < 1 || nSelectors > 18002) return 0;
+        uint8_t selectors[18002];
+        for (int i = 0; i < nSelectors; ++i) {
+            int j = 0;
+            while (sinter_bz_bit(br)) if (++j >= nGroups) return 0;
+            selectors[i] = (uint8_t)j;
+        }
+        int selmtf[6];
+        for (int i = 0; i < nGroups; ++i) selmtf[i] = i;
+        for (int i = 0; i < nSelectors; ++i)
+            selectors[i] = (uint8_t)sinter_bz_mtf(selmtf, selectors[i]);
+
+        sinter_bz_huff groups[6];
+        for (int g = 0; g < nGroups; ++g) {
+            int lens[258];
+            int curr = (int)sinter_bz_bits_n(br, 5);
+            for (int s = 0; s < alphaSize; ++s) {
+                while (sinter_bz_bit(br)) {
+                    if (sinter_bz_bit(br)) curr--; else curr++;
+                    if (curr < 1 || curr > 23) return 0;
+                }
+                lens[s] = curr;
+            }
+            if (!sinter_bz_build(&groups[g], lens, alphaSize)) return 0;
+        }
+
+        int64_t cap = blockLimit > 0 ? blockLimit : 900000;
+        uint8_t* block = (uint8_t*)malloc((size_t)cap);
+        if (!block) return 0;
+        int64_t nblock = 0;
+        int mtf[256];
+        for (int i = 0; i < nInUse; ++i) mtf[i] = i;
+        int groupNo = 0, gSel = 0, g = 0, nextSym = 0;
+        int ok = 1;
+        for (;;) {
+            if (groupNo == 0) {
+                if (gSel >= nSelectors) { ok = 0; break; }
+                g = selectors[gSel++];
+                groupNo = 50;
+            }
+            groupNo--;
+            nextSym = sinter_bz_decode(&groups[g], br);
+            if (nextSym < 0) { ok = 0; break; }
+            if (nextSym == nInUse + 1) break;
+            if (nextSym == 0 || nextSym == 1) {
+                int64_t sum = 0, N = 1;
+                for (;;) {
+                    if (N > (1 << 24)) { ok = 0; break; }
+                    sum += (nextSym == 0) ? N : 2 * N;
+                    N <<= 1;
+                    if (groupNo == 0) {
+                        if (gSel >= nSelectors) { ok = 0; break; }
+                        g = selectors[gSel++];
+                        groupNo = 50;
+                    }
+                    groupNo--;
+                    nextSym = sinter_bz_decode(&groups[g], br);
+                    if (nextSym < 0) { ok = 0; break; }
+                    if (nextSym != 0 && nextSym != 1) break;
+                }
+                if (!ok) break;
+                if (nblock + sum > cap) { ok = 0; break; }
+                uint8_t ch = (uint8_t)seqToUnseq[mtf[0]];
+                for (int64_t i = 0; i < sum; ++i) block[nblock++] = ch;
+                if (nextSym == nInUse + 1) break;
+            }
+            if (nextSym < 2 || nextSym > nInUse) { ok = 0; break; }
+            block[nblock++] = (uint8_t)seqToUnseq[sinter_bz_mtf(mtf, nextSym - 1)];
+            if (nblock > cap) { ok = 0; break; }
+        }
+        if (!ok || nblock <= 0 || origPtr >= (uint32_t)nblock) { free(block); return 0; }
+
+        uint32_t* tt = (uint32_t*)malloc((size_t)nblock * sizeof(uint32_t));
+        if (!tt) { free(block); return 0; }
+        int cftab[256];
+        memset(cftab, 0, sizeof cftab);
+        for (int64_t i = 0; i < nblock; ++i) cftab[block[i]]++;
+        int acc = 0;
+        for (int i = 0; i < 256; ++i) { int t = cftab[i]; cftab[i] = acc; acc += t; }
+        for (int64_t i = 0; i < nblock; ++i) tt[cftab[block[i]]++] = (uint32_t)i;
+
+        int64_t tPos = tt[origPtr];
+        int run = 0;
+        uint8_t prev = 0;
+        for (int64_t k = 0; k < nblock; ++k) {
+            uint8_t ch = block[tPos];
+            tPos = tt[tPos];
+            if (!sinter_bz_reserve(out, 256)) { ok = 0; break; }
+            out->p[out->len++] = ch;
+            if (ch == prev) run++; else { prev = ch; run = 1; }
+            if (run == 4) {
+                if (k + 1 >= nblock) { ok = 0; break; }
+                uint8_t extra = block[tPos];
+                tPos = tt[tPos];
+                k++;
+                if (!sinter_bz_reserve(out, extra)) { ok = 0; break; }
+                for (int i = 0; i < extra; ++i) out->p[out->len++] = ch;
+                run = 0;
+                prev = 0;
+            }
+        }
+        free(tt);
+        free(block);
+        return ok;
+    }
+
+    static sinter_string sinter_bin_bunzip2_str(sinter_string data) {
+        if (data.len < 4 || memcmp(data.data, "BZh", 3) != 0) return sinter_string_from_literal("", 0);
+        int level = data.data[3] - '0';
+        if (level < 1 || level > 9) return sinter_string_from_literal("", 0);
+        sinter_bz_bits br;
+        br.p = (const uint8_t*)data.data;
+        br.n = data.len;
+        br.bit = 32;
+        sinter_bz_buf out;
+        out.p = 0; out.len = 0; out.cap = 0;
+        uint32_t combined = 0;
+        int ok = 1;
+        for (;;) {
+            uint64_t magic = (sinter_bz_bits_n(&br, 24) << 24) | sinter_bz_bits_n(&br, 24);
+            if (magic == 0x177245385090ULL) {
+                uint32_t stored = (uint32_t)sinter_bz_bits_n(&br, 32);
+                if (stored != combined) ok = 0;
+                break;
+            }
+            if (magic != 0x314159265359ULL) { ok = 0; break; }
+            uint32_t stored = (uint32_t)sinter_bz_bits_n(&br, 32);
+            int64_t before = out.len;
+            if (!sinter_bz_block(&br, &out, (int64_t)level * 100000)) { ok = 0; break; }
+            uint32_t crc = 0xFFFFFFFFu;
+            for (int64_t i = before; i < out.len; ++i) crc = sinter_bz_crc(crc, out.p[i]);
+            if ((crc ^ 0xFFFFFFFFu) != stored) { ok = 0; break; }
+            combined = ((combined << 1) | (combined >> 31)) ^ stored;
+        }
+        if (!ok) { free(out.p); return sinter_string_from_literal("", 0); }
+        sinter_string r = sinter_string_from_buf((const char*)out.p, out.len);
+        free(out.p);
+        return r;
+    }
+}
+
+/// Raw DEFLATE (RFC 1951) decompression. Returns "" on malformed input.
+pub fun inflate(data: str): str => sinter_bin_inflate_str(data)
+/// Raw DEFLATE compression (fixed Huffman + LZ77). Returns "" on allocation failure.
+pub fun deflate(data: str): str => sinter_bin_deflate_str(data)
+
+/// bzip2 decompression (ZIP method 12).
+pub fun bunzip2(data: str): str => sinter_bin_bunzip2_str(data)
+/// zstd decompression (ZIP method 93).
+pub fun unzstd(data: str): str => sinter_bin_unzstd(data)
+/// Traditional PKZIP encryption; prepends the 12-byte header.
+pub fun zipCryptEncrypt(data: str, password: str, crc: i64): str =>
+    sinter_bin_zipcrypt_encrypt(data, password, crc)
+/// Traditional PKZIP decryption; expects the 12-byte header.
+pub fun zipCryptDecrypt(data: str, password: str, crc: i64): str =>
+    sinter_bin_zipcrypt_decrypt(data, password, crc)
+/// CRC-32 (IEEE) of the raw bytes.
+pub fun crc32(data: str): i64 => sinter_bin_crc32_str(data)
+
+// ============================================================================
+// Text encodings and a byte buffer (plain Sinter, no embedded C)
+// ============================================================================
+/// Lowercase hexadecimal encoding.
+pub fun hexEncode(data: str): str {
+    val sb = StringBuilder()
+    val digits = "0123456789abcdef"
+    var i: i64 = 0
+    while i < data.length() {
+        val b = data.at(i)
+        sb.appendByte((digits.at((b / 16) % 16)) as u8)
+        sb.appendByte((digits.at(b % 16)) as u8)
+        i = i + 1
+    }
+    ret sb.toString()
+}
+
+fun hexValue(ch: i64): i64 {
+    if ch >= 48 && ch <= 57 { ret ch - 48 }
+    if ch >= 65 && ch <= 70 { ret ch - 55 }
+    if ch >= 97 && ch <= 102 { ret ch - 87 }
+    ret -1
+}
+
+/// Decode hexadecimal; whitespace is ignored. Returns "" on invalid input.
+pub fun hexDecode(text: str): str {
+    val sb = StringBuilder()
+    var hi: i64 = -1
+    var i: i64 = 0
+    while i < text.length() {
+        val ch = text.at(i)
+        val v = hexValue(ch)
+        if v < 0 {
+            if ch == 32 || ch == 9 || ch == 10 || ch == 13 { i = i + 1; continue }
+            ret ""
+        }
+        if hi < 0 {
+            hi = v
+        } else {
+            sb.appendByte((hi * 16 + v) as u8)
+            hi = -1
+        }
+        i = i + 1
+    }
+    if hi >= 0 { ret "" }
+    ret sb.toString()
+}
+
+/// Standard Base64 encoding with padding.
+pub fun base64Encode(data: str): str {
+    val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    val sb = StringBuilder()
+    var i: i64 = 0
+    while i < data.length() {
+        val b0 = data.at(i)
+        val has1 = i + 1 < data.length()
+        val has2 = i + 2 < data.length()
+        val b1 = has1 ? data.at(i + 1) : 0
+        val b2 = has2 ? data.at(i + 2) : 0
+        sb.appendByte((alphabet.at(b0 / 4)) as u8)
+        sb.appendByte((alphabet.at((b0 % 4) * 16 + b1 / 16)) as u8)
+        if has1 { sb.appendByte((alphabet.at((b1 % 16) * 4 + b2 / 64)) as u8) } else { sb.appendByte(61u8) }
+        if has2 { sb.appendByte((alphabet.at(b2 % 64)) as u8) } else { sb.appendByte(61u8) }
+        i = i + 3
+    }
+    ret sb.toString()
+}
+
+fun base64Value(ch: i64): i64 {
+    if ch >= 65 && ch <= 90 { ret ch - 65 }
+    if ch >= 97 && ch <= 122 { ret ch - 71 }
+    if ch >= 48 && ch <= 57 { ret ch + 4 }
+    if ch == 43 { ret 62 }
+    if ch == 47 { ret 63 }
+    ret -1
+}
+
+/// Decode standard Base64. Whitespace is ignored; returns "" on invalid input.
+pub fun base64Decode(text: str): str {
+    val sb = StringBuilder()
+    var a: i64 = 0
+    var b: i64 = 0
+    var c: i64 = 0
+    var d: i64 = 0
+    var slot: i64 = 0
+    var i: i64 = 0
+    while i < text.length() {
+        val ch = text.at(i)
+        if ch == 32 || ch == 9 || ch == 10 || ch == 13 { i = i + 1; continue }
+        var v: i64 = -1
+        if ch == 61 { v = -2 } else { v = base64Value(ch) }
+        if v == -1 { ret "" }
+        if slot == 0 { a = v; slot = 1 }
+        else if slot == 1 { b = v; slot = 2 }
+        else if slot == 2 { c = v; slot = 3 }
+        else {
+            d = v
+            val n = a * 262144 + b * 4096 + (c < 0 ? 0 : c) * 64 + (d < 0 ? 0 : d)
+            sb.appendByte(((n / 65536) % 256) as u8)
+            if c >= 0 { sb.appendByte(((n / 256) % 256) as u8) }
+            if d >= 0 { sb.appendByte((n % 256) as u8) }
+            slot = 0
+            if c < 0 || d < 0 { break }
+        }
+        i = i + 1
+    }
+    if slot == 2 {
+        val n = a * 262144 + b * 4096
+        sb.appendByte(((n / 65536) % 256) as u8)
+    } else if slot == 3 {
+        val n = a * 262144 + b * 4096 + (c < 0 ? 0 : c) * 64
+        sb.appendByte(((n / 65536) % 256) as u8)
+        if c >= 0 { sb.appendByte(((n / 256) % 256) as u8) }
+    } else if slot == 1 {
+        ret ""
+    }
+    ret sb.toString()
+}
+
+/// Growable binary buffer built on `StringBuilder`.
+pub class ByteBuffer {
+    var sb: StringBuilder
+
+    ByteBuffer() { self.sb = StringBuilder() }
+
+    pub fun appendByte(v: u8): void => self.sb.appendByte(v)
+    pub fun append(text: str): void => self.sb.append(text)
+    pub fun appendU16(v: i64): void {
+        self.sb.appendByte((v % 256) as u8)
+        self.sb.appendByte(((v / 256) % 256) as u8)
+    }
+    pub fun appendU32(v: i64): void {
+        self.sb.appendByte((v % 256) as u8)
+        self.sb.appendByte(((v / 256) % 256) as u8)
+        self.sb.appendByte(((v / 65536) % 256) as u8)
+        self.sb.appendByte(((v / 16777216) % 256) as u8)
+    }
+    pub fun length(): i64 => self.sb.length()
+    pub fun bytes(): str => self.sb.toString()
+    pub fun clear(): void => self.sb.clear()
+}

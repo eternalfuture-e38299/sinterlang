@@ -1,0 +1,34 @@
+[package]
+name = "linklib"
+version = "0.1.0"
+entry = "src/main.sinter"
+
+[dependencies]
+std = { version = "1.5.2", source = "path:../../../packages/std" }
+cond = { version = "0.1.0", source = "path:libs/cond" }
+
+[link]
+subdirs = ["libs/greet"]
+includes = [
+    "${CMAKE_CURRENT_SOURCE_DIR}/libs/greet/include",
+    "${CMAKE_CURRENT_BINARY_DIR}/libs/greet/include"
+]
+libs = ["greet"]
+
+[[link.condition]]
+if = "WIN32"
+defs = ["LINKLIB_WINDOWS=1"]
+
+[[link.condition]]
+if = "NOT WIN32"
+defs = ["LINKLIB_WINDOWS=0"]
+
+[link.android]
+libs = ["log"]
+
+[link.linux]
+defs = ["LINKLIB_LINUX=1"]
+
+[[link.condition]]
+if = "MINGW OR (WIN32 AND CMAKE_C_COMPILER_ID STREQUAL \"GNU\")"
+options = ["-static-libgcc", "-Wl,--gc-sections"]
