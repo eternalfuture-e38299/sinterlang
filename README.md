@@ -2,9 +2,9 @@
 
 > **Status / 状态**
 >
-> **EN:** This directory is an archived snapshot of the **original C++ implementation** of the Sinter compiler. It is kept as a reference and bootstrap artifact only. New development happens in the self-hosted Sinter toolchain under [`../Sinter`](../Sinter). Do not expect new features here.
+> **EN:** This directory is an archived snapshot of the **original C++ implementation** of the Sinter compiler. It is kept as a reference and bootstrap artifact only. New development happens in the self-hosted Sinter toolchain under [`Sinter`](https://github.com/eternalfuture-e38299/sinterlang). Do not expect new features here.
 >
-> **中文：** 本目录保存的是 Sinter 编译器**最初的 C++ 实现**的归档快照，仅作为参考与自举历史产物保留。当前开发已转移到 [`../Sinter`](../Sinter) 下用 Sinter 自身编写的自举工具链；这里不再接受新功能开发。
+> **中文：** 本目录保存的是 Sinter 编译器**最初的 C++ 实现**的归档快照，仅作为参考与自举历史产物保留。当前开发已转移到 [`Sinter`](https://github.com/eternalfuture-e38299/sinterlang) 下用 Sinter 自身编写的自举工具链；这里不再接受新功能开发。
 
 ---
 
@@ -62,7 +62,7 @@ The binaries are written to `build/bin/`. If the system `cmake` is broken, point
 ### Relationship to the current toolchain
 
 - This C++ code is **the prototype/reference implementation**.
-- The current, maintained implementation is the self-hosted Sinter project in [`../Sinter`](../Sinter).
+- The current, maintained implementation is the self-hosted Sinter project in [`Sinter`](https://github.com/eternalfuture-e38299/sinterlang).
 
 ### Scope of this archive
 
@@ -124,7 +124,7 @@ cmake --build build -j8
 ### 与当前工具链的关系
 
 - 这份 C++ 代码是**最初的原型/参考实现**。
-- 当前持续维护的实现是 [`../Sinter`](../Sinter) 中的自举 Sinter 工具链。
+- 当前持续维护的实现是 [`Sinter`](https://github.com/eternalfuture-e38299/sinterlang) 中的自举 Sinter 工具链。
 
 ### 归档边界
 
