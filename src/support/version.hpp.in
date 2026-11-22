@@ -1,0 +1,11 @@
+// 由 CMake 从 project(Sinter VERSION ...) 生成 —— 不要手改这个文件的产物。
+//
+// 版本号的唯一来源是仓库根目录的 VERSION 文件；根 CMakeLists.txt 读它并填入
+// project(... VERSION ...)。四个宿主工具（sinter / sinterc / sinterd / sinter-lsp）
+// 都只 include 这里，自举工具链则由 sinter 读取同一个 VERSION 文件。
+#pragma once
+
+#define SINTER_VERSION_STRING "@PROJECT_VERSION@"
+#define SINTER_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define SINTER_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define SINTER_VERSION_PATCH @PROJECT_VERSION_PATCH@
